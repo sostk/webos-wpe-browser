@@ -15,7 +15,7 @@
 | Path | What |
 |---|---|
 | `browser/` | the app (kit-based, C++), to be written |
-| `third_party/webos-native-app-kit/` | kit clone (github.com/Native-Webos/webos-native-app-kit @312f365, 2026-10-30) |
+| `third_party/webos-native-app-kit/` | kit **submodule** (github.com/Native-Webos/webos-native-app-kit @312f365, 2026-10-30). Local changes live as patches in `third_party/patches/webos-native-app-kit/`; after `git submodule update --init`, run `third_party/patches/apply-kit-patches.sh`. |
 | `toolchain/ct-ng.defconfig` | crosstool-ng config for the cross toolchain |
 | `buildroot-external/` | BR2_EXTERNAL tree: `configs/webos_browser_defconfig`, overrides in `external.mk` |
 | `docker/` | `Dockerfile` (ubuntu 24.04 + build tools + crosstool-ng 1.27.0); `run.sh '<cmd>'` runs in it as the host user |
@@ -123,6 +123,7 @@
   - Verified: host screenshots (menu, settings, history, bookmarks, clear data); a scripted "clear all time" removed 6/6 history
     entries and saved 0 to disk; NDK ipk 0.2.0 (1.55 MB) passes check-package; installed and launched on the TV, profile at
     /media/developer/org.sostk.wpebrowser.data/profile.
+- 2026-11-10 Git repository initialised (branch `main`, one commit per component). The kit's working copy keeps the 4 local changes uncommitted; they are tracked as patches (regenerate with `git -C third_party/webos-native-app-kit diff -- <files>` when a kit change is edited).
 - 2026-11-10 Buildroot built every dependency (LLVM 23, Mesa 26.2.5 with libEGL + libgallium, libsoup3, ICU 78, ...). WPE WebKit failed at
   its first file: "DFG and FTL JIT require baseline JIT to be enabled". JSC's 32-bit ARM JIT needs the **hard-float** ABI
   (__ARM_PCS_VFP) and webOS is softfp. **Decision:** CLoop interpreter (JIT/DFG/FTL/WebAssembly/sampling profiler off) via external.mk,
@@ -130,3 +131,4 @@
   **Possible later speed-up:** build the engine tree hard-float with its own glibc + loader (a true private runtime). WebKit's helpers
   can't be exec'd with a system PT_INTERP, but PT_INTERP can point at a fixed path such as /tmp/wpe-browser/ld-linux-armhf.so.3 that the UI
   sets up at start (like the CA bundle). That would enable the ARMv7 JIT. It means rebuilding the toolchain and all packages.
+  **2026-11-10:** the first WebKit compile was stopped at step 3491/7656: 6 parallel jobs exhausted the PC's 15 GB (cc1plus killed). Resumed with `make BR2_JLEVEL=4` (`~/webos-browser-build/br-build3.log`).
