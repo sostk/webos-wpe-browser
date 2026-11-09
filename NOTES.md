@@ -123,7 +123,7 @@
   - Verified: host screenshots (menu, settings, history, bookmarks, clear data); a scripted "clear all time" removed 6/6 history
     entries and saved 0 to disk; NDK ipk 0.2.0 (1.55 MB) passes check-package; installed and launched on the TV, profile at
     /media/developer/org.sostk.wpebrowser.data/profile.
-- 2026-11-10 Git repository initialised (branch `main`, one commit per component). The kit's working copy keeps the 4 local changes uncommitted; they are tracked as patches (regenerate with `git -C third_party/webos-native-app-kit diff -- <files>` when a kit change is edited).
+- 2026-11-10 Git repository initialised (branch `main`, one commit per component); remote `origin` = https://github.com/sostk/webos-wpe-browser (private). The kit's working copy keeps the 4 local changes uncommitted; they are tracked as patches (regenerate with `git -C third_party/webos-native-app-kit diff -- <files>` when a kit change is edited).
 - 2026-11-10 Buildroot built every dependency (LLVM 23, Mesa 26.2.5 with libEGL + libgallium, libsoup3, ICU 78, ...). WPE WebKit failed at
   its first file: "DFG and FTL JIT require baseline JIT to be enabled". JSC's 32-bit ARM JIT needs the **hard-float** ABI
   (__ARM_PCS_VFP) and webOS is softfp. **Decision:** CLoop interpreter (JIT/DFG/FTL/WebAssembly/sampling profiler off) via external.mk,
