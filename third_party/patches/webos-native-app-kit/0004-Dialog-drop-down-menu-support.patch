@@ -1,0 +1,72 @@
+diff --git a/ui/include/wnk/ui/navigation.hpp b/ui/include/wnk/ui/navigation.hpp
+index c19c501..78d2ba4 100644
+--- a/ui/include/wnk/ui/navigation.hpp
++++ b/ui/include/wnk/ui/navigation.hpp
+@@ -69,6 +69,11 @@ class Dialog : public View {
+     bool back_dismisses = true;
+     std::function<void(Ui &)> on_dismiss;
+     Column &body() { return *body_; }  // for extra content above the buttons
++    // Layout options, e.g. for a drop-down menu: panel width and padding, and an anchor that places the
++    // panel's top-right corner at `p` (logical units) instead of centring it. An empty title adds no title line.
++    Dialog &set_panel_width(float width);
++    Dialog &set_panel_padding(Insets padding);
++    Dialog &anchor_top_right(Point p);
+ 
+  protected:
+     void layout_content(Ui &ui, const Rect &content) override;
+@@ -84,6 +89,8 @@ class Dialog : public View {
+     Row *buttons_;
+     Tween appear_;
+     bool dismissed_ = false;
++    bool anchored_ = false;
++    Point anchor_{};
+ };
+ 
+ }  // namespace wnk::ui
+diff --git a/ui/src/navigation.cpp b/ui/src/navigation.cpp
+index 0bf9222..c1e6153 100644
+--- a/ui/src/navigation.cpp
++++ b/ui/src/navigation.cpp
+@@ -108,7 +108,7 @@ Dialog::Dialog(std::string title, std::string message) {
+     panel_->set_width(Dim::fixed(920));
+     panel_->set_align(Align::Center, Align::Center);
+     panel_->set_padding(Insets::all(56));
+-    panel_->add<Label>(std::move(title), TextRole::Title).set_max_lines(2);
++    if (!title.empty()) panel_->add<Label>(std::move(title), TextRole::Title).set_max_lines(2);
+     if (!message.empty()) panel_->add<Label>(std::move(message)).set_muted(true).set_max_lines(6);
+     body_ = &panel_->add<Column>(16);
+     buttons_ = &panel_->add<Row>(24);
+@@ -133,7 +133,32 @@ void Dialog::dismiss(Ui &ui) {
+ 
+ Size Dialog::measure_content(Ui &, Size available) { return available; }
+ 
+-void Dialog::layout_content(Ui &ui, const Rect &content) { panel_->layout(ui, place(ui, *panel_, content)); }
++Dialog &Dialog::set_panel_width(float width) {
++    panel_->set_width(Dim::fixed(width));
++    return *this;
++}
++
++Dialog &Dialog::set_panel_padding(Insets padding) {
++    panel_->set_padding(padding);
++    return *this;
++}
++
++Dialog &Dialog::anchor_top_right(Point p) {
++    anchored_ = true;
++    anchor_ = p;
++    return *this;
++}
++
++void Dialog::layout_content(Ui &ui, const Rect &content) {
++    if (!anchored_) {
++        panel_->layout(ui, place(ui, *panel_, content));
++        return;
++    }
++    const Size s = panel_->measure(ui, {content.w, content.h});
++    const float x = std::max(content.x, anchor_.x - s.w);
++    const float y = std::min(anchor_.y, std::max(content.y, content.bottom() - s.h));
++    panel_->layout(ui, {x, y, s.w, std::min(s.h, content.bottom() - y)});
++}
+ 
+ bool Dialog::on_action(Ui &ui, const input::ActionEvent &e) {
+     if (e.action != input::Action::Back) return false;

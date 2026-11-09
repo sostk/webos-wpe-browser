@@ -1,0 +1,35 @@
+diff --git a/app/include/wnk/app/app.hpp b/app/include/wnk/app/app.hpp
+index eb110d4..9a23b2e 100644
+--- a/app/include/wnk/app/app.hpp
++++ b/app/include/wnk/app/app.hpp
+@@ -168,6 +168,9 @@ class Delegate {
+     // Every raw key event (USB/Bluetooth keyboard, remote) before text input and the keymap. Return true
+     // to consume it: a game that wants WASD or key-up timing reads keys here.
+     virtual bool on_key(Context &ctx, const input::KeyEvent &e);
++    // Every pointer event (Magic Remote, mouse) in drawable pixels, before the Ui sees it. Return true to
++    // consume it: an app that draws its own content under the pointer (a browser, a game) reads it here.
++    virtual bool on_pointer(Context &ctx, const input::PointerEvent &e);
+     // The network status changed (Context::network() already holds the new one): say "offline" instead
+     // of waiting for requests to time out, and refresh when it comes back.
+     virtual void on_network(Context &ctx, const platform::NetworkStatus &status);
+diff --git a/app/src/app.cpp b/app/src/app.cpp
+index 4e769c0..6899cb7 100644
+--- a/app/src/app.cpp
++++ b/app/src/app.cpp
+@@ -44,6 +44,7 @@ void Delegate::on_relaunch(Context &, const std::string &) {}
+ bool Delegate::on_gamepad(Context &, const input::GamepadEvent &) { return false; }
+ void Delegate::on_network(Context &, const platform::NetworkStatus &) {}
+ bool Delegate::on_key(Context &, const input::KeyEvent &) { return false; }
++bool Delegate::on_pointer(Context &, const input::PointerEvent &) { return false; }
+ void Delegate::on_frame(Context &, float) {}
+ void Delegate::on_stop(Context &) {}
+ 
+@@ -1227,7 +1228,7 @@ class Shell final : public Context {
+     void on_pointer(const input::PointerEvent &p) {
+         using T = input::PointerEvent::Type;
+         if (!lifecycle_.renders()) return;
+-        const bool hit = ui_->handle_pointer(p);
++        const bool hit = delegate_->on_pointer(*this, p) || ui_->handle_pointer(p);
+         if (p.type == T::Move || p.type == T::Press || p.type == T::Wheel) {
+             note_capability("input.pointer", diagnostics::Support::Supported,
+                             std::string("first event: ") + input::pointer_type_name(p.type));

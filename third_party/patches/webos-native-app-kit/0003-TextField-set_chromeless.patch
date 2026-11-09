@@ -1,0 +1,42 @@
+diff --git a/ui/include/wnk/ui/widgets.hpp b/ui/include/wnk/ui/widgets.hpp
+index c8dd009..7dbb95f 100644
+--- a/ui/include/wnk/ui/widgets.hpp
++++ b/ui/include/wnk/ui/widgets.hpp
+@@ -239,6 +239,12 @@ class TextField : public View {
+     TextField &set_placeholder(std::string placeholder);
+     TextField &set_password(bool on);        // shows a bullet per character
+     TextField &set_max_length(size_t code_points);  // 0: unlimited; longer input is cut
++    // No box of its own (no fill, no editing border): for a field inside a container that draws the frame,
++    // such as a browser's address pill. Text, placeholder and caret are drawn as usual.
++    TextField &set_chromeless(bool on) {
++        chromeless_ = on;
++        return *this;
++    }
+     TextField &set_on_change(TextHandler h);  // after every edit
+     TextField &set_on_submit(TextHandler h);  // OK/Enter while editing
+     const std::string &text() const { return text_; }
+@@ -272,6 +278,7 @@ class TextField : public View {
+     size_t max_length_ = 0;
+     bool password_ = false;
+     bool editing_ = false;
++    bool chromeless_ = false;
+     float scroll_ = 0;          // horizontal, keeps the cursor in view
+     double caret_since_ = 0;    // the caret blinks from here (reset by every edit)
+     TextHandler on_change_, on_submit_;
+diff --git a/ui/src/text_field.cpp b/ui/src/text_field.cpp
+index 2bdfd2b..8e0fdac 100644
+--- a/ui/src/text_field.cpp
++++ b/ui/src/text_field.cpp
+@@ -260,8 +260,10 @@ void TextField::draw(Ui &ui) {
+     const Theme &t = ui.theme();
+     const Rect f = frame();
+     const bool focused = ui.is_focused(this);
+-    r.fill_rect(f, ui.fade(!enabled() || editing_ ? t.surface : focused ? t.raised_focused : t.raised), radius_);
+-    if (editing_) r.stroke_rect(f, ui.fade(t.accent), 3, radius_);
++    if (!chromeless_) {
++        r.fill_rect(f, ui.fade(!enabled() || editing_ ? t.surface : focused ? t.raised_focused : t.raised), radius_);
++        if (editing_) r.stroke_rect(f, ui.fade(t.accent), 3, radius_);
++    }
+ 
+     const Rect c = content_rect();
+     const render::TextStyle s{t.regular, t.text_size, ui.fade(enabled() ? t.text : t.text_disabled)};

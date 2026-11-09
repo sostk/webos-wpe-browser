@@ -1,0 +1,164 @@
+diff --git a/cmake/WebOSPackage.cmake b/cmake/WebOSPackage.cmake
+index ce8d1fa..4451544 100644
+--- a/cmake/WebOSPackage.cmake
++++ b/cmake/WebOSPackage.cmake
+@@ -18,6 +18,8 @@
+ #                                        <basename>/ and started as separate processes; checked with
+ #                                        check-package.py --private-runtime instead of the executable's
+ #                                        ARM/libstdc++ rules
++#     [GLIBC_RUNTIMES <dir>...]          like PRIVATE_RUNTIMES, but the tree uses the TV's glibc instead of its
++#                                        own loader and C library (check-package.py --glibc-runtime)
+ #     [SOURCE_URL <url>]                 where the app's corresponding source is published (named in
+ #                                        licenses/SOURCE.txt; default WNK_SOURCE_URL, else the kit's notice)
+ # )
+@@ -43,7 +45,7 @@ set(WNK_TOOLS_DIR "${CMAKE_CURRENT_LIST_DIR}/../tools")
+ 
+ function(wnk_add_webos_package)
+     cmake_parse_arguments(P "" "TARGET;APPID;TITLE;VERSION;VENDOR;ICON;LARGE_ICON;ICON_COLOR;EXPECTED_NEEDED;MIN_RELEASE;SOURCE_URL"
+-            "EXTRA_FILES;EXTRA_DIRS;REQUIRED_PERMISSIONS;BUNDLED_LIBS;PRIVATE_RUNTIMES" ${ARGN})
++            "EXTRA_FILES;EXTRA_DIRS;REQUIRED_PERMISSIONS;BUNDLED_LIBS;PRIVATE_RUNTIMES;GLIBC_RUNTIMES" ${ARGN})
+     foreach (req TARGET APPID TITLE VERSION VENDOR ICON LARGE_ICON)
+         if (NOT P_${req})
+             message(FATAL_ERROR "wnk_add_webos_package: ${req} is required")
+@@ -200,6 +202,13 @@ of the same version and options.
+         list(APPEND _dir_deps ${_dfiles})
+         list(APPEND _check_args --private-runtime "${_dname}")
+     endforeach ()
++    foreach (_d IN LISTS P_GLIBC_RUNTIMES)
++        get_filename_component(_dname "${_d}" NAME)
++        list(APPEND _cmds COMMAND "${CMAKE_COMMAND}" -E copy_directory "${_d}" "${_stage}/${_dname}")
++        file(GLOB_RECURSE _dfiles CONFIGURE_DEPENDS "${_d}/*")
++        list(APPEND _dir_deps ${_dfiles})
++        list(APPEND _check_args --glibc-runtime "${_dname}")
++    endforeach ()
+ 
+     add_custom_target(${P_TARGET}-ipk
+             ${_cmds}
+diff --git a/tests/tools/test_packaging.py b/tests/tools/test_packaging.py
+index 641482b..91253b9 100644
+--- a/tests/tools/test_packaging.py
++++ b/tests/tools/test_packaging.py
+@@ -319,6 +319,34 @@ class PrivateRuntimeRuleTests(unittest.TestCase):
+                 "demo": self.elf(rpath=["$ORIGIN/runtime-other/lib"])}  # a component named differently
+         self.assertEqual(self.run_rules(elfs), [])
+ 
++    def run_glibc_rules(self, elfs):
++        r = check_package.Report()
++        with redirect_stdout(io.StringIO()):
++            check_package.check_private_runtimes(r, {self.ROOT + k: v for k, v in elfs.items()}, self.ROOT, ["rt"],
++                                                 "arm", check_package.FIRMWARE_GLIBC,
++                                                 check_package.DENY_IN_GLIBC_RUNTIME)
++        return r.failures
++
++    def test_glibc_runtime_may_use_the_tvs_glibc_and_a_bundled_mesa(self):
++        elfs = {"rt/engine": self.elf(needed=["libc.so.6", "libpthread.so.0", "libstdc++.so.6", "libEGL.so.1"],
++                                      runpath=["$ORIGIN/lib"]),
++                "rt/lib/libstdc++.so.6": self.elf(needed=["libc.so.6", "libm.so.6"], soname="libstdc++.so.6"),
++                "rt/lib/libEGL.so.1": self.elf(needed=["libGLESv2.so.2", "libc.so.6"], soname="libEGL.so.1"),
++                "rt/lib/libGLESv2.so.2": self.elf(needed=["libc.so.6"], soname="libGLESv2.so.2"),
++                "demo": self.elf()}
++        self.assertEqual(self.run_glibc_rules(elfs), [])
++        # A private runtime (own C library) may not lean on the TV's glibc or bundle libGLES.
++        failures = self.run_rules(elfs)
++        self.assertTrue(any("every DT_NEEDED is inside rt/" in f for f in failures))
++        self.assertTrue(any("libGLESv2.so.2: not an LG firmware library" in f for f in failures))
++
++    def test_glibc_runtime_still_denies_lg_libraries_and_unresolved_names(self):
++        elfs = {"rt/engine": self.elf(needed=["libc.so.6", "libhelpers.so.2"]),
++                "rt/lib/libhelpers.so.2": self.elf(soname="libhelpers.so.2")}
++        self.assertTrue(any("not an LG firmware library" in f for f in self.run_glibc_rules(elfs)))
++        elfs = {"rt/engine": self.elf(needed=["libc.so.6", "libsoup-3.0.so.0"])}
++        self.assertTrue(any("every DT_NEEDED is inside rt/" in f for f in self.run_glibc_rules(elfs)))
++
+ 
+ class FwCheckTests(unittest.TestCase):
+     """fw-check against a synthetic inventory in the real format: symbols are "name@VERSION" and a
+diff --git a/tools/check-package.py b/tools/check-package.py
+index 3588848..474911f 100755
+--- a/tools/check-package.py
++++ b/tools/check-package.py
+@@ -45,6 +45,15 @@ DENY_IN_PRIVATE_RUNTIME = [
+     r"libGLES.*", r"libwayland-.*", r"libluna-service2.*", r"libhelpers\.so.*", r"libpbnjson.*", r"libPmLog.*",
+     r"libumedia.*", r"libresource_mgr.*", r"libums_.*",
+ ]
++# A glibc runtime (--glibc-runtime DIR) is a tree like a private runtime, run as separate processes, that
++# uses the TV's own glibc instead of carrying a loader and C library: its DT_NEEDED may also name the glibc
++# libraries below. Its processes never load LG libraries, so a bundled Mesa libEGL/libGLESv2 (software GL)
++# is allowed there; every other LG library stays denied. Example: the WPE WebKit engine of a browser.
++FIRMWARE_GLIBC = frozenset({
++    "ld-linux.so.3", "libc.so.6", "libm.so.6", "libdl.so.2", "libpthread.so.0", "librt.so.1", "libresolv.so.2",
++    "libutil.so.1", "libanl.so.1", "libnsl.so.1", "libcrypt.so.1",
++})
++DENY_IN_GLIBC_RUNTIME = [p for p in DENY_IN_PRIVATE_RUNTIME if p != r"libGLES.*"]
+ EM_AARCH64 = 183
+ PRIVATE_RUNTIME_MACHINES = {"arm": {wnk_elf.EM_ARM, EM_AARCH64}, "x86_64": {wnk_elf.EM_X86_64}}
+ STATE_DIR = ".wnk-state"  # tools/mkipk.py
+@@ -73,7 +82,8 @@ def parse_control(text: str) -> dict[str, str]:
+ 
+ 
+ def check_private_runtimes(r: Report, elfs: dict[str, wnk_elf.ElfInfo], app_root: str, runtimes: list[str],
+-                           arch: str) -> None:
++                           arch: str, system_libs: frozenset[str] = frozenset(),
++                           deny: list[str] | None = None) -> None:
+     """Self-contained trees: every DT_NEEDED resolves inside the tree, no LG library, nothing outside
+     the tree loads from it (no RPATH/RUNPATH of another ELF names it)."""
+     for rt in runtimes:
+@@ -91,10 +101,11 @@ def check_private_runtimes(r: Report, elfs: dict[str, wnk_elf.ElfInfo], app_root
+             short = name[len(app_root):]
+             r.check(info.machine in PRIVATE_RUNTIME_MACHINES.get(arch, {info.machine}),
+                     f"{short}: machine {info.machine} allowed in a private runtime for {arch}")
+-            missing = [n for n in info.needed if n not in provided]
++            missing = [n for n in info.needed if n not in provided and n not in system_libs]
+             r.check(not missing, f"{short}: every DT_NEEDED is inside {rt}/" + (f" (missing {missing})" if missing else ""))
+             base = {posixpath.basename(name), info.soname or ""}
+-            r.check(not any(re.fullmatch(p, b) for p in DENY_IN_PRIVATE_RUNTIME for b in base if b),
++            r.check(not any(re.fullmatch(p, b) for p in (deny if deny is not None else DENY_IN_PRIVATE_RUNTIME)
++                            for b in base if b),
+                     f"{short}: not an LG firmware library")
+         for name, info in sorted(elfs.items()):
+             if name.startswith(prefix):
+@@ -105,7 +116,7 @@ def check_private_runtimes(r: Report, elfs: dict[str, wnk_elf.ElfInfo], app_root
+ 
+ 
+ def check_ipk(path: Path, expected_needed: list[str] | None, arch: str,
+-              private_runtimes: list[str] | None = None) -> list[str]:
++              private_runtimes: list[str] | None = None, glibc_runtimes: list[str] | None = None) -> list[str]:
+     r = Report()
+     print(f"check-package: {path}")
+     members = read_ar(path.read_bytes())
+@@ -198,7 +209,8 @@ def check_ipk(path: Path, expected_needed: list[str] | None, arch: str,
+     bundled = {p[len(bundled_dir):]: b for p, b in files.items()
+                if p.startswith(bundled_dir) and "/" not in p[len(bundled_dir):]}
+     private_runtimes = private_runtimes or []
+-    private_prefixes = tuple(f"{app_root}{rt.strip('/')}/" for rt in private_runtimes)
++    glibc_runtimes = glibc_runtimes or []
++    private_prefixes = tuple(f"{app_root}{rt.strip('/')}/" for rt in private_runtimes + glibc_runtimes)
+     elfs: dict[str, wnk_elf.ElfInfo] = {}
+     for name, blob in sorted(files.items()):
+         if not wnk_elf.is_elf(blob):
+@@ -221,6 +233,7 @@ def check_ipk(path: Path, expected_needed: list[str] | None, arch: str,
+         r.check(not any(lib.startswith("libstdc++") for lib in info.needed),
+                 f"{short}: does not need libstdc++.so (link it statically)")
+     check_private_runtimes(r, elfs, app_root, private_runtimes, arch)
++    check_private_runtimes(r, elfs, app_root, glibc_runtimes, arch, FIRMWARE_GLIBC, DENY_IN_GLIBC_RUNTIME)
+ 
+     # Licences (cmake/WebOSPackage.cmake stages them): a package must say what it is under and where
+     # its source is, and carry the licence of everything it bundles.
+@@ -258,13 +271,16 @@ def main(argv: list[str] | None = None) -> int:
+     ap.add_argument("--private-runtime", action="append", default=[], metavar="DIR",
+                     help="app-relative directory holding a self-contained runtime run as a separate process "
+                          "(see DENY_IN_PRIVATE_RUNTIME); repeatable")
++    ap.add_argument("--glibc-runtime", action="append", default=[], metavar="DIR",
++                    help="app-relative directory run as separate processes that use the TV's glibc "
++                         "(see FIRMWARE_GLIBC); repeatable")
+     args = ap.parse_args(argv)
+     expected = None
+     if args.expected_needed:
+         expected = [ln.split("#", 1)[0].strip() for ln in args.expected_needed.read_text().splitlines()
+                     if ln.split("#", 1)[0].strip()]
+     try:
+-        failures = check_ipk(args.ipk, expected, args.arch, args.private_runtime)
++        failures = check_ipk(args.ipk, expected, args.arch, args.private_runtime, args.glibc_runtime)
+     except (OSError, ValueError, tarfile.TarError, wnk_elf.ElfError) as exc:
+         print(f"check-package: cannot read {args.ipk}: {exc}", file=sys.stderr)
+         return 3

@@ -1,0 +1,3 @@
+[submodule "third_party/webos-native-app-kit"]
+	path = third_party/webos-native-app-kit
+	url = https://github.com/Native-Webos/webos-native-app-kit
