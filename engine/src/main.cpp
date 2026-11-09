@@ -1,0 +1,773 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// wpe-engine: runs WPE WebKit for the webOS browser UI app, which spawns it with a SOCK_SEQPACKET socket on
+// fd 3 (common/wpe_ipc.h). Each browser tab is one WebKitWebView; all views share one web process (they are
+// created as related views) to keep memory down on a TV. Only the active tab is visible and renders: pages
+// render on the CPU into shared-memory buffers (platform.cpp), and each frame is copied into a memfd slot
+// the UI maps and draws with the TV's GPU.
+//
+// Environment (set by the UI app):
+//   WPE_BROWSER_DATA_DIR   cookies, local storage (persistent)
+//   WPE_BROWSER_CACHE_DIR  HTTP cache
+//   WEBKIT_EXEC_PATH       where WPEWebProcess / WPENetworkProcess are (patched to work in release builds)
+//   LD_LIBRARY_PATH, GIO_MODULE_DIR, FONTCONFIG_FILE, ... for the bundled libraries
+#include "../../common/wpe_ipc.h"
+#include "platform.h"
+
+#include <wpe/webkit.h>
+
+#include <glib-unix.h>
+
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stddef.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <map>
+#include <memory>
+#include <string>
+
+namespace {
+
+struct Tab {
+    uint32_t id = 0;
+    WebKitWebView *web_view = nullptr;
+    WPEView *view = nullptr;
+};
+
+struct Engine {
+    int sock = WPE_IPC_ENGINE_FD;
+    GMainLoop *loop = nullptr;
+    WPEDisplay *display = nullptr;
+    WebKitNetworkSession *session = nullptr;
+    WebKitSettings *settings = nullptr;
+    std::map<uint32_t, Tab> tabs;
+    uint32_t active = 0;
+    uint32_t width = 1280, height = 720;
+    double zoom = 1.0;
+
+    // Frame slots in a memfd shared with the UI.
+    int frames_fd = -1;
+    uint8_t *frames = nullptr;
+    uint32_t slot_bytes = 0;
+    uint32_t next_slot = 0;
+    uint32_t serial = 0;
+    WPEBuffer *in_flight[WPE_IPC_FRAME_SLOTS] = {};
+    WPEView *in_flight_view[WPE_IPC_FRAME_SLOTS] = {};
+
+    // Pointer state for modifiers and press counts.
+    uint32_t buttons = 0;
+    double pointer_x = 0, pointer_y = 0;
+};
+
+Engine g;
+
+void log_msg(const char *fmt, ...) G_GNUC_PRINTF(1, 2);
+void log_msg(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    fprintf(stderr, "wpe-engine: ");
+    vfprintf(stderr, fmt, ap);
+    fputc('\n', stderr);
+    va_end(ap);
+}
+
+guint32 now_ms()
+{
+    return static_cast<guint32>(g_get_monotonic_time() / 1000);
+}
+
+Tab *tab_by_id(uint32_t id)
+{
+    auto it = g.tabs.find(id);
+    return it == g.tabs.end() ? nullptr : &it->second;
+}
+
+uint32_t tab_of_web_view(WebKitWebView *web_view)
+{
+    for (auto &[id, tab] : g.tabs) {
+        if (tab.web_view == web_view)
+            return id;
+    }
+    return 0;
+}
+
+uint32_t tab_of_view(WPEView *view)
+{
+    for (auto &[id, tab] : g.tabs) {
+        if (tab.view == view)
+            return id;
+    }
+    return 0;
+}
+
+Tab *active_tab()
+{
+    return tab_by_id(g.active);
+}
+
+// ---- sending ---------------------------------------------------------------------------------------------
+
+bool send_msg(uint32_t type, uint32_t tab, const void *payload, uint32_t size, int fd = -1)
+{
+    uint8_t packet[WPE_IPC_MAX_PACKET];
+    if (sizeof(WpeMsgHeader) + size > sizeof(packet))
+        return false;
+    WpeMsgHeader header { type, size, tab };
+    memcpy(packet, &header, sizeof(header));
+    if (size)
+        memcpy(packet + sizeof(header), payload, size);
+
+    iovec iov { packet, sizeof(header) + size };
+    msghdr msg {};
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    alignas(cmsghdr) char control[CMSG_SPACE(sizeof(int))];
+    if (fd >= 0) {
+        msg.msg_control = control;
+        msg.msg_controllen = sizeof(control);
+        cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+        cmsg->cmsg_level = SOL_SOCKET;
+        cmsg->cmsg_type = SCM_RIGHTS;
+        cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+        memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
+    }
+    for (;;) {
+        ssize_t n = sendmsg(g.sock, &msg, MSG_NOSIGNAL);
+        if (n >= 0)
+            return true;
+        if (errno == EINTR)
+            continue;
+        log_msg("send failed: %s", strerror(errno));
+        return false;
+    }
+}
+
+void send_text(uint32_t type, uint32_t tab, const char *text)
+{
+    WpeText t {};
+    const size_t len = text ? std::min<size_t>(strlen(text), WPE_IPC_MAX_TEXT - 1) : 0;
+    t.length = static_cast<uint32_t>(len);
+    if (len)
+        memcpy(t.text, text, len);
+    t.text[len] = '\0';
+    send_msg(type, tab, &t, static_cast<uint32_t>(offsetof(WpeText, text) + len + 1));
+}
+
+void send_error(uint32_t tab, uint32_t kind, uint32_t code, const char *message)
+{
+    WpeError e {};
+    e.kind = kind;
+    e.code = code;
+    const size_t len = message ? std::min<size_t>(strlen(message), WPE_IPC_MAX_TEXT - 1) : 0;
+    e.message.length = static_cast<uint32_t>(len);
+    if (len)
+        memcpy(e.message.text, message, len);
+    send_msg(WPE_ENGINE_ERROR, tab, &e, static_cast<uint32_t>(offsetof(WpeError, message) + offsetof(WpeText, text) + len + 1));
+}
+
+void send_history(uint32_t tab, WebKitWebView *web_view)
+{
+    WpeHistory h { webkit_web_view_can_go_back(web_view) ? 1u : 0u, webkit_web_view_can_go_forward(web_view) ? 1u : 0u };
+    send_msg(WPE_ENGINE_HISTORY, tab, &h, sizeof(h));
+}
+
+// ---- frames ----------------------------------------------------------------------------------------------
+
+bool ensure_frames(uint32_t needed)
+{
+    if (g.frames && needed <= g.slot_bytes)
+        return true;
+    for (auto *b : g.in_flight) {
+        if (b)
+            return false; // cannot remap under a frame the UI is still reading; the caller drops this one
+    }
+    const uint32_t slot = (needed + 0xFFFFFu) & ~0xFFFFFu;
+    if (g.frames) {
+        munmap(g.frames, static_cast<size_t>(g.slot_bytes) * WPE_IPC_FRAME_SLOTS);
+        g.frames = nullptr;
+    }
+    if (g.frames_fd >= 0)
+        close(g.frames_fd);
+    g.frames_fd = memfd_create("wpe-browser-frames", MFD_CLOEXEC);
+    if (g.frames_fd < 0) {
+        log_msg("memfd_create: %s", strerror(errno));
+        return false;
+    }
+    const size_t total = static_cast<size_t>(slot) * WPE_IPC_FRAME_SLOTS;
+    if (ftruncate(g.frames_fd, static_cast<off_t>(total)) < 0) {
+        log_msg("ftruncate: %s", strerror(errno));
+        return false;
+    }
+    void *map = mmap(nullptr, total, PROT_READ | PROT_WRITE, MAP_SHARED, g.frames_fd, 0);
+    if (map == MAP_FAILED) {
+        log_msg("mmap: %s", strerror(errno));
+        return false;
+    }
+    g.frames = static_cast<uint8_t *>(map);
+    g.slot_bytes = slot;
+    g.next_slot = 0;
+    WpeFrames f { slot, WPE_IPC_FRAME_SLOTS };
+    return send_msg(WPE_ENGINE_FRAMES, 0, &f, sizeof(f), g.frames_fd);
+}
+
+void on_frame(void *, WPEView *view, WPEBuffer *buffer, const WPERectangle *damage, guint n_damage)
+{
+    const uint32_t tab = tab_of_view(view);
+    WPEBufferSHM *shm = WPE_BUFFER_SHM(buffer);
+    GBytes *bytes = wpe_buffer_shm_get_data(shm);
+    gsize size = 0;
+    const auto *pixels = static_cast<const uint8_t *>(g_bytes_get_data(bytes, &size));
+    const uint32_t width = static_cast<uint32_t>(wpe_buffer_get_width(buffer));
+    const uint32_t height = static_cast<uint32_t>(wpe_buffer_get_height(buffer));
+    const uint32_t stride = wpe_buffer_shm_get_stride(shm);
+    const uint32_t needed = stride * height;
+    // A hidden tab's frame (e.g. rendered just before a switch) is not shown: hand it straight back.
+    if (tab != g.active || !pixels || size < needed || !ensure_frames(needed)) {
+        webos_view_frame_shown(WEBOS_VIEW(view), buffer);
+        return;
+    }
+
+    uint32_t slot = g.next_slot;
+    for (uint32_t i = 0; i < WPE_IPC_FRAME_SLOTS && g.in_flight[slot]; ++i)
+        slot = (slot + 1) % WPE_IPC_FRAME_SLOTS;
+    if (g.in_flight[slot]) {
+        webos_view_frame_shown(WEBOS_VIEW(view), buffer);
+        return;
+    }
+    g.next_slot = (slot + 1) % WPE_IPC_FRAME_SLOTS;
+    memcpy(g.frames + static_cast<size_t>(slot) * g.slot_bytes, pixels, needed);
+
+    WpeFrame f {};
+    f.slot = slot;
+    f.serial = ++g.serial;
+    f.width = width;
+    f.height = height;
+    f.stride = stride;
+    if (n_damage > 0 && n_damage <= WPE_IPC_MAX_DAMAGE) {
+        f.n_damage = n_damage;
+        for (guint i = 0; i < n_damage; ++i)
+            f.damage[i] = WpeRect { damage[i].x, damage[i].y, damage[i].width, damage[i].height };
+    } else if (n_damage > WPE_IPC_MAX_DAMAGE) {
+        int x0 = damage[0].x, y0 = damage[0].y, x1 = x0 + damage[0].width, y1 = y0 + damage[0].height;
+        for (guint i = 1; i < n_damage; ++i) {
+            x0 = std::min(x0, damage[i].x);
+            y0 = std::min(y0, damage[i].y);
+            x1 = std::max(x1, damage[i].x + damage[i].width);
+            y1 = std::max(y1, damage[i].y + damage[i].height);
+        }
+        f.n_damage = 1;
+        f.damage[0] = WpeRect { x0, y0, x1 - x0, y1 - y0 };
+    }
+    g.in_flight[slot] = WPE_BUFFER(g_object_ref(buffer));
+    g.in_flight_view[slot] = WPE_VIEW(g_object_ref(view));
+    if (!send_msg(WPE_ENGINE_FRAME, tab, &f, sizeof(f))) {
+        g_clear_object(&g.in_flight[slot]);
+        g_clear_object(&g.in_flight_view[slot]);
+        webos_view_frame_shown(WEBOS_VIEW(view), buffer);
+    }
+}
+
+void frame_done(const WpeFrameDone &d)
+{
+    if (d.slot >= WPE_IPC_FRAME_SLOTS || !g.in_flight[d.slot])
+        return;
+    WPEBuffer *buffer = g.in_flight[d.slot];
+    WPEView *view = g.in_flight_view[d.slot];
+    g.in_flight[d.slot] = nullptr;
+    g.in_flight_view[d.slot] = nullptr;
+    webos_view_frame_shown(WEBOS_VIEW(view), buffer);
+    g_object_unref(buffer);
+    g_object_unref(view);
+}
+
+void on_ime_focus(void *, WPEView *view, gboolean focused, WPEInputPurpose purpose, int x, int y, int width, int height)
+{
+    WpeIme m { focused ? 1u : 0u, static_cast<uint32_t>(purpose), x, y, width, height };
+    send_msg(WPE_ENGINE_IME, tab_of_view(view), &m, sizeof(m));
+}
+
+// ---- input (always to the active tab) --------------------------------------------------------------------
+
+void dispatch(WPEEvent *event)
+{
+    if (event)
+        wpe_view_event(wpe_event_get_view(event), event);
+    if (event)
+        wpe_event_unref(event);
+}
+
+WPEModifiers button_modifier(uint32_t button)
+{
+    switch (button) {
+    case 1: return WPE_MODIFIER_POINTER_BUTTON1;
+    case 2: return WPE_MODIFIER_POINTER_BUTTON2;
+    case 3: return WPE_MODIFIER_POINTER_BUTTON3;
+    default: return static_cast<WPEModifiers>(0);
+    }
+}
+
+void handle_key(WPEView *view, const WpeKey &k)
+{
+    dispatch(wpe_event_keyboard_new(k.down ? WPE_EVENT_KEYBOARD_KEY_DOWN : WPE_EVENT_KEYBOARD_KEY_UP, view,
+        WPE_INPUT_SOURCE_KEYBOARD, now_ms(), static_cast<WPEModifiers>(k.modifiers), k.keycode, k.keyval));
+}
+
+void handle_pointer(WPEView *view, const WpePointer &p)
+{
+    const double x = p.x, y = p.y;
+    const guint32 t = p.time_ms ? p.time_ms : now_ms();
+    switch (p.kind) {
+    case WPE_POINTER_MOVE: {
+        const double dx = x - g.pointer_x, dy = y - g.pointer_y;
+        g.pointer_x = x;
+        g.pointer_y = y;
+        dispatch(wpe_event_pointer_move_new(WPE_EVENT_POINTER_MOVE, view, WPE_INPUT_SOURCE_MOUSE, t,
+            static_cast<WPEModifiers>(g.buttons), x, y, dx, dy));
+        break;
+    }
+    case WPE_POINTER_DOWN:
+    case WPE_POINTER_UP: {
+        const bool down = p.kind == WPE_POINTER_DOWN;
+        g.pointer_x = x;
+        g.pointer_y = y;
+        const WPEModifiers bit = button_modifier(p.button);
+        if (down)
+            g.buttons |= bit;
+        else
+            g.buttons &= ~static_cast<uint32_t>(bit);
+        const guint count = down ? wpe_view_compute_press_count(view, x, y, p.button, t) : 0;
+        dispatch(wpe_event_pointer_button_new(down ? WPE_EVENT_POINTER_DOWN : WPE_EVENT_POINTER_UP, view,
+            WPE_INPUT_SOURCE_MOUSE, t, static_cast<WPEModifiers>(g.buttons), p.button, x, y, count));
+        break;
+    }
+    case WPE_POINTER_LEAVE:
+        dispatch(wpe_event_pointer_move_new(WPE_EVENT_POINTER_LEAVE, view, WPE_INPUT_SOURCE_MOUSE, t,
+            static_cast<WPEModifiers>(g.buttons), g.pointer_x, g.pointer_y, 0, 0));
+        break;
+    }
+}
+
+void handle_scroll(WPEView *view, const WpeScroll &s)
+{
+    // Wheel notches, not pixels (precise_deltas = FALSE). WPE's sign is the opposite of ours: like its
+    // Wayland platform, negative means "content moves up" (scroll down).
+    dispatch(wpe_event_scroll_new(view, WPE_INPUT_SOURCE_MOUSE, now_ms(), static_cast<WPEModifiers>(g.buttons),
+        -s.delta_x / 120.0, -s.delta_y / 120.0, FALSE, FALSE, s.x, s.y));
+}
+
+void resize_view(WPEView *view)
+{
+    if (WPEToplevel *toplevel = wpe_view_get_toplevel(view))
+        wpe_toplevel_resize(toplevel, static_cast<int>(g.width), static_cast<int>(g.height));
+    else
+        wpe_view_resized(view, static_cast<int>(g.width), static_cast<int>(g.height));
+}
+
+void resize(uint32_t width, uint32_t height)
+{
+    g.width = std::clamp<uint32_t>(width, 64, 3840);
+    g.height = std::clamp<uint32_t>(height, 64, 2160);
+    for (auto &[id, tab] : g.tabs)
+        resize_view(tab.view);
+}
+
+// ---- WebKit signals (user_data = nothing; the tab is looked up from the view) ----------------------------
+
+void on_uri(WebKitWebView *view, GParamSpec *, gpointer) { send_text(WPE_ENGINE_URI, tab_of_web_view(view), webkit_web_view_get_uri(view)); }
+void on_title(WebKitWebView *view, GParamSpec *, gpointer) { send_text(WPE_ENGINE_TITLE, tab_of_web_view(view), webkit_web_view_get_title(view)); }
+
+void on_progress(WebKitWebView *view, GParamSpec *, gpointer)
+{
+    WpeProgress p { static_cast<uint32_t>(std::clamp(webkit_web_view_get_estimated_load_progress(view), 0.0, 1.0) * 1000) };
+    send_msg(WPE_ENGINE_PROGRESS, tab_of_web_view(view), &p, sizeof(p));
+}
+
+void on_load_changed(WebKitWebView *view, WebKitLoadEvent event, gpointer)
+{
+    WpeLoad l {};
+    switch (event) {
+    case WEBKIT_LOAD_STARTED: l.event = WPE_LOAD_STARTED; break;
+    case WEBKIT_LOAD_COMMITTED: l.event = WPE_LOAD_COMMITTED; break;
+    case WEBKIT_LOAD_FINISHED: l.event = WPE_LOAD_FINISHED; break;
+    default: return;
+    }
+    const uint32_t tab = tab_of_web_view(view);
+    send_msg(WPE_ENGINE_LOAD, tab, &l, sizeof(l));
+    send_history(tab, view);
+}
+
+gboolean on_load_failed(WebKitWebView *view, WebKitLoadEvent, gchar *uri, GError *error, gpointer)
+{
+    const uint32_t tab = tab_of_web_view(view);
+    WpeLoad l { WPE_LOAD_FAILED };
+    send_msg(WPE_ENGINE_LOAD, tab, &l, sizeof(l));
+    if (!g_error_matches(error, WEBKIT_NETWORK_ERROR, WEBKIT_NETWORK_ERROR_CANCELLED)) {
+        log_msg("load failed for %s: %s", uri, error->message);
+        send_error(tab, WPE_ERROR_LOAD, static_cast<uint32_t>(error->code), error->message);
+    }
+    return FALSE; // let WebKit show its error page
+}
+
+gboolean on_tls_error(WebKitWebView *view, gchar *uri, GTlsCertificate *, GTlsCertificateFlags flags, gpointer)
+{
+    log_msg("TLS error for %s (flags 0x%x)", uri, flags);
+    send_error(tab_of_web_view(view), WPE_ERROR_TLS, flags, uri);
+    return FALSE;
+}
+
+void on_web_process_terminated(WebKitWebView *view, WebKitWebProcessTerminationReason reason, gpointer)
+{
+    const char *why = reason == WEBKIT_WEB_PROCESS_CRASHED ? "crashed"
+        : reason == WEBKIT_WEB_PROCESS_EXCEEDED_MEMORY_LIMIT ? "used too much memory" : "was terminated";
+    log_msg("web process %s", why);
+    send_error(tab_of_web_view(view), WPE_ERROR_WEB_PROCESS_CRASHED, static_cast<uint32_t>(reason), why);
+}
+
+void on_history_changed(WebKitBackForwardList *, WebKitBackForwardListItem *, gpointer, gpointer web_view)
+{
+    auto *view = WEBKIT_WEB_VIEW(web_view);
+    send_history(tab_of_web_view(view), view);
+}
+
+// target=_blank and window.open load in the same tab: the UI decides about new tabs, not pages.
+WebKitWebView *on_create(WebKitWebView *view, WebKitNavigationAction *action, gpointer)
+{
+    if (WebKitURIRequest *request = webkit_navigation_action_get_request(action))
+        webkit_web_view_load_uri(view, webkit_uri_request_get_uri(request));
+    return nullptr;
+}
+
+// ---- tabs ------------------------------------------------------------------------------------------------
+
+void tab_open(uint32_t id, const std::string &uri)
+{
+    if (!id || tab_by_id(id))
+        return;
+    // Related views share the first view's web process: one process for every tab saves a lot of memory
+    // on a TV (a page crash then takes all tabs down, and the UI reloads them).
+    WebKitWebView *related = nullptr;
+    for (auto &[other, tab] : g.tabs) {
+        related = tab.web_view;
+        break;
+    }
+    WebKitWebView *web_view = related
+        // The display must be passed to related views too: without it WebKit would use
+        // wpe_display_get_default(), which creates a display of another platform instead of ours.
+        ? WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW, "related-view", related, "display", g.display,
+            "settings", g.settings, nullptr))
+        : WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW, "display", g.display, "network-session", g.session,
+            "settings", g.settings, nullptr));
+    WPEView *view = webkit_web_view_get_wpe_view(web_view);
+    if (!view) {
+        log_msg("WebKit did not create a WPEView for tab %u", id);
+        g_object_unref(web_view);
+        send_error(id, WPE_ERROR_FATAL, 0, "could not create a view");
+        return;
+    }
+    g.tabs[id] = Tab { id, web_view, view };
+
+    g_signal_connect(web_view, "notify::uri", G_CALLBACK(on_uri), nullptr);
+    g_signal_connect(web_view, "notify::title", G_CALLBACK(on_title), nullptr);
+    g_signal_connect(web_view, "notify::estimated-load-progress", G_CALLBACK(on_progress), nullptr);
+    g_signal_connect(web_view, "load-changed", G_CALLBACK(on_load_changed), nullptr);
+    g_signal_connect(web_view, "load-failed", G_CALLBACK(on_load_failed), nullptr);
+    g_signal_connect(web_view, "load-failed-with-tls-errors", G_CALLBACK(on_tls_error), nullptr);
+    g_signal_connect(web_view, "web-process-terminated", G_CALLBACK(on_web_process_terminated), nullptr);
+    g_signal_connect(web_view, "create", G_CALLBACK(on_create), nullptr);
+    g_signal_connect(webkit_web_view_get_back_forward_list(web_view), "changed", G_CALLBACK(on_history_changed), web_view);
+
+    resize_view(view);
+    webkit_web_view_set_zoom_level(web_view, g.zoom);
+    const bool active = id == g.active;
+    wpe_view_set_visible(view, active);
+    if (active)
+        wpe_view_focus_in(view);
+    if (!uri.empty())
+        webkit_web_view_load_uri(web_view, uri.c_str());
+    log_msg("tab %u opened (%zu open)", id, g.tabs.size());
+}
+
+void tab_close(uint32_t id)
+{
+    auto it = g.tabs.find(id);
+    if (it == g.tabs.end())
+        return;
+    // Frames of this view still in flight keep their own references (released on FRAME_DONE).
+    g_signal_handlers_disconnect_by_data(webkit_web_view_get_back_forward_list(it->second.web_view), it->second.web_view);
+    webkit_web_view_try_close(it->second.web_view);
+    g_object_unref(it->second.web_view);
+    g.tabs.erase(it);
+    if (g.active == id)
+        g.active = 0;
+    log_msg("tab %u closed (%zu open)", id, g.tabs.size());
+}
+
+void tab_activate(uint32_t id)
+{
+    if (g.active == id)
+        return;
+    if (Tab *old = active_tab()) {
+        wpe_view_focus_out(old->view);
+        wpe_view_set_visible(old->view, FALSE);
+    }
+    g.active = id;
+    if (Tab *tab = active_tab()) {
+        wpe_view_set_visible(tab->view, TRUE);
+        wpe_view_focus_in(tab->view);
+        send_history(id, tab->web_view);
+    }
+}
+
+// ---- website data and zoom ---------------------------------------------------------------------------------
+
+void clear_data(const WpeClearData &c)
+{
+    unsigned types = 0;
+    if (c.what & WPE_CLEAR_COOKIES_AND_SITE_DATA)
+        types |= WEBKIT_WEBSITE_DATA_COOKIES | WEBKIT_WEBSITE_DATA_SESSION_STORAGE | WEBKIT_WEBSITE_DATA_LOCAL_STORAGE
+            | WEBKIT_WEBSITE_DATA_INDEXEDDB_DATABASES | WEBKIT_WEBSITE_DATA_SERVICE_WORKER_REGISTRATIONS
+            | WEBKIT_WEBSITE_DATA_DOM_CACHE | WEBKIT_WEBSITE_DATA_HSTS_CACHE | WEBKIT_WEBSITE_DATA_OFFLINE_APPLICATION_CACHE;
+    if (c.what & WPE_CLEAR_CACHE)
+        types |= WEBKIT_WEBSITE_DATA_MEMORY_CACHE | WEBKIT_WEBSITE_DATA_DISK_CACHE;
+    if (!types) {
+        WpeDataCleared done { c.what, 1 };
+        send_msg(WPE_ENGINE_DATA_CLEARED, 0, &done, sizeof(done));
+        return;
+    }
+    auto *what = new uint32_t(c.what);
+    // timespan: GTimeSpan in microseconds; 0 = everything.
+    webkit_website_data_manager_clear(webkit_network_session_get_website_data_manager(g.session),
+        static_cast<WebKitWebsiteDataTypes>(types), static_cast<GTimeSpan>(c.seconds) * G_TIME_SPAN_SECOND, nullptr,
+        [](GObject *source, GAsyncResult *result, gpointer data) {
+            std::unique_ptr<uint32_t> what(static_cast<uint32_t *>(data));
+            GError *error = nullptr;
+            const gboolean ok = webkit_website_data_manager_clear_finish(WEBKIT_WEBSITE_DATA_MANAGER(source), result, &error);
+            if (!ok) {
+                log_msg("clearing website data failed: %s", error ? error->message : "?");
+                g_clear_error(&error);
+            }
+            WpeDataCleared done { *what, ok ? 1u : 0u };
+            send_msg(WPE_ENGINE_DATA_CLEARED, 0, &done, sizeof(done));
+        },
+        what);
+}
+
+void set_zoom(uint32_t permille)
+{
+    g.zoom = std::clamp(permille, 250u, 5000u) / 1000.0;
+    for (auto &[id, tab] : g.tabs)
+        webkit_web_view_set_zoom_level(tab.web_view, g.zoom);
+}
+
+// ---- receiving -------------------------------------------------------------------------------------------
+
+template<typename T> const T *payload(const uint8_t *buf, ssize_t n, const WpeMsgHeader &h, size_t min = sizeof(T))
+{
+    if (h.size < min || static_cast<size_t>(n) < sizeof(WpeMsgHeader) + min)
+        return nullptr;
+    return reinterpret_cast<const T *>(buf + sizeof(WpeMsgHeader));
+}
+
+std::string text_of(const uint8_t *buf, ssize_t n, const WpeMsgHeader &h)
+{
+    if (h.size < offsetof(WpeText, text) || static_cast<size_t>(n) < sizeof(WpeMsgHeader) + offsetof(WpeText, text))
+        return {};
+    const auto *t = reinterpret_cast<const WpeText *>(buf + sizeof(WpeMsgHeader));
+    const size_t avail = static_cast<size_t>(n) - sizeof(WpeMsgHeader) - offsetof(WpeText, text);
+    return std::string(t->text, std::min<size_t>({ t->length, avail, WPE_IPC_MAX_TEXT - 1 }));
+}
+
+void handle_message(const uint8_t *buf, ssize_t n)
+{
+    WpeMsgHeader h;
+    memcpy(&h, buf, sizeof(h));
+    Tab *tab = tab_by_id(h.tab);      // navigation target
+    Tab *active = active_tab();       // input target
+    switch (h.type) {
+    case WPE_APP_TAB_OPEN: tab_open(h.tab, text_of(buf, n, h)); break;
+    case WPE_APP_TAB_CLOSE: tab_close(h.tab); break;
+    case WPE_APP_TAB_ACTIVATE: tab_activate(h.tab); break;
+    case WPE_APP_LOAD_URI: {
+        const std::string uri = text_of(buf, n, h);
+        if (tab && !uri.empty())
+            webkit_web_view_load_uri(tab->web_view, uri.c_str());
+        break;
+    }
+    case WPE_APP_GO_BACK: if (tab) webkit_web_view_go_back(tab->web_view); break;
+    case WPE_APP_GO_FORWARD: if (tab) webkit_web_view_go_forward(tab->web_view); break;
+    case WPE_APP_RELOAD: if (tab) webkit_web_view_reload(tab->web_view); break;
+    case WPE_APP_STOP: if (tab) webkit_web_view_stop_loading(tab->web_view); break;
+    case WPE_APP_RUN_JS: {
+        const std::string script = text_of(buf, n, h);
+        if (tab)
+            webkit_web_view_evaluate_javascript(tab->web_view, script.c_str(), static_cast<gssize>(script.size()),
+                nullptr, nullptr, nullptr, nullptr, nullptr);
+        break;
+    }
+    case WPE_APP_RESIZE:
+        if (auto *s = payload<WpeSize>(buf, n, h))
+            resize(s->width, s->height);
+        break;
+    case WPE_APP_VISIBLE:
+        if (auto *f = payload<WpeFlag>(buf, n, h); f && active)
+            wpe_view_set_visible(active->view, f->value != 0);
+        break;
+    case WPE_APP_FOCUS:
+        if (auto *f = payload<WpeFlag>(buf, n, h); f && active) {
+            if (f->value)
+                wpe_view_focus_in(active->view);
+            else
+                wpe_view_focus_out(active->view);
+        }
+        break;
+    case WPE_APP_KEY:
+        if (auto *k = payload<WpeKey>(buf, n, h); k && active)
+            handle_key(active->view, *k);
+        break;
+    case WPE_APP_POINTER:
+        if (auto *p = payload<WpePointer>(buf, n, h); p && active)
+            handle_pointer(active->view, *p);
+        break;
+    case WPE_APP_SCROLL:
+        if (auto *s = payload<WpeScroll>(buf, n, h); s && active)
+            handle_scroll(active->view, *s);
+        break;
+    case WPE_APP_TEXT_COMMIT: {
+        const std::string text = text_of(buf, n, h);
+        webos_display_commit_text(WEBOS_DISPLAY(g.display), text.c_str());
+        break;
+    }
+    case WPE_APP_FRAME_DONE:
+        if (auto *d = payload<WpeFrameDone>(buf, n, h))
+            frame_done(*d);
+        break;
+    case WPE_APP_CLEAR_DATA:
+        if (auto *c = payload<WpeClearData>(buf, n, h))
+            clear_data(*c);
+        break;
+    case WPE_APP_SET_ZOOM:
+        if (auto *z = payload<WpeZoom>(buf, n, h))
+            set_zoom(z->permille);
+        break;
+    case WPE_APP_QUIT:
+        g_main_loop_quit(g.loop);
+        break;
+    default:
+        log_msg("ignoring message type %u", h.type);
+    }
+}
+
+gboolean on_socket(gint fd, GIOCondition condition, gpointer)
+{
+    if (condition & (G_IO_HUP | G_IO_ERR)) {
+        log_msg("UI closed the connection");
+        g_main_loop_quit(g.loop);
+        return G_SOURCE_REMOVE;
+    }
+    alignas(WpeMsgHeader) uint8_t buf[WPE_IPC_MAX_PACKET];
+    for (;;) {
+        ssize_t n = recv(fd, buf, sizeof(buf), MSG_DONTWAIT);
+        if (n < 0) {
+            if (errno == EINTR)
+                continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+                return G_SOURCE_CONTINUE;
+            log_msg("recv: %s", strerror(errno));
+            g_main_loop_quit(g.loop);
+            return G_SOURCE_REMOVE;
+        }
+        if (n == 0) {
+            g_main_loop_quit(g.loop);
+            return G_SOURCE_REMOVE;
+        }
+        if (static_cast<size_t>(n) >= sizeof(WpeMsgHeader))
+            handle_message(buf, n);
+    }
+}
+
+std::string env_or(const char *name, const char *fallback)
+{
+    const char *v = g_getenv(name);
+    return v && *v ? v : fallback;
+}
+
+} // namespace
+
+int main(int, char **)
+{
+    signal(SIGPIPE, SIG_IGN);
+    if (fcntl(g.sock, F_GETFD) < 0) {
+        fprintf(stderr, "wpe-engine: fd %d is not open; this program is started by the browser app\n", g.sock);
+        return 2;
+    }
+
+    // The UI speaks first: protocol version and the page size.
+    alignas(WpeMsgHeader) uint8_t buf[WPE_IPC_MAX_PACKET];
+    ssize_t n;
+    do {
+        n = recv(g.sock, buf, sizeof(buf), 0);
+    } while (n < 0 && errno == EINTR);
+    WpeMsgHeader h {};
+    if (n >= static_cast<ssize_t>(sizeof(h)))
+        memcpy(&h, buf, sizeof(h));
+    const auto *hello = h.type == WPE_APP_HELLO ? payload<WpeAppHello>(buf, n, h) : nullptr;
+    if (!hello || hello->version != WPE_IPC_VERSION) {
+        log_msg("bad or missing hello (type %u)", h.type);
+        return 3;
+    }
+    g.width = hello->width;
+    g.height = hello->height;
+
+    g.loop = g_main_loop_new(nullptr, FALSE);
+
+    WebOSSink sink { on_frame, on_ime_focus, nullptr };
+    g.display = webos_display_new(&sink);
+    GError *error = nullptr;
+    if (!wpe_display_connect(g.display, &error)) {
+        log_msg("display: %s", error->message);
+        return 4;
+    }
+    wpe_display_set_primary(g.display);
+
+    const std::string data_dir = env_or("WPE_BROWSER_DATA_DIR", "/tmp/wpe-browser/data");
+    const std::string cache_dir = env_or("WPE_BROWSER_CACHE_DIR", "/tmp/wpe-browser/cache");
+    g_mkdir_with_parents(data_dir.c_str(), 0700);
+    g_mkdir_with_parents(cache_dir.c_str(), 0700);
+    g.session = webkit_network_session_new(data_dir.c_str(), cache_dir.c_str());
+    webkit_cookie_manager_set_persistent_storage(webkit_network_session_get_cookie_manager(g.session),
+        (data_dir + "/cookies.sqlite").c_str(), WEBKIT_COOKIE_PERSISTENT_STORAGE_SQLITE);
+
+    g.settings = webkit_settings_new();
+    webkit_settings_set_enable_spatial_navigation(g.settings, TRUE);
+    webkit_settings_set_user_agent_with_application_details(g.settings, "WPEBrowser-webOS", "0.2");
+    webkit_settings_set_enable_developer_extras(g.settings, FALSE);
+
+    g_unix_fd_add(g.sock, static_cast<GIOCondition>(G_IO_IN | G_IO_HUP | G_IO_ERR), on_socket, nullptr);
+
+    WpeEngineReady ready { WPE_IPC_VERSION, webkit_get_major_version(), webkit_get_minor_version(), webkit_get_micro_version() };
+    send_msg(WPE_ENGINE_READY, 0, &ready, sizeof(ready));
+    log_msg("ready: WPE WebKit %u.%u.%u, page %ux%u", ready.webkit_major, ready.webkit_minor, ready.webkit_micro,
+        g.width, g.height);
+
+    g_main_loop_run(g.loop);
+
+    for (uint32_t i = 0; i < WPE_IPC_FRAME_SLOTS; ++i) {
+        g_clear_object(&g.in_flight[i]);
+        g_clear_object(&g.in_flight_view[i]);
+    }
+    while (!g.tabs.empty())
+        tab_close(g.tabs.begin()->first);
+    g_object_unref(g.settings);
+    g_object_unref(g.session);
+    g_object_unref(g.display);
+    g_main_loop_unref(g.loop);
+    return 0;
+}
