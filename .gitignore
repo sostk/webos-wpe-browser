@@ -1,0 +1,14 @@
+# build output (the toolchain, Buildroot source/output and downloads live in ~/webos-browser-build)
+build/
+/browser/build/
+/engine/build/
+*.ipk
+*.o
+*.so
+*.so.*
+# screenshots and scratch files
+*.png
+!browser/icon.png
+!browser/largeIcon.png
+.cache/
+__pycache__/
