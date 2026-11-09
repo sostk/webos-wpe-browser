@@ -132,3 +132,9 @@
   can't be exec'd with a system PT_INTERP, but PT_INTERP can point at a fixed path such as /tmp/wpe-browser/ld-linux-armhf.so.3 that the UI
   sets up at start (like the CA bundle). That would enable the ARMv7 JIT. It means rebuilding the toolchain and all packages.
   **2026-11-10:** the first WebKit compile was stopped at step 3491/7656: 6 parallel jobs exhausted the PC's 15 GB (cc1plus killed). Resumed with `make BR2_JLEVEL=4` (`~/webos-browser-build/br-build3.log`).
+- 2026-11-10 **Compile error at WebCore/platform/graphics/gbm/MemoryMappedGPUBuffer.cpp: `linux/dma-buf.h` missing.** That uapi header
+  appeared in Linux 4.6; the toolchain has 4.4 headers. Fix: `toolchain/extra-headers/linux/dma-buf.h` (copy of the uapi header) copied into
+  Buildroot's sysroot `br-out/host/arm-buildroot-linux-gnueabi/sysroot/usr/include/linux/`. crosstool-ng leaves `x-tools/.../sysroot` read-only,
+  so after a toolchain rebuild or a fresh `br-out`, copy it again (`chmod u+w` the directory first for x-tools). The code that uses it only runs for
+  GBM/dma-buf buffers, which the engine never creates. Alternative for a clean rebuild: `-DUSE_GBM=OFF -DUSE_LIBDRM=OFF` (needs reconfigure = full rebuild).
+  Resumed with `br-build4.log`.
