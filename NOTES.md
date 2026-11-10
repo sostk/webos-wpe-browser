@@ -146,3 +146,7 @@
   Not yet tested: loading a page. The script step `text@...` did not type into the NTP search box on the TV (works on the host);
   use D-pad steps instead. The kit script's final `wait@` does not hold: add a trailing `wait@10` step.
   **User asked to pause TV testing (2026-11-10).**
+- 2026-11-10 **Full ipk with the engine builds and passes check-package**: `browser/build/webos-release/dist/org.sostk.wpebrowser_0.2.0_arm.ipk`,
+  94.5 MB (200 MB unpacked). One fix: Mesa's libEGL linked libwayland-client/-server (Buildroot adds the wayland EGL platform because
+  wpewebkit selects wayland); external.mk now passes `-Dplatforms= -Dlegacy-wayland=` to Mesa (surfaceless + drm only). 55 libraries in engine/lib.
+  Not installed on the TV (TV testing paused at the user's request).
