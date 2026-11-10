@@ -1,0 +1,24 @@
+Skia: no pcs("aapcs-vfp") stage ABI for GCC on 32-bit ARM
+
+The highp/lowp raster pipeline passes r,g,b,a between stages through a Stage
+function-pointer type marked __attribute__((pcs("aapcs-vfp"))). With GCC and
+-mfloat-abi=softfp the stage functions and the calls through that pointer type do
+not agree on where the vectors go, so every 4-pixel group gets other lanes' and
+channels' values: linear gradients, CSS masks and colour filters are drawn as
+vertical stripes. Use the attribute only with clang; GCC keeps the NEON stages
+with its default ABI (output identical to SKRP_CPU_SCALAR).
+
+--- a/Source/ThirdParty/skia/src/opts/SkRasterPipeline_opts.h
++++ b/Source/ThirdParty/skia/src/opts/SkRasterPipeline_opts.h
+@@ -1520,7 +1520,10 @@
+ 
+ // Any custom ABI to use for all (non-externally-facing) stage functions?
+ // Also decide here whether to use narrow (compromise) or wide (ideal) stages.
+-#if defined(SK_CPU_ARM32) && defined(SKRP_CPU_NEON)
++// webOS browser: only with clang. GCC (softfp, -mfpu=neon) does not give the Stage function-pointer type the
++// same pcs("aapcs-vfp") convention as the stage functions, so r,g,b,a arrive in the wrong registers: gradients,
++// masks and colour filters come out as 4-pixel stripes. Without it GCC keeps the NEON code with its own ABI.
++#if defined(SK_CPU_ARM32) && defined(SKRP_CPU_NEON) && defined(__clang__)
+     // This lets us pass vectors more efficiently on 32-bit ARM.
+     // We can still only pass 16 floats, so best as 4x {r,g,b,a}.
+     #define ABI __attribute__((pcs("aapcs-vfp")))

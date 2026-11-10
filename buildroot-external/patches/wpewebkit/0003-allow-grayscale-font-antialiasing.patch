@@ -1,0 +1,19 @@
+Allow grayscale font antialiasing
+
+WPESettings has no "none" subpixel layout and WPE always reports one, so text is
+always drawn with LCD subpixel antialiasing. Map unknown layout values to "none".
+
+--- a/Source/WebKit/UIProcess/wpe/SystemSettingsManagerProxyWPE.cpp
++++ b/Source/WebKit/UIProcess/wpe/SystemSettingsManagerProxyWPE.cpp
+@@ -147,8 +147,9 @@
+     case WPE_SETTINGS_SUBPIXEL_LAYOUT_VBGR:
+         return "vbgr"_s;
+     }
+-    ASSERT_NOT_REACHED();
+-    return "rgb"_s;
++    // webOS browser: any other value means "no subpixel layout", so text gets grayscale antialiasing.
++    // TV panels (OLED WRGB, scaled output) show LCD subpixel antialiasing as coloured, soft text.
++    return "none"_s;
+ }
+ 
+ int SystemSettingsManagerProxy::xftDPI() const

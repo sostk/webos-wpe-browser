@@ -1,0 +1,66 @@
+# Hard-float engine: a private runtime (own glibc + loader) next to the softfp webOS userland. JavaScriptCore's
+# ARMv7 JIT and WebAssembly need hard-float + Thumb-2 (PlatformEnable.h). The UI app stays softfp (NDK).
+BR2_arm=y
+BR2_cortex_a9=y
+BR2_ARM_ENABLE_VFP=y
+BR2_ARM_ENABLE_NEON=y
+BR2_ARM_FPU_NEON=y
+BR2_ARM_EABIHF=y
+BR2_ARM_INSTRUCTIONS_THUMB2=y
+# Toolchain: crosstool-ng hard-float, GCC 14.2, glibc 2.28 (bundled in the ipk), Linux 4.4 headers
+BR2_TOOLCHAIN_EXTERNAL=y
+BR2_TOOLCHAIN_EXTERNAL_CUSTOM=y
+BR2_TOOLCHAIN_EXTERNAL_PREINSTALLED=y
+BR2_TOOLCHAIN_EXTERNAL_PATH="/build/x-tools/arm-webos-linux-gnueabihf"
+BR2_TOOLCHAIN_EXTERNAL_CUSTOM_PREFIX="arm-webos-linux-gnueabihf"
+BR2_TOOLCHAIN_EXTERNAL_GCC_14=y
+BR2_TOOLCHAIN_EXTERNAL_HEADERS_4_4=y
+BR2_TOOLCHAIN_EXTERNAL_CUSTOM_GLIBC=y
+BR2_TOOLCHAIN_EXTERNAL_CXX=y
+# The engine's glibc is private, so it needs its own iconv modules (the TV's are softfp).
+BR2_TOOLCHAIN_GLIBC_GCONV_LIBS_COPY=y
+# No system: we only want libraries in staging/target to bundle into the ipk
+BR2_INIT_NONE=y
+BR2_SYSTEM_BIN_SH_NONE=y
+# BR2_PACKAGE_BUSYBOX is not set
+# BR2_TARGET_ROOTFS_TAR is not set
+BR2_DL_DIR="/build/dl"
+BR2_GLOBAL_PATCH_DIR="/src/buildroot-external/patches"
+BR2_JLEVEL=4
+BR2_CCACHE=y
+BR2_CCACHE_DIR="/build/ccache"
+# Engine
+BR2_PACKAGE_WPEWEBKIT=y
+BR2_PACKAGE_WOFF2=y
+# Mesa: bundled for WPEWebProcess only. WebKit's compositor needs EGL_MESA_platform_surfaceless
+# (AcceleratedSurface::SwapChain -> Type::SharedMemory), which the TV's Mali EGL lacks. llvmpipe = fast software GL.
+# The UI process (kit/SDL) keeps using the TV's Mali libEGL/libGLESv2.
+BR2_PACKAGE_MESA3D=y
+BR2_PACKAGE_MESA3D_LLVM=y
+BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_LLVMPIPE=y
+BR2_PACKAGE_MESA3D_GALLIUM_DRIVER_SOFTPIPE=y
+BR2_PACKAGE_MESA3D_OPENGL_EGL=y
+BR2_PACKAGE_MESA3D_OPENGL_ES=y
+# HTTPS for libsoup3
+BR2_PACKAGE_GLIB_NETWORKING=y
+BR2_PACKAGE_GNUTLS=y
+BR2_PACKAGE_CA_CERTIFICATES=y
+# Fonts (bundled; LG's own fonts can be added through fontconfig later)
+BR2_PACKAGE_DEJAVU=y
+
+# Browser multimedia: keep upstream GStreamer MediaSource support, including JS-fed streams.
+BR2_PACKAGE_WPEWEBKIT_MULTIMEDIA=y
+# BR2_PACKAGE_WPEWEBKIT_USE_GSTREAMER_GL is not set
+BR2_PACKAGE_GSTREAMER1_INSTALL_TOOLS=y
+BR2_PACKAGE_GST1_PLUGINS_GOOD_PLUGIN_AUDIOPARSERS=y
+BR2_PACKAGE_GST1_PLUGINS_BAD_PLUGIN_VIDEOPARSERS=y
+BR2_PACKAGE_GST1_PLUGINS_BASE_PLUGIN_OPUS=y
+BR2_PACKAGE_GST1_PLUGINS_BASE_PLUGIN_VORBIS=y
+BR2_PACKAGE_GST1_PLUGINS_GOOD_PLUGIN_SOUPHTTPSRC=y
+BR2_PACKAGE_GST1_PLUGINS_GOOD_ADAPTIVEMUX2=y
+BR2_PACKAGE_GST1_PLUGINS_GOOD_PLUGIN_PULSE=y
+# Use the existing TV sound server; do not ship/start a daemon.
+# BR2_PACKAGE_PULSEAUDIO_DAEMON is not set
+
+# Rendering is embedded into WPEPlatform; do not bundle a second Wayland client.
+# BR2_PACKAGE_GST1_PLUGINS_BAD_PLUGIN_WAYLAND is not set

@@ -16,6 +16,17 @@ GNUTLS_CONF_OPTS += --with-default-trust-store-file=/tmp/wpe-browser/ca-certific
 # and webOS userland is softfp, so WebKit turns the baseline JIT off in its headers while CMake keeps DFG on:
 # "DFG and FTL JIT require baseline JIT to be enabled". Buildroot only does this for ARMv5/v6/MIPS
 # (https://bugs.webkit.org/show_bug.cgi?id=278559); do the same here: the portable CLoop interpreter.
+# The hard-float build (webos_browser_hf_defconfig, private glibc) keeps WebKit's defaults: baseline + DFG JIT, WebAssembly.
+#
+# softfp + JIT (`make WPEB_SOFTFP_JIT=y ...`, tools/build-softfp-jit.sh): uses patches/wpewebkit/0004-jsc-arm-softfp-jit.patch
+# (tested on the TV 2026-11-11). JSC's ARMv7 JIT emits Thumb-2 and detects CPU(ARM_THUMB2) from __thumb2__, so WebKit
+# alone is compiled as Thumb-2; it interworks with the ARM-mode libraries of the rest of the tree. The toolchain
+# wrapper puts its -marm first, so this later -mthumb wins. CMAKE_*_FLAGS must repeat TARGET_*FLAGS (toolchainfile.cmake).
+ifeq ($(WPEB_SOFTFP_JIT),y)
+WPEWEBKIT_CONF_OPTS += \
+	-DCMAKE_C_FLAGS="$(TARGET_CFLAGS) -mthumb" \
+	-DCMAKE_CXX_FLAGS="$(TARGET_CXXFLAGS) -mthumb"
+else ifneq ($(BR2_ARM_EABIHF),y)
 WPEWEBKIT_CONF_OPTS += \
 	-DENABLE_JIT=OFF \
 	-DENABLE_DFG_JIT=OFF \
@@ -23,6 +34,7 @@ WPEWEBKIT_CONF_OPTS += \
 	-DENABLE_C_LOOP=ON \
 	-DENABLE_SAMPLING_PROFILER=OFF \
 	-DENABLE_WEBASSEMBLY=OFF
+endif
 
 # Mesa is bundled for WPEWebProcess only, as the surfaceless (software) EGL platform. Buildroot adds the
 # wayland platform whenever BR2_PACKAGE_WAYLAND is on (wpewebkit selects it), which makes libEGL link

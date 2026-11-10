@@ -1,0 +1,258 @@
+JavaScriptCore: JIT on 32-bit ARM with the softfp ABI (V8's model)
+
+webOS TV userland is ARMv7 "softfp": a VFP unit is present, but the C calling convention passes
+floating-point values in core registers. JSC's ARMv7 JIT requires hardfp (PlatformEnable.h), so
+softfp builds fall back to the CLoop interpreter. JIT code itself keeps doubles in VFP registers;
+only the boundary with C differs. V8 handles this at its C-call boundary (MovToFloatParameter,
+MovFromFloatResult, CalculateStackPassedWords), and JSC used to for 32-bit iOS (see the Darwin
+ARM_THUMB2 UnaryDoubleOpWrapper in ThunkGenerators.cpp). Do the same here:
+
+- WTF: CPU(ARM_SOFTFP_VFP) = VFP present, softfp calling convention. Allow ENABLE_JIT with it.
+- CCallHelpers (Baseline/DFG operation calls): a double argument goes in the next even core
+  register pair (r0:r1, r2:r3) or on the stack 8-byte aligned, never back-filling r3 (AAPCS C.3);
+  a double result is read from r0:r1.
+- WasmToJS: operationConvertToF32/F64 results come back in r0 / r0:r1.
+- WebAssembly BBQ is off by default on softfp (its C calls still assume hardfp); OMG is already
+  off on ARMv7. WebAssembly runs on IPInt, whose C calls pass no floating-point values.
+
+LLInt and IPInt pass only pointers/ints to C; the JIT-to-JIT conventions (JSToWasm/WasmToJS
+argument shuffles) do not involve the C ABI and are unchanged.
+
+diff -ru a/Source/JavaScriptCore/jit/CCallHelpers.h b/Source/JavaScriptCore/jit/CCallHelpers.h
+--- a/Source/JavaScriptCore/jit/CCallHelpers.h	2026-11-10 22:44:27.013228658 +1100
++++ b/Source/JavaScriptCore/jit/CCallHelpers.h	2026-11-10 22:45:35.699509659 +1100
+@@ -208,6 +208,7 @@
+             fprDestinations.fill(InvalidFPRReg);
+             crossSources.fill(InvalidFPRReg);
+             crossDestinations.fill(InvalidGPRReg);
++            crossDestinationsHigh.fill(InvalidGPRReg);
+         }
+ 
+         template<unsigned a, unsigned b, unsigned c, unsigned d, unsigned e, unsigned f, unsigned g, unsigned h>
+@@ -219,6 +220,7 @@
+             fprDestinations = other.fprDestinations;
+             crossSources = other.crossSources;
+             crossDestinations = other.crossDestinations;
++            crossDestinationsHigh = other.crossDestinationsHigh;
+         }
+ 
+         ArgCollection<numGPRArgs + 1, numGPRSources + 1, numFPRArgs, numFPRSources, numCrossSources, extraGPRArgs, nonArgGPRs, extraPoke> pushRegArg(GPRReg argument, GPRReg destination)
+@@ -248,6 +250,19 @@
+             return result;
+         }
+ 
++#if CPU(ARM_SOFTFP_VFP)
++        // softfp: one double argument (one logical FP argument) in a core register pair, low word first.
++        ArgCollection<numGPRArgs, numGPRSources, numFPRArgs + 1, numFPRSources, numCrossSources + 1, extraGPRArgs + 2, nonArgGPRs, extraPoke> pushRegArgPair(FPRReg argument, GPRReg low, GPRReg high)
++        {
++            ArgCollection<numGPRArgs, numGPRSources, numFPRArgs + 1, numFPRSources, numCrossSources + 1, extraGPRArgs + 2, nonArgGPRs, extraPoke> result(*this);
++
++            result.crossSources[numCrossSources] = argument;
++            result.crossDestinations[numCrossSources] = low;
++            result.crossDestinationsHigh[numCrossSources] = high;
++            return result;
++        }
++#endif
++
+         ArgCollection<numGPRArgs, numGPRSources + 1, numFPRArgs, numFPRSources, numCrossSources, extraGPRArgs + 1, nonArgGPRs, extraPoke> pushExtraRegArg(GPRReg argument, GPRReg destination)
+         {
+             ArgCollection<numGPRArgs, numGPRSources + 1, numFPRArgs, numFPRSources, numCrossSources, extraGPRArgs + 1, nonArgGPRs, extraPoke> result(*this);
+@@ -305,8 +320,16 @@
+         // store FPR -> GPR assignments
+         std::array<FPRReg, GPRInfo::numberOfRegisters> crossSources;
+         std::array<GPRReg, GPRInfo::numberOfRegisters> crossDestinations;
++        std::array<GPRReg, GPRInfo::numberOfRegisters> crossDestinationsHigh; // softfp double pairs; InvalidGPRReg otherwise
+     };
+ 
++    // FP argument registers of the C calling convention: none under softfp, where doubles use core registers or the stack.
++#if CPU(ARM_SOFTFP_VFP)
++    static constexpr unsigned numberOfCCallFPArgumentRegisters = 0;
++#else
++    static constexpr unsigned numberOfCCallFPArgumentRegisters = FPRInfo::numberOfArgumentRegisters;
++#endif
++
+     template<unsigned TargetSize, typename RegType>
+     std::array<RegType, TargetSize> clampArrayToSize(std::array<RegType, InfoTypeForReg<RegType>::numberOfRegisters> sourceArray)
+     {
+@@ -329,7 +352,7 @@
+     ALWAYS_INLINE unsigned calculatePokeOffset(unsigned currentGPRArgument, unsigned currentFPRArgument, unsigned numCrossSources, unsigned extraGPRArgs, unsigned nonArgGPRs, unsigned extraPoke)
+     {
+         // Clang claims that it cannot find the symbol for FPRReg/GPRReg::numberOfArgumentRegisters when they are passed directly to std::max... seems like a bug
+-        unsigned numberOfFPArgumentRegisters = FPRInfo::numberOfArgumentRegisters;
++        unsigned numberOfFPArgumentRegisters = numberOfCCallFPArgumentRegisters;
+         unsigned numberOfGPArgumentRegisters = GPRInfo::numberOfArgumentRegisters;
+ 
+         UNUSED_PARAM(nonArgGPRs);
+@@ -421,12 +444,48 @@
+ #else // USE(JSVALUE64)
+ #if CPU(ARM_THUMB2)
+ 
++#if CPU(ARM_SOFTFP_VFP)
++    template<typename OperationType, unsigned numGPRArgs, unsigned numGPRSources, unsigned numFPRArgs, unsigned numFPRSources, unsigned numCrossSources, unsigned extraGPRArgs, unsigned nonArgGPRs, unsigned extraPoke, typename... Args>
++    void pokeSoftFPDouble(ArgCollection<numGPRArgs, numGPRSources, numFPRArgs, numFPRSources, numCrossSources, extraGPRArgs, nonArgGPRs, extraPoke> argSourceRegs, FPRReg arg, Args... args)
++    {
++        // Same as the hardfp stack case below: two words, at an 8-byte aligned offset.
++        if (stackAligned(numGPRArgs, numFPRArgs, numCrossSources, extraGPRArgs, nonArgGPRs, extraPoke)) {
++            pokeForArgument(arg, numGPRArgs, numFPRArgs, numCrossSources, extraGPRArgs, nonArgGPRs, extraPoke);
++            setupArgumentsImpl<OperationType>(argSourceRegs.addStackArg(arg).addPoke(), args...);
++        } else {
++            pokeForArgument(arg, numGPRArgs, numFPRArgs, numCrossSources, extraGPRArgs, nonArgGPRs, extraPoke + 1);
++            setupArgumentsImpl<OperationType>(argSourceRegs.addStackArg(arg).addPoke().addPoke(), args...);
++        }
++    }
++#endif
++
+     template<typename OperationType, unsigned numGPRArgs, unsigned numGPRSources, unsigned numFPRArgs, unsigned numFPRSources, unsigned numCrossSources, unsigned extraGPRArgs, unsigned nonArgGPRs, unsigned extraPoke, typename... Args>
+     void setupArgumentsImpl(ArgCollection<numGPRArgs, numGPRSources, numFPRArgs, numFPRSources, numCrossSources, extraGPRArgs, nonArgGPRs, extraPoke> argSourceRegs, FPRReg arg, Args... args)
+     {
+         static_assert(std::is_same_v<CURRENT_ARGUMENT_TYPE, double>, "We should only be passing FPRRegs to a double. We use moveDouble / loadDouble / storeDouble exclusively");
+ 
+-        // ARM (hardfp, which we require) passes FP arguments in FP registers.
++#if CPU(ARM_SOFTFP_VFP)
++        // AAPCS base standard (softfp): a double takes the next even core register pair (r0:r1 or r2:r3).
++        // If none is left it goes on the stack, 8-byte aligned, and no later argument uses a core register.
++        unsigned numArgRegisters = GPRInfo::numberOfArgumentRegisters;
++        unsigned currentArgCount = argSourceRegs.argCount(GPRInfo::regT0);
++        unsigned alignedArgCount = roundUpToMultipleOf<2>(currentArgCount);
++        if (alignedArgCount + 1 < numArgRegisters) {
++            auto updatedArgSourceRegs = argSourceRegs.pushRegArgPair(arg, GPRInfo::toArgumentRegister(alignedArgCount), GPRInfo::toArgumentRegister(alignedArgCount + 1));
++            if (alignedArgCount > currentArgCount)
++                setupArgumentsImpl<OperationType>(updatedArgSourceRegs.addGPRExtraArg(), args...);
++            else
++                setupArgumentsImpl<OperationType>(updatedArgSourceRegs, args...);
++            return;
++        }
++        if (currentArgCount < numArgRegisters) {
++            // Only r3 was left: it stays unused (C.3: the NCRN is rounded up past it).
++            pokeSoftFPDouble<OperationType>(argSourceRegs.addGPRExtraArg(), arg, args...);
++            return;
++        }
++        pokeSoftFPDouble<OperationType>(argSourceRegs, arg, args...);
++#else
++        // ARM hardfp passes FP arguments in FP registers.
+         unsigned numberOfFPArgumentRegisters = FPRInfo::numberOfArgumentRegisters;
+         unsigned currentFPArgCount = argSourceRegs.argCount(arg);
+ 
+@@ -444,6 +503,7 @@
+             pokeForArgument(arg, numGPRArgs, numFPRArgs, numCrossSources, extraGPRArgs, nonArgGPRs, extraPoke + 1);
+             setupArgumentsImpl<OperationType>(argSourceRegs.addStackArg(arg).addPoke().addPoke(), args...);
+         }
++#endif // CPU(ARM_SOFTFP_VFP)
+     }
+ 
+     template<typename OperationType, unsigned numGPRArgs, unsigned numGPRSources, unsigned numFPRArgs, unsigned numFPRSources, unsigned numCrossSources, unsigned extraGPRArgs, unsigned nonArgGPRs, unsigned extraPoke, typename... Args>
+@@ -669,7 +729,14 @@
+         static_assert(fprArgsCount<TraitsType>(std::make_index_sequence<TraitsType::arity>()) == numFPRArgs);
+ 
+         shuffleRegisters<GPRReg, numGPRSources>(clampArrayToSize<numGPRSources, GPRReg>(argSourceRegs.gprSources), clampArrayToSize<numGPRSources, GPRReg>(argSourceRegs.gprDestinations));
++#if CPU(ARM_SOFTFP_VFP)
++        for (unsigned i = 0; i < numCrossSources; ++i) {
++            ASSERT(argSourceRegs.crossDestinationsHigh[i] != InvalidGPRReg);
++            moveDoubleToInts(argSourceRegs.crossSources[i], argSourceRegs.crossDestinations[i], argSourceRegs.crossDestinationsHigh[i]);
++        }
++#else
+         static_assert(!numCrossSources, "shouldn't be used on this architecture.");
++#endif
+ 
+         shuffleRegisters<FPRReg, numFPRSources>(clampArrayToSize<numFPRSources, FPRReg>(argSourceRegs.fprSources), clampArrayToSize<numFPRSources, FPRReg>(argSourceRegs.fprDestinations));
+     }
+@@ -750,8 +817,14 @@
+     
+     void setupResults(FPRReg destA)
+     {
++#if CPU(ARM_SOFTFP_VFP)
++        // softfp: the C function returned its double in r0:r1 (JIT operations never return float into an FPR here).
++        if (destA != InvalidFPRReg)
++            moveIntsToDouble(GPRInfo::returnValueGPR, GPRInfo::returnValueGPR2, destA);
++#else
+         if (destA != InvalidFPRReg)
+             moveDouble(FPRInfo::returnValueFPR, destA);
++#endif
+     }
+ 
+     void jumpToExceptionHandler(VM& vm)
+diff -ru a/Source/JavaScriptCore/runtime/OptionsList.h b/Source/JavaScriptCore/runtime/OptionsList.h
+--- a/Source/JavaScriptCore/runtime/OptionsList.h	2026-11-10 22:44:27.024889618 +1100
++++ b/Source/JavaScriptCore/runtime/OptionsList.h	2026-11-10 22:44:40.967639720 +1100
+@@ -38,6 +38,15 @@
+ 
+ namespace JSC {
+ 
++constexpr bool isARMSoftFPVFP()
++{
++#if CPU(ARM_SOFTFP_VFP)
++    return true;
++#else
++    return false;
++#endif
++}
++
+ #define MAXIMUM_NUMBER_OF_FTL_COMPILER_THREADS 8
+ 
+ JS_EXPORT_PRIVATE bool canUseJITCage();
+@@ -557,7 +566,7 @@
+     v(Bool, verboseBBQJITInstructions, false, Normal, "Logs instruction information during BBQ JIT"_s) \
+     v(Bool, disableBBQConsts, false, Normal, "Wasm <type>.const instructions in BBQ JIT won't lower to a const BBQ::Value"_s) \
+     v(Bool, useWasmLLInt, true, Normal, nullptr) \
+-    v(Bool, useBBQJIT, true, Normal, "allows the BBQ JIT to be used if true"_s) \
++    v(Bool, useBBQJIT, !isARMSoftFPVFP(), Normal, "allows the BBQ JIT to be used if true (off for ARM softfp: its C calls still assume hardfp)"_s) \
+     v(Bool, useOMGJIT, !isARM_THUMB2(), Normal, "allows the OMG JIT to be used if true"_s) \
+     v(Bool, useWasmLLIntPrologueOSR, true, Normal, "allows prologue OSR from wasm LLInt if true"_s) \
+     v(Bool, useWasmLLIntLoopOSR, true, Normal, "allows loop OSR from wasm LLInt if true"_s) \
+diff -ru a/Source/JavaScriptCore/wasm/js/WasmToJS.cpp b/Source/JavaScriptCore/wasm/js/WasmToJS.cpp
+--- a/Source/JavaScriptCore/wasm/js/WasmToJS.cpp	2026-11-10 22:44:27.019060631 +1100
++++ b/Source/JavaScriptCore/wasm/js/WasmToJS.cpp	2026-11-10 22:44:40.967756521 +1100
+@@ -405,7 +405,11 @@
+             jit.callOperation<OperationPtrTag>(operationConvertToF32);
+             jit.loadPtr(CCallHelpers::Address(GPRInfo::wasmContextInstancePointer, JSWebAssemblyInstance::offsetOfVM()), GPRInfo::nonPreservedNonReturnGPR);
+             exceptionChecks.append(jit.branchTestPtr(CCallHelpers::NonZero, CCallHelpers::Address(GPRInfo::nonPreservedNonReturnGPR, VM::exceptionOffset())));
++#if CPU(ARM_SOFTFP_VFP)
++            jit.move32ToFloat(GPRInfo::returnValueGPR, dest); // softfp: a float result comes back in r0
++#else
+             jit.moveDouble(FPRInfo::returnValueFPR , dest);
++#endif
+             done.link(&jit);
+             break;
+         }
+@@ -433,7 +437,11 @@
+             jit.callOperation<OperationPtrTag>(operationConvertToF64);
+             jit.loadPtr(CCallHelpers::Address(GPRInfo::wasmContextInstancePointer, JSWebAssemblyInstance::offsetOfVM()), GPRInfo::nonPreservedNonReturnGPR);
+             exceptionChecks.append(jit.branchTestPtr(CCallHelpers::NonZero, CCallHelpers::Address(GPRInfo::nonPreservedNonReturnGPR, VM::exceptionOffset())));
++#if CPU(ARM_SOFTFP_VFP)
++            jit.moveIntsToDouble(GPRInfo::returnValueGPR, GPRInfo::returnValueGPR2, dest); // softfp: a double result comes back in r0:r1
++#else
+             jit.moveDouble(FPRInfo::returnValueFPR, dest);
++#endif
+             done.link(&jit);
+             break;
+         }
+diff -ru a/Source/WTF/wtf/PlatformCPU.h b/Source/WTF/wtf/PlatformCPU.h
+--- a/Source/WTF/wtf/PlatformCPU.h	2026-11-10 22:44:27.001269492 +1100
++++ b/Source/WTF/wtf/PlatformCPU.h	2026-11-10 22:44:40.967342938 +1100
+@@ -142,6 +142,14 @@
+ #define WTF_CPU_ARM_HARDFP 1
+ #endif
+ 
++/* CPU(ARM_SOFTFP_VFP) - the "softfp" ABI: a VFP unit is present and code uses it, but the C calling convention
++   passes floating-point values in core registers (e.g. the LG webOS TV userland). JSC's JIT keeps doubles in VFP
++   registers and converts at C-call boundaries, as V8 does (MovToFloatParameter / MovFromFloatResult) and as JSC
++   did for 32-bit iOS. */
++#if !defined(__ARM_PCS_VFP) && defined(__ARM_FP)
++#define WTF_CPU_ARM_SOFTFP_VFP 1
++#endif
++
+ /* Set WTF_ARM_ARCH_VERSION */
+ #if   defined(__ARM_ARCH_4__) \
+     || defined(__ARM_ARCH_4T__) \
+diff -ru a/Source/WTF/wtf/PlatformEnable.h b/Source/WTF/wtf/PlatformEnable.h
+--- a/Source/WTF/wtf/PlatformEnable.h	2026-11-10 22:44:27.007194336 +1100
++++ b/Source/WTF/wtf/PlatformEnable.h	2026-11-10 22:44:40.967486326 +1100
+@@ -637,7 +637,7 @@
+ #endif
+ 
+ #if USE(JSVALUE32_64)
+-#if CPU(ARM_THUMB2) && CPU(ARM_HARDFP) && OS(LINUX)
++#if CPU(ARM_THUMB2) && (CPU(ARM_HARDFP) || CPU(ARM_SOFTFP_VFP)) && OS(LINUX)
+ /* On ARMv7 Linux the JIT is enabled unless explicitly disabled. */
+ #if !defined(ENABLE_JIT)
+ #define ENABLE_JIT 1
