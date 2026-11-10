@@ -176,22 +176,26 @@ static gboolean webos_view_can_be_mapped(WPEView *)
     return TRUE;
 }
 
+// Map as soon as there is a toplevel with a size (same as WPE's headless view).
+static void webos_view_toplevel_changed(WPEView *view, GParamSpec *, gpointer)
+{
+    WPEToplevel *toplevel = wpe_view_get_toplevel(view);
+    if (!toplevel) {
+        wpe_view_unmap(view);
+        return;
+    }
+    int width = 0;
+    int height = 0;
+    wpe_toplevel_get_size(toplevel, &width, &height);
+    if (width && height)
+        wpe_view_resized(view, width, height);
+    wpe_view_map(view);
+}
+
 static void webos_view_constructed(GObject *object)
 {
     G_OBJECT_CLASS(webos_view_parent_class)->constructed(object);
-    // Map as soon as there is a toplevel with a size (same as WPE's headless view).
-    g_signal_connect(object, "notify::toplevel", G_CALLBACK(+[](WPEView *view, GParamSpec *, gpointer) {
-        WPEToplevel *toplevel = wpe_view_get_toplevel(view);
-        if (!toplevel) {
-            wpe_view_unmap(view);
-            return;
-        }
-        int width = 0, height = 0;
-        wpe_toplevel_get_size(toplevel, &width, &height);
-        if (width && height)
-            wpe_view_resized(view, width, height);
-        wpe_view_map(view);
-    }), nullptr);
+    g_signal_connect(object, "notify::toplevel", G_CALLBACK(webos_view_toplevel_changed), nullptr);
 }
 
 static void webos_view_dispose(GObject *object)
