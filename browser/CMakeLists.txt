@@ -55,3 +55,11 @@ wnk_add_webos_package(
 # Host smoke test: OK on the focused button, then Back twice at the root quits.
 wnk_add_app_test(NAME e2e.wpebrowser.starts_and_quits TARGET wpebrowser PREFIX APP_WPEBROWSER
         KEYS "Escape,Escape" PASS "browser ui ready")
+
+if (NOT CMAKE_CROSSCOMPILING)
+    add_executable(engine-environment-test tests/engine_environment.cpp engine_client.cpp)
+    target_compile_features(engine-environment-test PRIVATE cxx_std_17)
+    target_include_directories(engine-environment-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../common")
+    target_link_libraries(engine-environment-test PRIVATE wnk_logging)
+    add_test(NAME engine.environment COMMAND engine-environment-test)
+endif ()

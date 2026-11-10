@@ -37,42 +37,95 @@ cp /build/engine-build/wpe-engine "$OUT/"
 
 LIBEXEC=$(ls -d "$TARGET"/usr/libexec/wpe-webkit-* | head -n 1)
 cp "$LIBEXEC"/WPEWebProcess "$LIBEXEC"/WPENetworkProcess "$OUT/libexec/"
+# GPU_PROCESS is enabled by this WebKit configuration; retain its helper too.
+GPU_SEED=''
+if [ -x "$LIBEXEC/WPEGPUProcess" ]; then
+    cp "$LIBEXEC/WPEGPUProcess" "$OUT/libexec/"
+    GPU_SEED="$OUT/libexec/WPEGPUProcess"
+fi
 cp "$TARGET"/usr/lib/gio/modules/libgiognutls.so "$OUT/lib/gio/modules/"
 
-# Libraries that are dlopen()ed, so not in any DT_NEEDED: libepoxy loads EGL/GLES by SONAME.
-SEEDS="$OUT/wpe-engine $OUT/libexec/WPEWebProcess $OUT/libexec/WPENetworkProcess $OUT/lib/gio/modules/libgiognutls.so"
+BUNDLE=$(ls "$TARGET"/usr/lib/wpe-webkit-*/injected-bundle/libWPEInjectedBundle.so)
+mkdir -p "$OUT/lib/injected-bundle"
+cp "$BUNDLE" "$OUT/lib/injected-bundle/"
+SEEDS="$OUT/wpe-engine $OUT/libexec/WPEWebProcess $OUT/libexec/WPENetworkProcess $OUT/lib/gio/modules/libgiognutls.so $OUT/lib/injected-bundle/libWPEInjectedBundle.so $GPU_SEED"
+# Mesa (software GL for the web process) is dlopen()ed by libepoxy by SONAME, so it is in no DT_NEEDED.
+# It goes to lib/mesa/, which the UI adds to LD_LIBRARY_PATH only in software mode; in GPU mode the
+# web process picks up the TV's own libEGL.so.1 / libGLESv2.so.2 (Mali) from the default search path.
+MESA_SEEDS=''
+MEDIA_SEEDS=''
+if [ -f "$TARGET/usr/lib/libgstreamer-1.0.so.0" ]; then
+    echo "== stage private GStreamer plugins and scanner"
+    mkdir -p "$OUT/lib/gstreamer-1.0" "$OUT/etc/pulse"
+    for plugin in "$TARGET"/usr/lib/gstreamer-1.0/*.so; do
+        [ -f "$plugin" ] || { echo "GStreamer has no plugins" >&2; exit 1; }
+        # Older/incremental target trees may retain this unused desktop sink.
+        # The UI owns Wayland, and the engine must not load a bundled Wayland ABI.
+        case "$(basename "$plugin")" in libgstwaylandsink.so) continue ;; esac
+        cp -L "$plugin" "$OUT/lib/gstreamer-1.0/"
+        MEDIA_SEEDS="$MEDIA_SEEDS $OUT/lib/gstreamer-1.0/$(basename "$plugin")"
+    done
+    for required in coreelements typefindfunctions playback app isomp4 matroska libav videoparsersbad audioparsers vpx opus pulseaudio soup adaptivedemux2; do
+        [ -f "$OUT/lib/gstreamer-1.0/libgst$required.so" ] || {
+            echo "missing required media plugin: $required (build multimedia dependencies first)" >&2
+            exit 1
+        }
+    done
+    scanner="$TARGET/usr/libexec/gstreamer-1.0/gst-plugin-scanner"
+    [ -x "$scanner" ] || { echo "missing GStreamer plugin scanner" >&2; exit 1; }
+    cp "$scanner" "$OUT/libexec/"
+    MEDIA_SEEDS="$MEDIA_SEEDS $OUT/libexec/gst-plugin-scanner"
+    # PulseAudio client uses the existing sound server. Never autospawn a daemon.
+    printf 'autospawn = no\n' > "$OUT/etc/pulse/client.conf"
+    for tool in gst-inspect-1.0 gst-launch-1.0; do
+        if [ -x "$TARGET/usr/bin/$tool" ]; then
+            cp "$TARGET/usr/bin/$tool" "$OUT/libexec/"
+            MEDIA_SEEDS="$MEDIA_SEEDS $OUT/libexec/$tool"
+        fi
+    done
+fi
 for so in libEGL.so.1 libGLESv2.so.2; do
     f=$(ls "$TARGET"/usr/lib/$so 2>/dev/null || true)
     [ -n "$f" ] || { echo "missing $so in target (Mesa?)" >&2; exit 1; }
-    SEEDS="$SEEDS $f"
+    MESA_SEEDS="$MESA_SEEDS $f"
 done
 
 find_lib() {
-    for d in "$TARGET/usr/lib" "$TARGET/lib" "$STAGING/usr/lib" "$STAGING/lib"; do
+    for d in "$TARGET/usr/lib" "$TARGET/usr/lib/pulseaudio" "$TARGET/lib" "$STAGING/usr/lib" "$STAGING/lib"; do
         [ -e "$d/$1" ] && { echo "$d/$1"; return 0; }
     done
     return 1
 }
 
-echo "== collect libraries"
-todo="$SEEDS"
+# collect <seeds> <dest-dir>: copies the DT_NEEDED closure of the seeds into dest-dir, skipping the TV's
+# glibc and anything already collected (the global $seen), so a second call only adds what is new.
 seen=' '
-while [ -n "$todo" ]; do
-    next=''
-    for f in $todo; do
-        for need in $("$READELF" -d "$f" 2>/dev/null | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p'); do
-            case "$SYSTEM_LIBS" in *" $need "*) continue ;; esac
-            case "$seen" in *" $need "*) continue ;; esac
-            seen="$seen$need "
-            path=$(find_lib "$need") || { echo "  ! not found: $need (needed by $(basename "$f"))" >&2; exit 1; }
-            cp -L "$path" "$OUT/lib/$need"
-            next="$next $OUT/lib/$need"
+collect() {
+    todo="$1"
+    dest="$2"
+    while [ -n "$todo" ]; do
+        next=''
+        for f in $todo; do
+            for need in $("$READELF" -d "$f" 2>/dev/null | sed -n 's/.*(NEEDED).*\[\(.*\)\]/\1/p'); do
+                case "$SYSTEM_LIBS" in *" $need "*) continue ;; esac
+                case "$seen" in *" $need "*) continue ;; esac
+                seen="$seen$need "
+                path=$(find_lib "$need") || { echo "  ! not found: $need (needed by $(basename "$f"))" >&2; exit 1; }
+                cp -L "$path" "$dest/$need"
+                next="$next $dest/$need"
+            done
         done
+        todo=$next
     done
-    todo=$next
-done
-for so in libEGL.so.1 libGLESv2.so.2; do cp -L "$TARGET/usr/lib/$so" "$OUT/lib/$so"; done
-"$BR"/host/bin/*-strip --strip-unneeded "$OUT"/lib/*.so* "$OUT"/lib/gio/modules/*.so "$OUT"/libexec/* 2>/dev/null || true
+}
+
+echo "== collect libraries"
+collect "$SEEDS $MEDIA_SEEDS" "$OUT/lib"
+mkdir -p "$OUT/lib/mesa"
+for f in $MESA_SEEDS; do cp -L "$f" "$OUT/lib/mesa/$(basename "$f")"; done
+# Mesa's own closure (libgallium, libLLVM, ...), minus what the engine already shares from lib/.
+collect "$(for f in $MESA_SEEDS; do printf '%s ' "$OUT/lib/mesa/$(basename "$f")"; done)" "$OUT/lib/mesa"
+"$BR"/host/bin/*-strip --strip-unneeded "$OUT"/lib/*.so* "$OUT"/lib/mesa/*.so* "$OUT"/lib/gstreamer-1.0/*.so "$OUT"/lib/gio/modules/*.so "$OUT"/lib/injected-bundle/*.so "$OUT"/libexec/* 2>/dev/null || true
 
 echo "== fonts, certificates"
 cp -r "$TARGET/usr/share/fonts" "$OUT/share/"
@@ -94,7 +147,7 @@ EOF
 
 echo "== check: nothing may need a glibc newer than the TV's 2.28"
 bad=0
-for f in "$OUT/wpe-engine" "$OUT"/libexec/* "$OUT"/lib/*.so* "$OUT"/lib/gio/modules/*.so; do
+for f in "$OUT/wpe-engine" "$OUT"/libexec/* "$OUT"/lib/*.so* "$OUT"/lib/mesa/*.so* "$OUT"/lib/gstreamer-1.0/*.so "$OUT"/lib/gio/modules/*.so "$OUT"/lib/injected-bundle/*.so; do
     v=$("$READELF" -V "$f" 2>/dev/null | grep -oE 'GLIBC_2\.[0-9]+' | sort -t. -k2 -n -u | tail -n 1)
     case "$v" in GLIBC_2.29|GLIBC_2.3[0-9]|GLIBC_2.4[0-9]) echo "  ! $(basename "$f") needs $v" >&2; bad=1 ;; esac
 done

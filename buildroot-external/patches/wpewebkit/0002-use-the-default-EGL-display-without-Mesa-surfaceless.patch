@@ -1,0 +1,127 @@
+From: webos-wpe-browser <poudelswastik@gmail.com>
+Subject: [PATCH] Use the default EGL display when Mesa's surfaceless platform is absent
+
+WPEWebProcess with ENABLE_WPE_PLATFORM needs an EGL display without a window. Upstream
+only accepts EGL_MESA_platform_surfaceless; a vendor EGL (ARM Mali on LG webOS) has no such
+platform. Try its default display without a window, with a surfaceless context
+(EGL_KHR_surfaceless_context) or a 1x1 pbuffer. The composited frames still travel to the UI
+process as shared memory (SwapChain::Type::SharedMemory, no MESA_image_dma_buf_export).
+
+- PlatformDisplaySurfaceless::create(): fall back to eglGetDisplay(EGL_DEFAULT_DISPLAY); the
+  env WEBKIT_DISABLE_DEFAULT_EGL_DISPLAY=1 keeps the upstream behaviour (return nullptr).
+- ANGLE platform is left at 0 (default) in that case instead of EGL_PLATFORM_SURFACELESS_MESA.
+- GLContext::createOffscreenContext(): allow the pbuffer fallback for Target::Surfaceless.
+
+Device status: C1/webOS 6.5.3 root probes passed for Mali compositing and WebGL
+with CPU Skia painting. GPU Skia painting corrupts tiles; app-jail validation
+remains pending. Keep Mesa as the default fallback. See NOTES.md.
+Upstream: not sent yet.
+Signed-off-by: webos-wpe-browser <poudelswastik@gmail.com>
+---
+--- a/Source/WebCore/platform/graphics/egl/PlatformDisplaySurfaceless.cpp
++++ b/Source/WebCore/platform/graphics/egl/PlatformDisplaySurfaceless.cpp
+@@ -28,34 +28,52 @@
+ 
+ #include "GLContext.h"
+ #include <epoxy/egl.h>
++#include <cstdlib>
++#include <cstring>
+ 
+ namespace WebCore {
+ 
+ std::unique_ptr<PlatformDisplaySurfaceless> PlatformDisplaySurfaceless::create()
+ {
+     const char* extensions = eglQueryString(nullptr, EGL_EXTENSIONS);
+-    if (!GLContext::isExtensionSupported(extensions, "EGL_MESA_platform_surfaceless"))
+-        return nullptr;
++    bool mesaSurfaceless = GLContext::isExtensionSupported(extensions, "EGL_MESA_platform_surfaceless");
+ 
+     RefPtr<GLDisplay> glDisplay;
+-    if (GLContext::isExtensionSupported(extensions, "EGL_EXT_platform_base"))
+-        glDisplay = GLDisplay::create(eglGetPlatformDisplayEXT(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, nullptr));
+-    else if (GLContext::isExtensionSupported(extensions, "EGL_KHR_platform_base"))
+-        glDisplay = GLDisplay::create(eglGetPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, nullptr));
+-
+-    if (!glDisplay) {
+-        WTFLogAlways("Could not create surfaceless EGL display: %s. Aborting...", GLContext::lastErrorString());
+-        CRASH();
++    if (mesaSurfaceless) {
++        if (GLContext::isExtensionSupported(extensions, "EGL_EXT_platform_base"))
++            glDisplay = GLDisplay::create(eglGetPlatformDisplayEXT(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, nullptr));
++        else if (GLContext::isExtensionSupported(extensions, "EGL_KHR_platform_base"))
++            glDisplay = GLDisplay::create(eglGetPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, nullptr));
++
++        if (!glDisplay) {
++            WTFLogAlways("Could not create surfaceless EGL display: %s. Aborting...", GLContext::lastErrorString());
++            CRASH();
++        }
++    } else {
++        // webOS: the firmware's EGL (ARM Mali) has no surfaceless platform, but its default display
++        // works without a window: GLContext then uses EGL_KHR_surfaceless_context or a pbuffer. The
++        // composited frames reach the UI process as shared memory, as with Mesa's surfaceless platform.
++        if (const char* disabled = getenv("WEBKIT_DISABLE_DEFAULT_EGL_DISPLAY")) {
++            if (strcmp(disabled, "0"))
++                return nullptr;
++        }
++        glDisplay = GLDisplay::create(eglGetDisplay(EGL_DEFAULT_DISPLAY));
++        if (!glDisplay) {
++            WTFLogAlways("Could not create default EGL display (no surfaceless platform either): %s", GLContext::lastErrorString());
++            return nullptr;
++        }
++        WTFLogAlways("No EGL_MESA_platform_surfaceless; using the default EGL display without a window");
+     }
+ 
+-    return std::unique_ptr<PlatformDisplaySurfaceless>(new PlatformDisplaySurfaceless(glDisplay.releaseNonNull()));
++    return std::unique_ptr<PlatformDisplaySurfaceless>(new PlatformDisplaySurfaceless(glDisplay.releaseNonNull(), mesaSurfaceless));
+ }
+ 
+-PlatformDisplaySurfaceless::PlatformDisplaySurfaceless(Ref<GLDisplay>&& glDisplay)
++PlatformDisplaySurfaceless::PlatformDisplaySurfaceless(Ref<GLDisplay>&& glDisplay, bool mesaSurfaceless)
+     : PlatformDisplay(WTFMove(glDisplay))
++    , m_mesaSurfaceless(mesaSurfaceless)
+ {
+ #if ENABLE(WEBGL)
+-    m_anglePlatform = EGL_PLATFORM_SURFACELESS_MESA;
++    m_anglePlatform = mesaSurfaceless ? EGL_PLATFORM_SURFACELESS_MESA : 0;
+     m_angleNativeDisplay = EGL_DEFAULT_DISPLAY;
+ #endif
+ }
+--- a/Source/WebCore/platform/graphics/egl/PlatformDisplaySurfaceless.h
++++ b/Source/WebCore/platform/graphics/egl/PlatformDisplaySurfaceless.h
+@@ -34,10 +34,16 @@
+     static std::unique_ptr<PlatformDisplaySurfaceless> create();
+ 
+     virtual ~PlatformDisplaySurfaceless();
++
++    // False when the display is the EGL default display used without a window (no Mesa surfaceless
++    // platform available, e.g. a vendor EGL such as ARM Mali on webOS).
++    bool usesMesaSurfacelessPlatform() const { return m_mesaSurfaceless; }
+ private:
+-    explicit PlatformDisplaySurfaceless(Ref<GLDisplay>&&);
++    PlatformDisplaySurfaceless(Ref<GLDisplay>&&, bool mesaSurfaceless);
+ 
+     Type type() const override { return PlatformDisplay::Type::Surfaceless; }
++
++    bool m_mesaSurfaceless { true };
+ };
+ 
+ } // namespace WebCore
+--- a/Source/WebCore/platform/graphics/egl/GLContext.cpp
++++ b/Source/WebCore/platform/graphics/egl/GLContext.cpp
+@@ -241,11 +241,14 @@
+ #endif
+ #if USE(GBM)
+     case Target::GBM:
+-#endif
+-    case Target::Surfaceless:
+         // Do not fallback to pbuffers.
+         RELEASE_LOG_INFO(Compositing, "Could not create EGL surfaceless context: %s.", lastErrorString());
+         return nullptr;
++#endif
++    case Target::Surfaceless:
++        // A vendor EGL used through its default display (see PlatformDisplaySurfaceless) may lack
++        // EGL_KHR_surfaceless_context; a 1x1 pbuffer gives the same offscreen context there.
++        break;
+     default:
+         break;
+     }

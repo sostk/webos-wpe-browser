@@ -43,6 +43,10 @@ struct EngineLaunch {
     std::string cache_dir;
     std::string runtime_dir;  // logs
     uint32_t width = 1280, height = 720;  // page size, CSS px
+    // Graphics for WPEWebProcess: false = bundled Mesa llvmpipe (software GL, engine/lib/mesa on the
+    // library path); true = the TV's own EGL/GLES (Mali) through the default EGL display, and Skia
+    // paints on the CPU pending a Mali tile-rendering fix. Composited frames use SHM in both modes.
+    bool gpu = false;
 };
 
 class EngineClient {

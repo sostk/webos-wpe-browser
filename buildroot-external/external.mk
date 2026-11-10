@@ -29,3 +29,15 @@ WPEWEBKIT_CONF_OPTS += \
 # libwayland-client/-server: libraries the TV has its own copies of, and which the kit's packaging check
 # refuses in the app. Appended last, so the platform list wins over Buildroot's.
 MESA3D_CONF_OPTS += -Dplatforms= -Dlegacy-wayland=
+
+# Preserve WebKit's complete in-process media stack (URL playback + MSE). A URL-only
+# external holepunch engine cannot implement SourceBuffer and must not replace it.
+ifeq ($(BR2_PACKAGE_WPEWEBKIT_MULTIMEDIA),y)
+# Buildroot's wpewebkit-reconfigure target only follows explicit dependencies;
+# Kconfig selects alone do not build runtime demuxers, parsers or audio sinks.
+WPEWEBKIT_DEPENDENCIES += gst1-plugins-good gst1-plugins-bad
+# Package infrastructure already expanded configure prerequisites before external.mk
+# was included; add the order-only edge explicitly for incremental package targets.
+$(WPEWEBKIT_TARGET_CONFIGURE): | gst1-plugins-good gst1-plugins-bad
+WPEWEBKIT_CONF_OPTS += -DENABLE_MEDIA_SOURCE=ON -DENABLE_ENCRYPTED_MEDIA=ON -DENABLE_THUNDER=OFF -DUSE_EXTERNAL_HOLEPUNCH=OFF
+endif

@@ -632,6 +632,10 @@ class App : public wnk::app::Delegate {
         const char *override_dir = std::getenv("WPE_BROWSER_ENGINE_DIR");
         l.engine_dir = override_dir && *override_dir ? override_dir : ctx.launch().app_dir + "/engine";
         l.runtime_dir = ctx.runtime_dir().empty() ? "/tmp" : ctx.runtime_dir();
+        // WPE_BROWSER_RENDERER=gpu selects the TV's Mali through WebKit's default-EGL-display patch
+        // (root probes passed; installed-app validation remains: see NOTES.md). Software stays the default.
+        const char *renderer = std::getenv("WPE_BROWSER_RENDERER");
+        l.gpu = renderer && std::string(renderer) == "gpu";
         l.data_dir = data_dir_ + "/webkit";
         l.cache_dir = l.data_dir + "/cache";
         make_dir(l.data_dir);

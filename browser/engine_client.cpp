@@ -78,21 +78,44 @@ bool EngineClient::start(const EngineLaunch &l, std::string &error) {
     const std::string &d = l.engine_dir;
     // Only the engine and its children see these; this process keeps the libraries it started with
     // (the loader read LD_LIBRARY_PATH at our start), so the TV's Mali EGL and the bundled Mesa never meet.
-    set_env(env, "LD_LIBRARY_PATH", d + "/lib");
+    // Software mode adds engine/lib/mesa (libEGL/libGLESv2 + llvmpipe); in GPU mode the web process
+    // finds the TV's libEGL.so.1/libGLESv2.so.2 on the default search path instead.
+    set_env(env, "LD_LIBRARY_PATH", l.gpu ? d + "/lib" : d + "/lib:" + d + "/lib/mesa");
     set_env(env, "WEBKIT_EXEC_PATH", d + "/libexec");
     set_env(env, "WPE_BROWSER_CA_FILE", ca_bundle);
     set_env(env, "GIO_MODULE_DIR", d + "/lib/gio/modules");
     // GIO scans EXTRA_MODULES first; inherited firmware paths would win over MODULE_DIR.
     set_env(env, "GIO_EXTRA_MODULES", "");
+    set_env(env, "WEBKIT_INJECTED_BUNDLE_PATH", d + "/lib/injected-bundle");
+    set_env(env, "GST_PLUGIN_PATH", "");
+    set_env(env, "GST_PLUGIN_PATH_1_0", "");
+    set_env(env, "GST_PLUGIN_SYSTEM_PATH", d + "/lib/gstreamer-1.0");
+    set_env(env, "GST_PLUGIN_SYSTEM_PATH_1_0", d + "/lib/gstreamer-1.0");
+    set_env(env, "GST_PLUGIN_SCANNER", d + "/libexec/gst-plugin-scanner");
+    set_env(env, "GST_PLUGIN_SCANNER_1_0", d + "/libexec/gst-plugin-scanner");
+    set_env(env, "GST_REGISTRY", l.cache_dir + "/gstreamer-registry.bin");
+    set_env(env, "GST_REGISTRY_1_0", l.cache_dir + "/gstreamer-registry.bin");
+    set_env(env, "PULSE_CLIENTCONFIG", d + "/etc/pulse/client.conf");
+    set_env(env, "WEBKIT_GST_ENABLE_HLS_SUPPORT", "1");
+    set_env(env, "WEBKIT_GST_ENABLE_DASH_SUPPORT", "1");
     set_env(env, "FONTCONFIG_FILE", d + "/etc/fonts/fonts.conf");
     set_env(env, "XDG_DATA_DIRS", d + "/share");
     set_env(env, "XDG_CACHE_HOME", l.cache_dir);
     set_env(env, "XDG_DATA_HOME", l.data_dir);
     set_env(env, "XDG_CONFIG_HOME", l.data_dir + "/config");
     set_env(env, "HOME", l.data_dir);
-    set_env(env, "GALLIUM_DRIVER", "llvmpipe");
-    set_env(env, "MESA_SHADER_CACHE_DIR", l.cache_dir + "/mesa");
-    set_env(env, "WEBKIT_SKIA_ENABLE_CPU_RENDERING", "1");
+    if (l.gpu) {
+        // C1/webOS 6.5.3: Mali compositing + WebGL pass, but Skia GPU painting
+        // corrupts ordinary page tiles. Keep CPU tile painting until that is fixed.
+        set_env(env, "WEBKIT_SKIA_ENABLE_CPU_RENDERING", "1");
+        set_env(env, "WEBKIT_DISABLE_DEFAULT_EGL_DISPLAY", "0");
+    } else {
+        set_env(env, "GALLIUM_DRIVER", "llvmpipe");
+        set_env(env, "MESA_SHADER_CACHE_DIR", l.cache_dir + "/mesa");
+        // Painting through llvmpipe would be slower than Skia's CPU raster (NEON) on half the cores.
+        set_env(env, "WEBKIT_SKIA_ENABLE_CPU_RENDERING", "1");
+    }
+    set_env(env, "WPE_BROWSER_RENDERER", l.gpu ? "gpu" : "software");
     set_env(env, "WPE_BROWSER_DATA_DIR", l.data_dir);
     set_env(env, "WPE_BROWSER_CACHE_DIR", l.cache_dir);
     std::vector<char *> envp;

@@ -1,0 +1,40 @@
+<!doctype html>
+<meta charset="utf-8"><title>Browser media checks</title>
+<style>body{background:#202124;color:#eee;font:20px sans-serif;margin:24px}button,select{font:inherit;margin:8px}video{display:block;width:640px;max-width:100%;background:black}pre{white-space:pre-wrap}</style>
+<h1>Browser media checks</h1>
+<p>Generated test patterns and tones. Press a test to allow playback. Results apply only to this browser and device.</p>
+<select id="format"><option value="avc-aac.mp4">H.264 + AAC</option><option value="vp9-opus.webm">VP9 + Opus</option><option value="stream.m3u8">HLS</option><option value="stream.mpd">DASH</option></select>
+<button id="direct">Play URL</button><button id="mse">Play through MSE</button><button id="seek">Seek to 4s</button><button id="full">Fullscreen</button>
+<video id="video" controls playsinline></video><pre id="log"></pre>
+<script>
+const video=document.getElementById('video'), log=document.getElementById('log'), format=document.getElementById('format');
+let objectURL, source;
+function report(message){ log.textContent+=message+'\n'; }
+function reset(){video.pause();video.removeAttribute('src');video.load();if(objectURL)URL.revokeObjectURL(objectURL);objectURL=null;source=null;log.textContent='';}
+function failure(error){report('FAIL: '+error);}
+['loadedmetadata','canplay','playing','waiting','seeking','seeked','ended','pause'].forEach(event=>video.addEventListener(event,()=>report(event+' @ '+video.currentTime.toFixed(2)+'s; '+video.videoWidth+'x'+video.videoHeight)));
+video.addEventListener('error',()=>failure('media error '+(video.error?video.error.code:'unknown')));
+document.getElementById('direct').onclick=()=>{reset();video.src='generated/'+format.value;video.play().catch(failure);};
+document.getElementById('mse').onclick=()=>{
+ reset(); if(!window.MediaSource){failure('MediaSource unavailable');return;}
+ const type=format.value==='avc-aac.mp4'?'video/mp4; codecs="avc1.42c00c,mp4a.40.2"':format.value==='vp9-opus.webm'?'video/webm; codecs="vp9,opus"':null;
+ if(!type){failure('Select MP4 or WebM: manifests are URL tests; MSE accepts media bytes');return;}
+ report(type+' supported: '+MediaSource.isTypeSupported(type));if(!MediaSource.isTypeSupported(type))return;
+ source=new MediaSource();objectURL=URL.createObjectURL(source);video.src=objectURL;
+ const thisSource=source;
+ source.addEventListener('sourceopen',async()=>{
+  try{
+   const response=await fetch('generated/'+format.value);if(!response.ok)throw Error(response.status);
+   const data=await response.arrayBuffer();if(source!==thisSource)return;
+   const buffer=thisSource.addSourceBuffer(type);
+   buffer.addEventListener('error',()=>failure('SourceBuffer append'));
+   buffer.addEventListener('updateend',()=>{if(source===thisSource&&thisSource.readyState==='open'){thisSource.endOfStream();report('append complete; endOfStream');}},{once:true});
+   buffer.appendBuffer(data);
+  }catch(error){failure(error);}
+ },{once:true});
+ video.play().catch(failure);
+};
+document.getElementById('seek').onclick=()=>{try{video.currentTime=4;}catch(error){failure(error);}};
+document.getElementById('full').onclick=()=>{const promise=video.requestFullscreen?video.requestFullscreen():null;if(promise)promise.catch(failure);};
+report('MediaSource: '+!!window.MediaSource+'; encrypted media API: '+!!navigator.requestMediaKeySystemAccess);
+</script>

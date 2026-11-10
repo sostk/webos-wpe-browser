@@ -12,3 +12,5 @@ build/
 !browser/largeIcon.png
 .cache/
 __pycache__/
+
+/tools/media-tests/generated/
