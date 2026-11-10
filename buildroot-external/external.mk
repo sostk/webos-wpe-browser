@@ -23,3 +23,9 @@ WPEWEBKIT_CONF_OPTS += \
 	-DENABLE_C_LOOP=ON \
 	-DENABLE_SAMPLING_PROFILER=OFF \
 	-DENABLE_WEBASSEMBLY=OFF
+
+# Mesa is bundled for WPEWebProcess only, as the surfaceless (software) EGL platform. Buildroot adds the
+# wayland platform whenever BR2_PACKAGE_WAYLAND is on (wpewebkit selects it), which makes libEGL link
+# libwayland-client/-server: libraries the TV has its own copies of, and which the kit's packaging check
+# refuses in the app. Appended last, so the platform list wins over Buildroot's.
+MESA3D_CONF_OPTS += -Dplatforms= -Dlegacy-wayland=
