@@ -10,29 +10,40 @@
 #   lib/*.so*                          every library the above need, except the TV's glibc, plus Mesa
 #                                      (libEGL/libGLESv2/libgallium: software GL for WPEWebProcess only)
 #   lib/gio/modules/libgiognutls.so    TLS for libsoup
+#   lib/libWPEBackend-webos.so         direct GPU presentation, when build/webos-backend has it (softfp);
+#   lib/libwpeb-owner.so               its window-owner half, dlopen()ed by the UI
 #   etc/fonts/fonts.conf, share/fonts  bundled fonts (+ the TV's own font folders)
 #   etc/ssl/certs/ca-certificates.crt  read directly via WPE_BROWSER_CA_FILE
+# Hard-float Buildroot output (BR2_ARM_EABIHF, tools/build-hf.sh): glibc is bundled too (lib/ld-linux-armhf.so.3,
+# libc, NSS modules for DNS, lib/gconv), and every executable's PT_INTERP is set to $LOADER_LINK, a link the UI
+# creates in its runtime folder (browser/private_loader.cpp). The TV has no hard-float loader of its own.
 set -eu
 
 BR=${BR:-/build/br-out}
 SRC=${SRC:-/src}
 OUT=${OUT:-/src/build/engine-stage/engine}
 TARGET=$BR/target
+ENGINE_BUILD=${ENGINE_BUILD:-/build/engine-build}
+LOADER_LINK=${LOADER_LINK:-/tmp/org.sostk.wpebrowser/ld-linux-armhf.so.3}
+HF=no
+grep -qx 'BR2_ARM_EABIHF=y' "$BR/.config" && HF=yes
 STAGING=$BR/staging
 READELF=$BR/host/bin/arm-webos-linux-gnueabi-readelf
 [ -x "$READELF" ] || READELF=$(ls "$BR"/host/bin/*-readelf | head -n 1)
 
 # The TV provides these (glibc 2.28); bundling them would break the loader.
 SYSTEM_LIBS=' ld-linux.so.3 libc.so.6 libm.so.6 libdl.so.2 libpthread.so.0 librt.so.1 libresolv.so.2 libutil.so.1 libanl.so.1 libnsl.so.1 libcrypt.so.1 '
+# Hard-float: nothing comes from the TV; the loader itself is copied below and is in no DT_NEEDED closure.
+[ "$HF" = yes ] && SYSTEM_LIBS=' ld-linux-armhf.so.3 '
 
 echo "== build wpe-engine"
-cmake -S "$SRC/engine" -B /build/engine-build -G Ninja \
+cmake -S "$SRC/engine" -B "$ENGINE_BUILD" -G Ninja \
     -DCMAKE_TOOLCHAIN_FILE="$BR/host/share/buildroot/toolchainfile.cmake" -DCMAKE_BUILD_TYPE=Release >/dev/null
-cmake --build /build/engine-build
+cmake --build "$ENGINE_BUILD"
 
 rm -rf "$OUT"
 mkdir -p "$OUT/lib/gio/modules" "$OUT/libexec" "$OUT/etc/fonts" "$OUT/etc/ssl/certs" "$OUT/share"
-cp /build/engine-build/wpe-engine "$OUT/"
+cp "$ENGINE_BUILD/wpe-engine" "$OUT/"
 "$BR"/host/bin/*-strip "$OUT/wpe-engine" 2>/dev/null || true
 
 LIBEXEC=$(ls -d "$TARGET"/usr/libexec/wpe-webkit-* | head -n 1)
@@ -125,7 +136,35 @@ mkdir -p "$OUT/lib/mesa"
 for f in $MESA_SEEDS; do cp -L "$f" "$OUT/lib/mesa/$(basename "$f")"; done
 # Mesa's own closure (libgallium, libLLVM, ...), minus what the engine already shares from lib/.
 collect "$(for f in $MESA_SEEDS; do printf '%s ' "$OUT/lib/mesa/$(basename "$f")"; done)" "$OUT/lib/mesa"
+if [ "$HF" = yes ]; then
+    echo "== private glibc (hard-float)"
+    cp -L "$TARGET/lib/ld-linux-armhf.so.3" "$OUT/lib/"
+    # dlopen()ed by getaddrinfo/getpwuid through the TV's /etc/nsswitch.conf; the TV's own are softfp.
+    NSS_SEEDS=''
+    for so in libnss_files.so.2 libnss_dns.so.2; do
+        cp -L "$TARGET/lib/$so" "$OUT/lib/"
+        NSS_SEEDS="$NSS_SEEDS $OUT/lib/$so"
+    done
+    collect "$NSS_SEEDS" "$OUT/lib"
+    gconv=$(ls -d "$TARGET"/usr/lib/gconv 2>/dev/null || true)
+    [ -n "$gconv" ] || { echo "missing usr/lib/gconv (BR2_TOOLCHAIN_GLIBC_GCONV_LIBS_COPY)" >&2; exit 1; }
+    cp -r "$gconv" "$OUT/lib/gconv"
+    PATCHELF=$BR/host/bin/patchelf
+    for exe in "$OUT/wpe-engine" "$OUT"/libexec/*; do
+        "$READELF" -l "$exe" 2>/dev/null | grep -q 'Requesting program interpreter' || continue
+        "$PATCHELF" --set-interpreter "$LOADER_LINK" "$exe"
+    done
+fi
 "$BR"/host/bin/*-strip --strip-unneeded "$OUT"/lib/*.so* "$OUT"/lib/mesa/*.so* "$OUT"/lib/gstreamer-1.0/*.so "$OUT"/lib/gio/modules/*.so "$OUT"/lib/injected-bundle/*.so "$OUT"/libexec/* 2>/dev/null || true
+
+# Direct GPU presentation (engine/webos-backend, built on the host with the webOS NDK by
+# tools/build-webos-backend.sh). dlopen()ed by the engine and by libwpe in WPEWebProcess; its libwayland-client
+# and libwayland-egl are the TV's own (Mali), so they are deliberately not collected. softfp only.
+BACKEND=$SRC/build/webos-backend/libWPEBackend-webos.so
+if [ "$HF" = no ] && [ -f "$BACKEND" ]; then
+    echo "== direct presentation backend"
+    cp "$BACKEND" "$SRC/build/webos-backend/libwpeb-owner.so" "$OUT/lib/"
+fi
 
 echo "== fonts, certificates"
 cp -r "$TARGET/usr/share/fonts" "$OUT/share/"
@@ -142,9 +181,25 @@ cat > "$OUT/etc/fonts/fonts.conf" <<'EOF'
   <alias><family>sans-serif</family><prefer><family>DejaVu Sans</family></prefer></alias>
   <alias><family>serif</family><prefer><family>DejaVu Serif</family></prefer></alias>
   <alias><family>monospace</family><prefer><family>DejaVu Sans Mono</family></prefer></alias>
+  <!-- Grayscale antialiasing: subpixel (LCD) text shows coloured fringes on a TV panel. SHM mode also gets this
+       from WebKit patch 0003; direct mode (libwpe API, no WPEPlatform settings) only from here. -->
+  <match target="font"><edit name="rgba" mode="assign"><const>none</const></edit></match>
 </fontconfig>
 EOF
 
+if [ "$HF" = yes ]; then
+    echo "== check: hard-float everywhere, loader at $LOADER_LINK"
+    bad=0
+    for f in "$OUT/wpe-engine" "$OUT"/libexec/* "$OUT"/lib/*.so* "$OUT"/lib/mesa/*.so* "$OUT"/lib/gstreamer-1.0/*.so; do
+        # A softfp object would be refused by the hard-float loader at run time; catch it here.
+        if "$READELF" -h "$f" 2>/dev/null | grep -q 'soft-float ABI'; then echo "  ! soft-float: $(basename "$f")" >&2; bad=1; fi
+    done
+    for f in "$OUT/wpe-engine" "$OUT"/libexec/*; do
+        i=$("$READELF" -l "$f" | sed -n 's/.*Requesting program interpreter: \(.*\)]/\1/p')
+        [ "$i" = "$LOADER_LINK" ] || { echo "  ! $(basename "$f") loader is '$i'" >&2; bad=1; }
+    done
+    [ "$bad" = 0 ] || exit 1
+fi
 echo "== check: nothing may need a glibc newer than the TV's 2.28"
 bad=0
 for f in "$OUT/wpe-engine" "$OUT"/libexec/* "$OUT"/lib/*.so* "$OUT"/lib/mesa/*.so* "$OUT"/lib/gstreamer-1.0/*.so "$OUT"/lib/gio/modules/*.so "$OUT"/lib/injected-bundle/*.so; do

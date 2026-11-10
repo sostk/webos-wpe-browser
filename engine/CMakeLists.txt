@@ -9,11 +9,12 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(WPE REQUIRED IMPORTED_TARGET wpe-webkit-2.0 wpe-platform-2.0 glib-2.0 gio-unix-2.0)
+pkg_check_modules(WPE REQUIRED IMPORTED_TARGET wpe-webkit-2.0 wpe-platform-2.0 wpe-1.0 glib-2.0 gio-unix-2.0)
 
-add_executable(wpe-engine src/main.cpp src/platform.cpp)
+add_executable(wpe-engine src/main.cpp src/platform.cpp src/direct.cpp)
 target_include_directories(wpe-engine PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../common)
-target_link_libraries(wpe-engine PRIVATE PkgConfig::WPE)
+# libWPEBackend-webos.so (engine/webos-backend, built with the webOS NDK) is dlopen()ed in direct mode.
+target_link_libraries(wpe-engine PRIVATE PkgConfig::WPE ${CMAKE_DL_LIBS})
 target_compile_options(wpe-engine PRIVATE -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
 # Libraries are bundled next to the engine inside the app package (engine/lib).
 set_target_properties(wpe-engine PROPERTIES
