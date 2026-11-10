@@ -11,7 +11,7 @@
 #                                      (libEGL/libGLESv2/libgallium: software GL for WPEWebProcess only)
 #   lib/gio/modules/libgiognutls.so    TLS for libsoup
 #   etc/fonts/fonts.conf, share/fonts  bundled fonts (+ the TV's own font folders)
-#   etc/ssl/certs/ca-certificates.crt  copied by the app to /tmp/wpe-browser/ before start
+#   etc/ssl/certs/ca-certificates.crt  read directly via WPE_BROWSER_CA_FILE
 set -eu
 
 BR=${BR:-/build/br-out}

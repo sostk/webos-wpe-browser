@@ -8,7 +8,6 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
-#include <fstream>
 
 #include <fcntl.h>
 #include <signal.h>
@@ -26,23 +25,6 @@ namespace browser {
 namespace {
 
 constexpr const char *kCat = "engine";
-
-// gnutls in the engine is built to read its CA bundle from this fixed path (buildroot-external/external.mk);
-// the app copies the bundled file there before starting the engine.
-constexpr const char *kCaBundlePath = "/tmp/wpe-browser/ca-certificates.crt";
-
-bool copy_file(const std::string &from, const std::string &to) {
-    std::ifstream in(from, std::ios::binary);
-    if (!in) return false;
-    const std::string tmp = to + ".tmp";
-    {
-        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-        if (!out) return false;
-        out << in.rdbuf();
-        if (!out) return false;
-    }
-    return ::rename(tmp.c_str(), to.c_str()) == 0;
-}
 
 void set_env(std::vector<std::string> &env, const std::string &name, const std::string &value) {
     const std::string prefix = name + "=";
@@ -71,9 +53,11 @@ bool EngineClient::start(const EngineLaunch &l, std::string &error) {
         error = "engine not found at " + exe;
         return false;
     }
-    ::mkdir("/tmp/wpe-browser", 0700);
-    if (!copy_file(l.engine_dir + "/etc/ssl/certs/ca-certificates.crt", kCaBundlePath))
-        WNK_LOGW(kCat, "could not install the CA bundle at %s: HTTPS will fail", kCaBundlePath);
+    const std::string ca_bundle = l.engine_dir + "/etc/ssl/certs/ca-certificates.crt";
+    if (::access(ca_bundle.c_str(), R_OK) != 0) {
+        error = "cannot read the bundled TLS certificates at " + ca_bundle;
+        return false;
+    }
 
     int sv[2];
     if (::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv) != 0) {
@@ -96,7 +80,10 @@ bool EngineClient::start(const EngineLaunch &l, std::string &error) {
     // (the loader read LD_LIBRARY_PATH at our start), so the TV's Mali EGL and the bundled Mesa never meet.
     set_env(env, "LD_LIBRARY_PATH", d + "/lib");
     set_env(env, "WEBKIT_EXEC_PATH", d + "/libexec");
+    set_env(env, "WPE_BROWSER_CA_FILE", ca_bundle);
     set_env(env, "GIO_MODULE_DIR", d + "/lib/gio/modules");
+    // GIO scans EXTRA_MODULES first; inherited firmware paths would win over MODULE_DIR.
+    set_env(env, "GIO_EXTRA_MODULES", "");
     set_env(env, "FONTCONFIG_FILE", d + "/etc/fonts/fonts.conf");
     set_env(env, "XDG_DATA_DIRS", d + "/share");
     set_env(env, "XDG_CACHE_HOME", l.cache_dir);

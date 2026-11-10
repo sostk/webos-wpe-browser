@@ -150,3 +150,10 @@
   94.5 MB (200 MB unpacked). One fix: Mesa's libEGL linked libwayland-client/-server (Buildroot adds the wayland EGL platform because
   wpewebkit selects wayland); external.mk now passes `-Dplatforms= -Dlegacy-wayland=` to Mesa (surfaceless + drm only). 55 libraries in engine/lib.
   Not installed on the TV (TV testing paused at the user's request).
+
+
+## 2026-11-10 TLS certificate repair
+- Root diagnostics left `/tmp/wpe-browser` owned by root with mode 0700. The installed browser (uid 6391) could not traverse it to read the public CA file. Clock was correct; the network process used bundled GIO/GnuTLS and reported unknown-CA errors for public sites.
+- With explicit user approval, changed the directory to 0755 and restarted WPE Browser. Website success awaits user confirmation.
+- Permanent fix reads the packaged CA bundle directly through WPE_BROWSER_CA_FILE, using secure_getenv in private GnuTLS and retaining its configured fallback for older launchers. Missing/unreadable bundles fail startup with an actionable error. Clear inherited GIO_EXTRA_MODULES so firmware TLS modules cannot override the bundled backend. Certificate and hostname checks remain enabled.
+- Local validation: GnuTLS rebuild/staging, host tests (2/2), and rebuilt IPK/package checks passed. ARM QEMU loopback checks in tools/test-tls.py accepted a trusted issuer and rejected an untrusted issuer and wrong hostname. The new IPK is prepared locally and has not been installed.

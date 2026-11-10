@@ -7,9 +7,9 @@ WPEWEBKIT_CONF_OPTS += \
 	-DENABLE_WPE_PLATFORM_DRM=OFF \
 	-DENABLE_WPE_PLATFORM_WAYLAND=OFF
 
-# HTTPS trust: the browser app copies its bundled CA list to this fixed path before starting the engine
-# (a path inside the app package is not known at build time). Appended last, so it wins over Buildroot's
-# --with-default-trust-store-file=/etc/ssl/certs/ca-certificates.crt.
+# HTTPS trust: the GnuTLS runtime patch accepts WPE_BROWSER_CA_FILE, set to the
+# immutable bundled CA list by EngineClient. The configured path is only a fallback
+# for older launchers; normal app startup no longer writes a shared /tmp file.
 GNUTLS_CONF_OPTS += --with-default-trust-store-file=/tmp/wpe-browser/ca-certificates.crt
 
 # JavaScriptCore's 32-bit ARM JIT needs the hard-float ABI (PlatformEnable.h: CPU(ARM_THUMB2) && CPU(ARM_HARDFP)),

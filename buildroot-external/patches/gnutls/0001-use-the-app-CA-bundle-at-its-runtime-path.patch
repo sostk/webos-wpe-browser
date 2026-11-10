@@ -1,0 +1,28 @@
+From: webos-wpe-browser <poudelswastik@gmail.com>
+Subject: [PATCH] Allow the private runtime to use its packaged CA bundle
+
+The installed app cannot traverse a shared /tmp CA directory left mode 0700
+by a root diagnostic run. Read WPE_BROWSER_CA_FILE through secure_getenv so
+normal app processes can use their immutable packaged bundle directly.
+Certificate and hostname verification are unchanged. Privileged execution
+ignores the environment override, retaining the configured system store.
+
+Upstream: not submitted (application-specific private runtime).
+---
+--- a/lib/system/certs.c
++++ b/lib/system/certs.c
+@@ -125,8 +125,13 @@
+ #endif
+ 
+ #ifdef DEFAULT_TRUST_STORE_FILE
++	/* The app's immutable CA bundle has a runtime installation path. Do not
++	 * depend on a shared /tmp file owned by a previous execution user. */
++	const char *trust_file = secure_getenv("WPE_BROWSER_CA_FILE");
++	if (trust_file == NULL || trust_file[0] == '\0')
++		trust_file = DEFAULT_TRUST_STORE_FILE;
+ 	ret = gnutls_x509_trust_list_add_trust_file(
+-		list, DEFAULT_TRUST_STORE_FILE, crl_file, GNUTLS_X509_FMT_PEM,
++		list, trust_file, crl_file, GNUTLS_X509_FMT_PEM,
+ 		tl_flags, tl_vflags);
+ 	if (ret > 0)
+ 		r += ret;
