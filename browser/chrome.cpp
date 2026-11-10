@@ -355,6 +355,7 @@ BookmarksBar::BookmarksBar(std::function<void(Ui &, const std::string &)> open, 
 
 void BookmarksBar::rebuild(Ui &ui, const std::vector<Item> &items) {
     clear_children();
+    has_items_ = !items.empty();
     if (items.empty()) {
         auto &hint = add<wnk::ui::Label>("For quick access, bookmark pages with the star in the address bar.", wnk::ui::TextRole::Small);
         hint.set_muted(true);

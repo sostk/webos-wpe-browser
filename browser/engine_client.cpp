@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "engine_client.hpp"
+#include "private_loader.hpp"
 
 #include "wnk/log.hpp"
 
@@ -58,6 +59,12 @@ bool EngineClient::start(const EngineLaunch &l, std::string &error) {
         error = "cannot read the bundled TLS certificates at " + ca_bundle;
         return false;
     }
+    // Hard-float engine (JIT): its executables use the bundled loader through a link in the runtime folder.
+    bool private_loader = false;
+    if (!prepare_private_loader(exe, l.engine_dir + "/lib", l.runtime_dir, private_loader, error)) return false;
+    // The TV's Mali libraries are softfp and can't load into a hard-float process: llvmpipe only.
+    const bool gpu = l.gpu && !private_loader;
+    if (l.gpu && !gpu) WNK_LOGW(kCat, "GPU mode needs the softfp engine; using software rendering");
 
     int sv[2];
     if (::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv) != 0) {
@@ -71,6 +78,8 @@ bool EngineClient::start(const EngineLaunch &l, std::string &error) {
         ::close(sv[1]);
     }
     const std::string log_path = l.runtime_dir + "/engine.log";
+    // Keep the previous run's log: after a crash and restart it holds what happened.
+    ::rename(log_path.c_str(), (l.runtime_dir + "/engine.prev.log").c_str());
     const int log_fd = ::open(log_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0640);
 
     std::vector<std::string> env;
@@ -80,9 +89,14 @@ bool EngineClient::start(const EngineLaunch &l, std::string &error) {
     // (the loader read LD_LIBRARY_PATH at our start), so the TV's Mali EGL and the bundled Mesa never meet.
     // Software mode adds engine/lib/mesa (libEGL/libGLESv2 + llvmpipe); in GPU mode the web process
     // finds the TV's libEGL.so.1/libGLESv2.so.2 on the default search path instead.
-    set_env(env, "LD_LIBRARY_PATH", l.gpu ? d + "/lib" : d + "/lib:" + d + "/lib/mesa");
+    set_env(env, "LD_LIBRARY_PATH", gpu ? d + "/lib" : d + "/lib:" + d + "/lib/mesa");
     set_env(env, "WEBKIT_EXEC_PATH", d + "/libexec");
     set_env(env, "WPE_BROWSER_CA_FILE", ca_bundle);
+    if (private_loader) {
+        // The bundled glibc must not pick up the TV's (softfp) iconv modules or preloads.
+        set_env(env, "GCONV_PATH", d + "/lib/gconv");
+        set_env(env, "LD_PRELOAD", "");
+    }
     set_env(env, "GIO_MODULE_DIR", d + "/lib/gio/modules");
     // GIO scans EXTRA_MODULES first; inherited firmware paths would win over MODULE_DIR.
     set_env(env, "GIO_EXTRA_MODULES", "");
@@ -104,7 +118,7 @@ bool EngineClient::start(const EngineLaunch &l, std::string &error) {
     set_env(env, "XDG_DATA_HOME", l.data_dir);
     set_env(env, "XDG_CONFIG_HOME", l.data_dir + "/config");
     set_env(env, "HOME", l.data_dir);
-    if (l.gpu) {
+    if (gpu) {
         // C1/webOS 6.5.3: Mali compositing + WebGL pass, but Skia GPU painting
         // corrupts ordinary page tiles. Keep CPU tile painting until that is fixed.
         set_env(env, "WEBKIT_SKIA_ENABLE_CPU_RENDERING", "1");
@@ -115,7 +129,17 @@ bool EngineClient::start(const EngineLaunch &l, std::string &error) {
         // Painting through llvmpipe would be slower than Skia's CPU raster (NEON) on half the cores.
         set_env(env, "WEBKIT_SKIA_ENABLE_CPU_RENDERING", "1");
     }
-    set_env(env, "WPE_BROWSER_RENDERER", l.gpu ? "gpu" : "software");
+    set_env(env, "WPE_BROWSER_RENDERER", gpu ? "gpu" : "software");
+    if (gpu && !l.surface_group.empty()) {
+        set_env(env, "WPE_BROWSER_PRESENT", "direct");
+        set_env(env, "WPEB_SURFACE_GROUP", l.surface_group);
+        set_env(env, "WPEB_APP_ID", "org.sostk.wpebrowser");  // the page surfaces' webOS window role
+        set_env(env, "WPEB_SURFACE_LAYER", l.surface_layer.empty() ? "page" : l.surface_layer);
+        // The full socket path, so the web processes need not share our XDG_RUNTIME_DIR / WAYLAND_DISPLAY.
+        if (!l.wayland_socket.empty()) set_env(env, "WPEB_WAYLAND_SOCKET", l.wayland_socket);
+    } else {
+        set_env(env, "WPE_BROWSER_PRESENT", "shm");
+    }
     set_env(env, "WPE_BROWSER_DATA_DIR", l.data_dir);
     set_env(env, "WPE_BROWSER_CACHE_DIR", l.cache_dir);
     std::vector<char *> envp;
@@ -211,6 +235,11 @@ void EngineClient::scroll(int32_t x, int32_t y, int32_t dx120, int32_t dy120) {
 void EngineClient::clear_data(uint32_t what, uint32_t seconds) {
     const WpeClearData c{what, seconds};
     send(WPE_APP_CLEAR_DATA, 0, &c, sizeof(c));
+}
+
+void EngineClient::set_scale(uint32_t permille) {
+    const WpeZoom z{permille};
+    send(WPE_APP_SET_SCALE, 0, &z, sizeof(z));
 }
 
 void EngineClient::set_zoom(uint32_t permille) {
@@ -361,6 +390,13 @@ void EngineClient::handle(const uint8_t *buf, size_t n, int fd) {
             cb_.history(h.tab, hi.can_go_back != 0, hi.can_go_forward != 0);
         }
         break;
+    case WPE_ENGINE_SCROLL:
+        if (len >= sizeof(WpeFlag) && cb_.scroll) {
+            WpeFlag f;
+            std::memcpy(&f, p, sizeof(f));
+            cb_.scroll(h.tab, f.value != 0);
+        }
+        break;
     case WPE_ENGINE_IME:
         if (len >= sizeof(WpeIme) && cb_.ime) {
             WpeIme m;
@@ -377,6 +413,13 @@ void EngineClient::handle(const uint8_t *buf, size_t n, int fd) {
                                   : 0;
             cb_.error(h.tab, static_cast<WpeErrorKind>(e.kind), e.code,
                       std::string(e.message.text, std::min<size_t>({e.message.length, tl, WPE_IPC_MAX_TEXT - 1})));
+        }
+        break;
+    case WPE_ENGINE_PRESENT:
+        if (len >= sizeof(WpePresent) && cb_.present) {
+            WpePresent m;
+            std::memcpy(&m, p, sizeof(m));
+            cb_.present(h.tab, m);
         }
         break;
     case WPE_ENGINE_DATA_CLEARED:

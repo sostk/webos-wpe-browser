@@ -140,8 +140,10 @@ class BookmarksBar : public wnk::ui::Row {
     };
     BookmarksBar(std::function<void(wnk::ui::Ui &, const std::string &)> open, wnk::ui::ClickHandler manage);
     void rebuild(wnk::ui::Ui &ui, const std::vector<Item> &items);
+    bool has_items() const { return has_items_; }  // focusable chips (else only a hint)
 
  private:
+    bool has_items_ = false;
     std::function<void(wnk::ui::Ui &, const std::string &)> open_;
     wnk::ui::ClickHandler manage_;
 };

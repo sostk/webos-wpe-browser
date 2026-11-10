@@ -22,6 +22,7 @@ struct Settings {
     int search_engine = 0;   // index into kSearchEngines
     int zoom = 0;            // index into kZoomLevels
     bool restore_session = false;  // "Continue where you left off"
+    bool sharp_text = true;  // render pages at the screen's resolution (1.5x), not 2/3 of it
 };
 
 struct SearchEngine {

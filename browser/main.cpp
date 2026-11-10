@@ -12,11 +12,14 @@
 // back in history, or to the omnibox when there is none. Colour keys: Red = omnibox, Green = reload,
 // Yellow = next tab, Blue = new tab. CH+/CH- = page up/down. The Magic Remote pointer is a mouse in pages.
 #include "chrome.hpp"
+#include "direct_owner.hpp"
 #include "engine_client.hpp"
 #include "keys.hpp"
 #include "page_view.hpp"
 #include "profile.hpp"
 #include "screens.hpp"
+#include "storage.hpp"
+#include "../engine/webos-backend/protocol.h"
 
 #include "wnk/app/app.hpp"
 #include "wnk/log.hpp"
@@ -24,6 +27,8 @@
 #include "wnk/ui/navigation.hpp"
 #include "wnk/ui/ui.hpp"
 #include "wnk/ui/widgets.hpp"
+
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -36,6 +41,15 @@
 #include <sys/stat.h>
 
 namespace {
+// A string launch parameter ({"target": "https://..."}), empty when absent or not a string.
+std::string launch_param(const std::string &params_json, const char *key) {
+    if (params_json.empty()) return {};
+    const auto j = nlohmann::json::parse(params_json, nullptr, false);
+    if (!j.is_object()) return {};
+    const auto it = j.find(key);
+    return it != j.end() && it->is_string() ? it->get<std::string>() : std::string();
+}
+
 
 using browser::TabId;
 namespace pal = browser::palette;
@@ -45,6 +59,9 @@ constexpr const char *kVersion = "0.2.0";
 // Pages are rendered at this fraction of the view's size in 1920x1080 logical units and scaled up by the
 // GPU: CPU rendering at about 1280 px wide keeps scrolling usable, and CSS px at that size read well from a sofa.
 constexpr float kRenderScale = 2.0f / 3.0f;
+constexpr double kChromeSlideMs = 160;     // toolbar slide in/out
+constexpr double kChromePeekMs = 2500;   // after Back the toolbar stays over the page this long
+constexpr float kChromeRevealEdge = 6.0f;  // logical px at the top of the screen that bring the toolbar back
 constexpr int kMaxRestarts = 3;
 // Background tabs beyond this many keep only their URL and title (Chromium's tab discarding); they reload
 // when shown again. Each live tab costs WebKit memory, and a TV has little to spare.
@@ -81,21 +98,13 @@ std::string to_url(std::string text, const std::string &search_prefix) {
     const auto e = text.find_last_not_of(" \t");
     if (b == std::string::npos) return {};
     text = text.substr(b, e - b + 1);
-    if (text.find("://") != std::string::npos || text.rfind("about:", 0) == 0) return text;
+    if (text.find("://") != std::string::npos || text.rfind("about:", 0) == 0 || text.rfind("data:", 0) == 0) return text;
     const bool hostish = text.find(' ') == std::string::npos &&
                          (text.find('.') != std::string::npos || text.rfind("localhost", 0) == 0);
     return hostish ? "https://" + text : search_prefix + url_encode(text);
 }
 
-bool make_dir(const std::string &path) {
-    for (size_t i = 1; i <= path.size(); ++i) {
-        if (i == path.size() || path[i] == '/') {
-            const std::string part = path.substr(0, i);
-            if (::mkdir(part.c_str(), 0700) != 0 && errno != EEXIST) return false;
-        }
-    }
-    return true;
-}
+using browser::make_dir;
 
 struct Tab {
     TabId id = 0;
@@ -104,6 +113,7 @@ struct Tab {
     bool loading = false;
     bool can_back = false, can_forward = false;
     bool live = false;  // has a WebKit view in the engine
+    bool at_top = true;  // the page is scrolled to its top (the toolbar peeks over it then)
     double last_shown_ms = 0;
 };
 
@@ -122,6 +132,9 @@ class BrowserScreen : public wnk::ui::Screen {
     browser::Omnibox *omnibox_ = nullptr;
     browser::BookmarksBar *bookmarks_ = nullptr;
     browser::ProgressLine *progress_ = nullptr;
+    wnk::ui::Column *chrome_ = nullptr;             // tabs, toolbar, bookmarks: drawn over the page
+    wnk::ui::Row *toolbar_ = nullptr;
+    browser::ProgressLine *thin_progress_ = nullptr;  // load progress while the chrome is hidden
     browser::PageView *page_ = nullptr;
     browser::NewTabPage *ntp_ = nullptr;
     wnk::ui::Label *message_ = nullptr;
@@ -221,7 +234,10 @@ class App : public wnk::app::Delegate {
         Tab *t = tab(active_);
         if (t == nullptr) return;
         if (t->live) engine_.tab_close(t->id);
-        *t = Tab{t->id, {}, {}, 0, false, false, false, false, ctx_->ui().now_ms()};
+        Tab fresh;
+        fresh.id = t->id;
+        fresh.last_shown_ms = ctx_->ui().now_ms();
+        *t = fresh;
         screen_->page_->show_tab(0);
         refresh_chrome();
         focus_content();
@@ -260,6 +276,56 @@ class App : public wnk::app::Delegate {
 
     void show_bookmarks_page(wnk::ui::Ui &ui) { push_page(ui, browser::make_bookmarks_screen(profile_, hooks())); }
 
+    // The chrome is shown unless the page itself has focus (Red, or Back with no history, moves focus to it; so
+    // does the pointer at the top edge). While the page has focus the chrome still peeks over it when the page is
+    // scrolled to its top and for kChromePeekMs after Back (focus stays on the page). It slides up out of view in
+    // kChromeSlideMs and is then hidden, so its buttons can't take focus.
+    bool chrome_wanted(wnk::ui::Ui &ui) {
+        const Tab *t = tab(active_);
+        const bool page_mode = ui.focused() == screen_->page_ && t != nullptr && t->live && !t->url.empty() &&
+                               !screen_->message_->visible() && ui.top_dialog() == nullptr && nav_->depth() == 1;
+        if (!page_mode) return true;
+        return t->at_top || ui.now_ms() < peek_until_ms_;
+    }
+
+    void peek_chrome() { peek_until_ms_ = ctx_->ui().now_ms() + kChromePeekMs; }
+
+    void update_chrome(wnk::ui::Ui &ui) {
+        auto *chrome = screen_->chrome_;
+        // The column itself spans the screen (a plain View places it with the full height); the chrome ends at the
+        // bottom of its last visible row.
+        float bottom = screen_->progress_->frame().y + screen_->progress_->frame().h;
+        if (screen_->message_->visible()) bottom = std::max(bottom, screen_->message_->frame().y + screen_->message_->frame().h);
+        const float h = std::max(0.0f, bottom - chrome->frame().y);
+        chrome_h_ = h;
+        // The New Tab page starts below the chrome; a web page lies under it.
+        const float pad = h > 0 ? h : 0;
+        if (screen_->ntp_->padding().top != pad) screen_->ntp_->set_padding({0, pad, 0, 0});
+        const bool want = chrome_wanted(ui);
+        const double now = ui.now_ms();
+        const double dt = last_chrome_ms_ > 0 ? now - last_chrome_ms_ : 0;
+        last_chrome_ms_ = now;
+        const float step = static_cast<float>(dt / kChromeSlideMs);
+        chrome_shown_ = want ? std::min(1.0f, chrome_shown_ + step) : std::max(0.0f, chrome_shown_ - step);
+        if (want && !chrome->visible()) chrome->set_visible(true);
+        chrome->set_translation({0, -(1.0f - chrome_shown_) * h});
+        if (!want && chrome_shown_ <= 0.0f && chrome->visible()) chrome->set_visible(false);
+        screen_->thin_progress_->set_visible(!chrome->visible());
+    }
+
+    // Hidden views can't take focus: show the chrome first (it slides in from its current position).
+    void focus_omnibox(wnk::ui::Ui &ui) {
+        screen_->chrome_->set_visible(true);
+        ui.focus(&omnibox_field());
+    }
+
+    // Over the visible chrome, pointer events belong to the chrome's widgets, not to the page underneath.
+    bool over_chrome(wnk::Point l) const {
+        if (!screen_->chrome_->visible()) return false;
+        const wnk::Rect r = screen_->chrome_->screen_rect();
+        return l.y >= r.y && l.y < r.y + chrome_h_ && l.x >= r.x && l.x < r.x + r.w;
+    }
+
     bool content_focused() {
         auto *f = ctx_->ui().focused();
         return f == screen_->page_ || (f != nullptr && screen_->ntp_->is_ancestor_of(f));
@@ -289,11 +355,40 @@ class App : public wnk::app::Delegate {
         refresh_bookmarks();
         start_engine();
         restore_or_new_tab();
+        open_launch_target(ctx.launch().params_json);
         WNK_LOGI(kCat, "browser ui ready");
+    }
+
+    // Launched (or relaunched) with {"target": url} (what webOS sends a browser) or {"url": url}.
+    void on_relaunch(wnk::app::Context &, const std::string &params_json) override { open_launch_target(params_json); }
+
+    void open_launch_target(const std::string &params_json) {
+        std::string url = launch_param(params_json, "target");
+        if (url.empty()) url = launch_param(params_json, "url");
+        if (url.empty()) return;
+        WNK_LOGI(kCat, "launch target %s", url.c_str());
+        const Tab *t = tab(active_);
+        if (t == nullptr || !t->url.empty()) {
+            new_tab();
+            if (tab(active_) == nullptr || !tab(active_)->url.empty()) return;  // tab limit reached
+        }
+        navigate(url);
     }
 
     void on_frame(wnk::app::Context &ctx, float) override {
         engine_.poll();
+        direct_.dispatch();
+        if (direct_fallback_pending_) {
+            // Direct presentation failed: start again with SHM frames (outside engine_.poll()).
+            direct_fallback_pending_ = false;
+            engine_.stop();
+            direct_.close();
+            screen_->page_->set_direct(false);
+            for (Tab &t : tabs_) t.live = false, t.loading = false;
+            screen_->page_->show_tab(0);
+            start_engine();
+            if (Tab *t = tab(active_)) activate(t->id);
+        }
         if (!focused_once_) {
             // Focus set in on_start lands before the first layout; settle it on the first frame.
             focused_once_ = true;
@@ -308,7 +403,11 @@ class App : public wnk::app::Delegate {
                 engine_.resize(w, h);
             }
         }
-        if (Tab *t = tab(active_)) screen_->progress_->set(t->loading, t->progress);
+        if (Tab *t = tab(active_)) {
+            screen_->progress_->set(t->loading, t->progress);
+            screen_->thin_progress_->set(t->loading, t->progress);
+        }
+        update_chrome(ctx.ui());
         if (restart_pending_ && ctx_->ui().now_ms() >= restart_at_ms_) {
             restart_pending_ = false;
             start_engine();
@@ -324,11 +423,23 @@ class App : public wnk::app::Delegate {
         // Colour keys work on the browser screen, except while typing or in a dialog.
         if (nav_->depth() == 1 && ui.text_input_view() == nullptr && ui.top_dialog() == nullptr && e.down && !e.repeat) {
             switch (action) {
-            case A::Red: ui.focus(&omnibox_field()); return true;
+            case A::Red: focus_omnibox(ui); return true;
             case A::Green: reload_or_stop(); return true;
             case A::Yellow: next_tab(); return true;
             case A::Blue: new_tab(); return true;
             default: break;
+            }
+        }
+        // The page lies under the chrome, so spatial navigation never finds it "below": Down from the toolbar
+        // or the bookmarks bar goes back to the page (or the New Tab page), which hides the chrome again.
+        if (action == A::Down && e.down && nav_->depth() == 1 && ui.text_input_view() == nullptr &&
+            ui.top_dialog() == nullptr && ui.focused() != nullptr &&
+            (screen_->toolbar_->is_ancestor_of(ui.focused()) || screen_->bookmarks_->is_ancestor_of(ui.focused()))) {
+            const bool bookmarks_below = screen_->bookmarks_->visible() && screen_->toolbar_->is_ancestor_of(ui.focused()) &&
+                                         screen_->bookmarks_->has_items();
+            if (!bookmarks_below) {
+                focus_content();
+                return true;
             }
         }
         const Tab *t = tab(active_);
@@ -338,10 +449,11 @@ class App : public wnk::app::Delegate {
         switch (action) {
         case A::Back:
             if (e.down && !e.repeat) {
-                if (t->can_back)
+                if (t->can_back) {
                     engine_.go_back(t->id);
-                else
-                    ui.focus(&omnibox_field());
+                    peek_chrome();  // show where we are (the address) while the page stays focused
+                } else
+                    focus_omnibox(ui);
             }
             return true;
         case A::Exit:
@@ -378,7 +490,12 @@ class App : public wnk::app::Delegate {
         if (p.type == T::Shown) return false;
         const wnk::Point l = ctx.renderer().mapping().to_logical({p.x, p.y});
         int32_t x = 0, y = 0;
-        if (ctx.ui().top_dialog() != nullptr || !screen_->page_->to_page(l, x, y)) {
+        if (!screen_->chrome_->visible() && l.y < kChromeRevealEdge && p.type == T::Move) {
+            leave_page();
+            focus_omnibox(ctx.ui());  // pointer at the top edge: bring the chrome back
+            return true;
+        }
+        if (ctx.ui().top_dialog() != nullptr || over_chrome(l) || !screen_->page_->to_page(l, x, y)) {
             leave_page();
             return false;  // over the chrome or a dialog: the kit's widgets handle it
         }
@@ -474,6 +591,10 @@ class App : public wnk::app::Delegate {
     void apply_settings() {
         screen_->bookmarks_->set_visible(profile_.settings.show_bookmarks_bar);
         engine_.set_zoom(static_cast<uint32_t>(browser::kZoomLevels[static_cast<size_t>(profile_.settings.zoom)]));
+        // Pages lay out at 2/3 of the screen (kRenderScale); 1/kRenderScale renders them at full resolution.
+        // Direct presentation always does: the page surface is shown 1:1, not scaled to the page area.
+        const bool full = profile_.settings.sharp_text || screen_->page_->direct();
+        engine_.set_scale(full ? static_cast<uint32_t>(1000.0f / kRenderScale + 0.5f) : 1000u);
     }
 
     void refresh_bookmarks() {
@@ -591,6 +712,9 @@ class App : public wnk::app::Delegate {
                 refresh_chrome();
             }
         };
+        cb.scroll = [this](TabId id, bool at_top) {
+            if (Tab *t = tab(id)) t->at_top = at_top;
+        };
         cb.history = [this](TabId id, bool back, bool forward) {
             if (Tab *t = tab(id)) {
                 t->can_back = back;
@@ -608,6 +732,27 @@ class App : public wnk::app::Delegate {
         };
         cb.data_cleared = [this](uint32_t, bool ok) {
             ctx_->ui().toast(ok ? "Browsing data cleared" : "Some browsing data could not be cleared");
+        };
+        cb.present = [this](TabId id, const WpePresent &m) {
+            if (id == 0) {  // sent once at engine start: the mode it actually uses
+                const bool direct = m.mode == WPE_PRESENT_DIRECT;
+                if (!direct && direct_.active()) WNK_LOGW(kCat, "the engine could not load direct presentation");
+                screen_->page_->set_direct(direct);
+                apply_settings();
+                return;
+            }
+            if (m.status == WPEB_WEBOS_STATUS_FIRST_FRAME) {
+                WNK_LOGI(kCat, "tab %u: page surface %ux%u on screen", id, m.width, m.height);
+                screen_->page_->direct_shown(id, true);
+            } else if (m.status == WPEB_WEBOS_STATUS_DETACHED || m.status == WPEB_WEBOS_STATUS_OWNER_GONE) {
+                screen_->page_->direct_shown(id, false);
+            }
+            if (m.status < 0 && !direct_failed_) {
+                WNK_LOGE(kCat, "direct presentation failed for tab %u (status %d); using normal drawing", id, m.status);
+                direct_failed_ = true;
+                direct_fallback_pending_ = true;
+                ctx_->ui().toast("GPU page drawing failed; switching to normal drawing", 4000);
+            }
         };
         cb.exited = [this](const std::string &why) {
             screen_->page_->ime(ctx_->ui(), false);
@@ -634,8 +779,27 @@ class App : public wnk::app::Delegate {
         l.runtime_dir = ctx.runtime_dir().empty() ? "/tmp" : ctx.runtime_dir();
         // WPE_BROWSER_RENDERER=gpu selects the TV's Mali through WebKit's default-EGL-display patch
         // (root probes passed; installed-app validation remains: see NOTES.md). Software stays the default.
-        const char *renderer = std::getenv("WPE_BROWSER_RENDERER");
-        l.gpu = renderer && std::string(renderer) == "gpu";
+        // Launch parameters {"wpebRenderer":"gpu","wpebPresent":"direct"} do the same as the environment (an
+        // installed app gets no environment from the launcher); a parameter wins.
+        const std::string &params = ctx.launch().params_json;
+        std::string renderer = launch_param(params, "wpebRenderer");
+        if (renderer.empty() && std::getenv("WPE_BROWSER_RENDERER")) renderer = std::getenv("WPE_BROWSER_RENDERER");
+        l.gpu = renderer == "gpu";
+        // WPE_BROWSER_PRESENT=direct (with gpu): pages draw straight into a surface below this window
+        // (docs/webkit-like-chromium.md, part 2). Experimental until checked on the TV; falls back by itself.
+        std::string present = launch_param(params, "wpebPresent");
+        if (present.empty() && std::getenv("WPE_BROWSER_PRESENT")) present = std::getenv("WPE_BROWSER_PRESENT");
+        WNK_LOGI(kCat, "renderer %s, presentation %s", l.gpu ? "gpu" : "software", present.empty() ? "shm" : present.c_str());
+        if (l.gpu && !direct_failed_ && present == "direct") {
+            std::string why;
+            if (!direct_.active() && !direct_.open(l.engine_dir, why))
+                WNK_LOGW(kCat, "direct presentation unavailable: %s", why.c_str());
+            if (direct_.active()) {
+                l.surface_group = direct_.group();
+                l.surface_layer = direct_.layer();
+                l.wayland_socket = direct_.socket();
+            }
+        }
         l.data_dir = data_dir_ + "/webkit";
         l.cache_dir = l.data_dir + "/cache";
         make_dir(l.data_dir);
@@ -653,16 +817,25 @@ class App : public wnk::app::Delegate {
 
     // The app's own folder inside the first writable persistent location the kit knows. The kit's candidates
     // are shared base folders (/media/developer, $XDG_DATA_HOME, ...), so always add a folder named for the app.
+    // The whole folder must be usable by this uid: an existing one may hold another user's files (root test
+    // runs on the TV left a root-owned cookies.sqlite, and libsoup then failed with "readonly database").
+    // own_usable_dir() switches to "<folder>-<uid>" then, leaving the other user's files alone.
     std::string data_dir(wnk::app::Context &ctx) {
         const std::string own = "/" + ctx.launch().app_id + ".data";
         for (const auto &c :
              wnk::platform::storage_candidates(ctx.launch().app_id, ctx.launch().app_dir, ctx.runtime_dir())) {
-            if (c.purpose != "data") continue;
-            if (wnk::platform::probe_writable(c).writable && make_dir(c.directory + own)) return c.directory + own;
+            if (c.purpose != "data" || !wnk::platform::probe_writable(c).writable) continue;
+            std::string why;
+            const std::string dir = browser::own_usable_dir(c.directory + own, &why);
+            if (!why.empty()) WNK_LOGW(kCat, "profile folder %s", why.c_str());
+            if (!dir.empty()) return dir;
         }
         const std::string fallback = (ctx.runtime_dir().empty() ? std::string("/tmp") : ctx.runtime_dir()) + own;
-        make_dir(fallback);
-        return fallback;
+        std::string why;
+        const std::string dir = browser::own_usable_dir(fallback, &why);
+        WNK_LOGE(kCat, "no persistent profile folder; using %s%s%s", dir.empty() ? fallback.c_str() : dir.c_str(),
+            why.empty() ? "" : " (", why.empty() ? "" : (why + ")").c_str());
+        return dir.empty() ? fallback : dir;
     }
 
     void show_message(const std::string &text) {
@@ -693,12 +866,36 @@ class App : public wnk::app::Delegate {
     int restarts_ = 0;
     bool restart_pending_ = false;
     double restart_at_ms_ = 0;
+    float chrome_shown_ = 1.0f;  // 0 hidden .. 1 shown (slide position)
+    float chrome_h_ = 0;         // height of the chrome's rows
+    double last_chrome_ms_ = 0;
+    double peek_until_ms_ = 0;
+    browser::DirectOwner direct_;
+    bool direct_failed_ = false;           // stays in SHM mode for the rest of this run
+    bool direct_fallback_pending_ = false;
 };
 
 BrowserScreen::BrowserScreen(App &app, browser::EngineClient &engine) : Screen("browser"), app_(app) {
     name = "browser";
-    auto &col = add<wnk::ui::Column>(0);
-    col.set_width(wnk::ui::Dim::fill()).set_height(wnk::ui::Dim::fill());
+    // The page fills the screen (with direct presentation the TV shows the page surface at full window size
+    // anyway); the chrome lies over its top and slides away while the page has focus (App::update_chrome).
+    auto &stack = add<wnk::ui::View>();
+    stack.set_width(wnk::ui::Dim::fill()).set_height(wnk::ui::Dim::fill());
+    auto &content = stack.add<wnk::ui::View>();
+    content.set_width(wnk::ui::Dim::fill()).set_height(wnk::ui::Dim::fill());
+    page_ = &content.add<browser::PageView>(engine);
+    page_->set_width(wnk::ui::Dim::fill()).set_height(wnk::ui::Dim::fill());
+    page_->set_focus_ring(false);
+    ntp_ = &content.add<browser::NewTabPage>(
+        kShortcuts, [&app](wnk::ui::Ui &, const std::string &url) { app.navigate(url); });
+    ntp_->set_width(wnk::ui::Dim::fill()).set_height(wnk::ui::Dim::fill());
+    thin_progress_ = &stack.add<browser::ProgressLine>();
+    thin_progress_->set_width(wnk::ui::Dim::fill());
+    thin_progress_->set_visible(false);
+
+    auto &col = stack.add<wnk::ui::Column>(0);
+    col.set_width(wnk::ui::Dim::fill());
+    chrome_ = &col;
 
     strip_ = &col.add<browser::TabStrip>(browser::TabStrip::Handlers{
         [&app](uint32_t id) { app.activate(id); },
@@ -707,6 +904,7 @@ BrowserScreen::BrowserScreen(App &app, browser::EngineClient &engine) : Screen("
     });
 
     auto &bar = col.add<wnk::ui::Row>(8);
+    toolbar_ = &bar;
     bar.set_padding({16, 10, 16, 10});
     bar.set_width(wnk::ui::Dim::fill());
     bar.set_background(pal::kToolbar);
@@ -732,15 +930,6 @@ BrowserScreen::BrowserScreen(App &app, browser::EngineClient &engine) : Screen("
     message_->set_width(wnk::ui::Dim::fill());
     message_->set_background(pal::kFrame);
     message_->set_visible(false);
-
-    auto &content = col.add<wnk::ui::View>();
-    content.set_width(wnk::ui::Dim::fill()).set_height(wnk::ui::Dim::fill());
-    page_ = &content.add<browser::PageView>(engine);
-    page_->set_width(wnk::ui::Dim::fill()).set_height(wnk::ui::Dim::fill());
-    page_->set_focus_ring(false);
-    ntp_ = &content.add<browser::NewTabPage>(
-        kShortcuts, [&app](wnk::ui::Ui &, const std::string &url) { app.navigate(url); });
-    ntp_->set_width(wnk::ui::Dim::fill()).set_height(wnk::ui::Dim::fill());
 }
 
 bool BrowserScreen::on_back(wnk::ui::Ui &) {

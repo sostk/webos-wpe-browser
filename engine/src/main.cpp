@@ -1,16 +1,22 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // wpe-engine: runs WPE WebKit for the webOS browser UI app, which spawns it with a SOCK_SEQPACKET socket on
 // fd 3 (common/wpe_ipc.h). Each browser tab is one WebKitWebView; all views share one web process (they are
-// created as related views) to keep memory down on a TV. Only the active tab is visible and renders: pages
-// render on the CPU into shared-memory buffers (platform.cpp), and each frame is copied into a memfd slot
-// the UI maps and draws with the TV's GPU.
+// created as related views) to keep memory down on a TV. Only the active tab is visible and renders. Two ways
+// to the screen, chosen at start-up:
+//   SHM (default): pages render into shared-memory buffers (platform.cpp), and each frame is copied into a
+//                  memfd slot the UI maps and draws with the TV's GPU.
+//   direct:        the web process draws with the TV's EGL into its own surface in the UI's webOS surface
+//                  group (direct.cpp, engine/webos-backend); no frames pass through here.
 //
 // Environment (set by the UI app):
 //   WPE_BROWSER_DATA_DIR   cookies, local storage (persistent)
 //   WPE_BROWSER_CACHE_DIR  HTTP cache
 //   WEBKIT_EXEC_PATH       where WPEWebProcess / WPENetworkProcess are (patched to work in release builds)
 //   LD_LIBRARY_PATH, GIO_MODULE_DIR, FONTCONFIG_FILE, ... for the bundled libraries
+//   WPE_BROWSER_PRESENT    "direct" for direct presentation, with WPEB_SURFACE_GROUP (the UI's surface group),
+//                          WPEB_SURFACE_LAYER (default "page") and WPEB_WAYLAND_SOCKET (the compositor's socket)
 #include "../../common/wpe_ipc.h"
+#include "direct.h"
 #include "platform.h"
 
 #include <wpe/webkit.h>
@@ -25,6 +31,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -33,24 +40,40 @@
 #include <memory>
 #include <string>
 
+// Also used by direct.cpp.
+void log_msg(const char *fmt, ...) G_GNUC_PRINTF(1, 2);
+void log_msg(const char *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    fprintf(stderr, "wpe-engine: ");
+    vfprintf(stderr, fmt, ap);
+    fputc('\n', stderr);
+    va_end(ap);
+}
+
 namespace {
 
 struct Tab {
     uint32_t id = 0;
     WebKitWebView *web_view = nullptr;
-    WPEView *view = nullptr;
+    WPEView *view = nullptr;                  // SHM mode
+    direct::View *direct = nullptr;           // direct mode (owned by the web view's backend)
+    WebKitInputMethodContext *ime = nullptr;  // direct mode (owned by the web view)
 };
 
 struct Engine {
     int sock = WPE_IPC_ENGINE_FD;
     GMainLoop *loop = nullptr;
-    WPEDisplay *display = nullptr;
+    WPEDisplay *display = nullptr;  // SHM mode only
+    bool direct = false;            // WPE_BROWSER_PRESENT=direct and the backend loaded (direct.cpp)
     WebKitNetworkSession *session = nullptr;
     WebKitSettings *settings = nullptr;
     std::map<uint32_t, Tab> tabs;
     uint32_t active = 0;
     uint32_t width = 1280, height = 720;
     double zoom = 1.0;
+    double scale = 1.0;      // device scale: buffers are CSS size x scale (sharp text on a 1080p screen)
 
     // Frame slots in a memfd shared with the UI.
     int frames_fd = -1;
@@ -68,16 +91,6 @@ struct Engine {
 
 Engine g;
 
-void log_msg(const char *fmt, ...) G_GNUC_PRINTF(1, 2);
-void log_msg(const char *fmt, ...)
-{
-    va_list ap;
-    va_start(ap, fmt);
-    fprintf(stderr, "wpe-engine: ");
-    vfprintf(stderr, fmt, ap);
-    fputc('\n', stderr);
-    va_end(ap);
-}
 
 guint32 now_ms()
 {
@@ -363,11 +376,19 @@ void handle_scroll(WPEView *view, const WpeScroll &s)
         -s.delta_x / 120.0, -s.delta_y / 120.0, FALSE, FALSE, s.x, s.y));
 }
 
-void resize_view(WPEView *view)
+void resize_view(Tab &tab)
 {
-    if (WPEToplevel *toplevel = wpe_view_get_toplevel(view))
+    if (tab.direct) {
+        direct::set_scale(tab.direct, g.scale);
+        direct::set_size(tab.direct, g.width, g.height);
+        return;
+    }
+    WPEView *view = tab.view;
+    if (WPEToplevel *toplevel = wpe_view_get_toplevel(view)) {
         wpe_toplevel_resize(toplevel, static_cast<int>(g.width), static_cast<int>(g.height));
-    else
+        if (wpe_toplevel_get_scale(toplevel) != g.scale)
+            wpe_toplevel_scale_changed(toplevel, g.scale);
+    } else
         wpe_view_resized(view, static_cast<int>(g.width), static_cast<int>(g.height));
 }
 
@@ -376,7 +397,7 @@ void resize(uint32_t width, uint32_t height)
     g.width = std::clamp<uint32_t>(width, 64, 3840);
     g.height = std::clamp<uint32_t>(height, 64, 2160);
     for (auto &[id, tab] : g.tabs)
-        resize_view(tab.view);
+        resize_view(tab);
 }
 
 // ---- WebKit signals (user_data = nothing; the tab is looked up from the view) ----------------------------
@@ -402,6 +423,17 @@ void on_load_changed(WebKitWebView *view, WebKitLoadEvent event, gpointer)
     const uint32_t tab = tab_of_web_view(view);
     send_msg(WPE_ENGINE_LOAD, tab, &l, sizeof(l));
     send_history(tab, view);
+
+    // Page timings for the log (TV diagnostics: which site, how long to first commit / full load).
+    static guint32 started = 0;
+    const char *uri = webkit_web_view_get_uri(view);
+    if (event == WEBKIT_LOAD_STARTED) {
+        started = now_ms();
+        log_msg("tab %u load started: %.200s", tab, uri ? uri : "");
+    } else {
+        log_msg("tab %u load %s after %u ms: %.200s", tab, event == WEBKIT_LOAD_COMMITTED ? "committed" : "finished",
+            now_ms() - started, uri ? uri : "");
+    }
 }
 
 gboolean on_load_failed(WebKitWebView *view, WebKitLoadEvent, gchar *uri, GError *error, gpointer)
@@ -427,8 +459,66 @@ void on_web_process_terminated(WebKitWebView *view, WebKitWebProcessTerminationR
 {
     const char *why = reason == WEBKIT_WEB_PROCESS_CRASHED ? "crashed"
         : reason == WEBKIT_WEB_PROCESS_EXCEEDED_MEMORY_LIMIT ? "used too much memory" : "was terminated";
-    log_msg("web process %s", why);
+    // With the time and page, so a crash can be matched to what was on screen (no core dumps: see main()).
+    const char *uri = webkit_web_view_get_uri(view);
+    GDateTime *now = g_date_time_new_now_utc();
+    gchar *when = g_date_time_format(now, "%F %T UTC");
+    log_msg("web process %s at %s on %s", why, when, uri ? uri : "(no page)");
+    g_free(when);
+    g_date_time_unref(now);
     send_error(tab_of_web_view(view), WPE_ERROR_WEB_PROCESS_CRASHED, static_cast<uint32_t>(reason), why);
+}
+
+// Whether the page is scrolled to its top, for the UI's toolbar (shown at the top, hidden once the page scrolls).
+// The script runs in its own world, so pages can neither see nor fake it. Pages that scroll an element instead of
+// the document (web apps) count too: scroll events are caught on the way down (capture) from any large scroller.
+constexpr const char *kScrollWorld = "wpeb";
+constexpr const char *kScrollScript = R"JS((function () {
+    var last = null;
+    function report(top) {
+        if (top === last) return;
+        last = top;
+        window.webkit.messageHandlers.wpebScroll.postMessage(top);
+    }
+    function pageTop() {
+        var e = document.scrollingElement || document.documentElement;
+        return (window.scrollY || (e ? e.scrollTop : 0)) <= 2;
+    }
+    addEventListener('scroll', function (ev) {
+        var t = ev.target;
+        if (t === document || t === window || t === document.scrollingElement) { report(pageTop()); return; }
+        if (t && t.clientHeight > innerHeight * 0.5) report(t.scrollTop <= 2 && pageTop());
+    }, {capture: true, passive: true});
+    // Back/forward puts a page back at its old position, after this script ran and without a scroll event. Look
+    // again shortly after the page shows (always sent: the UI may have seen other pages meanwhile).
+    function recheck() {
+        last = null;
+        report(pageTop());
+        [150, 600, 1500].forEach(function (ms) { setTimeout(function () { last = null; report(pageTop()); }, ms); });
+    }
+    addEventListener('pageshow', recheck);
+    recheck();
+})();)JS";
+
+void on_scroll_message(WebKitUserContentManager *, JSCValue *value, gpointer data)
+{
+    const uint32_t id = GPOINTER_TO_UINT(data);
+    WpeFlag flag = {jsc_value_to_boolean(value) ? 1u : 0u};
+    if (getenv("WPE_BROWSER_DEBUG_SCROLL"))
+        log_msg("tab %u scroll: %s", id, flag.value ? "top" : "scrolled");
+    send_msg(WPE_ENGINE_SCROLL, id, &flag, sizeof(flag));
+}
+
+void add_scroll_reporter(WebKitWebView *web_view, uint32_t id)
+{
+    WebKitUserContentManager *ucm = webkit_web_view_get_user_content_manager(web_view);
+    if (!ucm || !webkit_user_content_manager_register_script_message_handler(ucm, "wpebScroll", kScrollWorld))
+        return;
+    g_signal_connect(ucm, "script-message-received::wpebScroll", G_CALLBACK(on_scroll_message), GUINT_TO_POINTER(id));
+    WebKitUserScript *script = webkit_user_script_new_for_world(kScrollScript, WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
+        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_END, kScrollWorld, nullptr, nullptr);
+    webkit_user_content_manager_add_script(ucm, script);
+    webkit_user_script_unref(script);
 }
 
 void on_history_changed(WebKitBackForwardList *, WebKitBackForwardListItem *, gpointer, gpointer web_view)
@@ -445,6 +535,43 @@ WebKitWebView *on_create(WebKitWebView *view, WebKitNavigationAction *action, gp
     return nullptr;
 }
 
+// ---- direct presentation (direct.cpp) -------------------------------------------------------------------
+
+void send_present(uint32_t tab, int32_t status, uint32_t width, uint32_t height)
+{
+    WpePresent p { g.direct ? WPE_PRESENT_DIRECT : WPE_PRESENT_SHM, status, width, height };
+    send_msg(WPE_ENGINE_PRESENT, tab, &p, sizeof(p));
+}
+
+void on_direct_status(uint32_t tab, int32_t status, uint32_t width, uint32_t height)
+{
+    send_present(tab, status, width, height);
+}
+
+void on_direct_ime(uint32_t tab, bool focused, uint32_t purpose, int x, int y, int width, int height)
+{
+    WpeIme m { focused ? 1u : 0u, purpose, x, y, width, height };
+    send_msg(WPE_ENGINE_IME, tab, &m, sizeof(m));
+}
+
+void set_visible(Tab &tab, bool visible)
+{
+    if (tab.direct)
+        direct::set_shown(tab.direct, visible);
+    else
+        wpe_view_set_visible(tab.view, visible);
+}
+
+void set_focused(Tab &tab, bool focused)
+{
+    if (tab.direct)
+        direct::set_focused(tab.direct, focused);
+    else if (focused)
+        wpe_view_focus_in(tab.view);
+    else
+        wpe_view_focus_out(tab.view);
+}
+
 // ---- tabs ------------------------------------------------------------------------------------------------
 
 void tab_open(uint32_t id, const std::string &uri)
@@ -458,21 +585,42 @@ void tab_open(uint32_t id, const std::string &uri)
         related = tab.web_view;
         break;
     }
-    WebKitWebView *web_view = related
-        // The display must be passed to related views too: without it WebKit would use
-        // wpe_display_get_default(), which creates a display of another platform instead of ours.
-        ? WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW, "related-view", related, "display", g.display,
-            "settings", g.settings, nullptr))
-        : WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW, "display", g.display, "network-session", g.session,
-            "settings", g.settings, nullptr));
-    WPEView *view = webkit_web_view_get_wpe_view(web_view);
-    if (!view) {
-        log_msg("WebKit did not create a WPEView for tab %u", id);
-        g_object_unref(web_view);
+    Tab tab { id };
+    WebKitWebView *web_view = nullptr;
+    // Its own content manager: a related view would otherwise share the first tab's (scroll reports per tab).
+    WebKitUserContentManager *ucm = webkit_user_content_manager_new();
+    if (g.direct) {
+        WebKitWebViewBackend *backend = direct::create_backend(id, g.width, g.height, &tab.direct);
+        if (backend) {
+            web_view = related
+                ? WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW, "backend", backend, "related-view", related,
+                    "settings", g.settings, "user-content-manager", ucm, nullptr))
+                : WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW, "backend", backend, "network-session", g.session,
+                    "settings", g.settings, "user-content-manager", ucm, nullptr));
+            tab.ime = direct::create_ime(id, on_direct_ime);
+            webkit_web_view_set_input_method_context(web_view, tab.ime);
+            g_object_unref(tab.ime); // the web view keeps it
+        }
+    } else {
+        web_view = related
+            // The display must be passed to related views too: without it WebKit would use
+            // wpe_display_get_default(), which creates a display of another platform instead of ours.
+            ? WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW, "related-view", related, "display", g.display,
+                "settings", g.settings, "user-content-manager", ucm, nullptr))
+            : WEBKIT_WEB_VIEW(g_object_new(WEBKIT_TYPE_WEB_VIEW, "display", g.display, "network-session", g.session,
+                "settings", g.settings, "user-content-manager", ucm, nullptr));
+        tab.view = webkit_web_view_get_wpe_view(web_view);
+    }
+    g_object_unref(ucm); // the view keeps its own reference
+    if (!web_view || (!tab.view && !tab.direct)) {
+        log_msg("WebKit did not create a view for tab %u", id);
+        if (web_view)
+            g_object_unref(web_view);
         send_error(id, WPE_ERROR_FATAL, 0, "could not create a view");
         return;
     }
-    g.tabs[id] = Tab { id, web_view, view };
+    tab.web_view = web_view;
+    g.tabs[id] = tab;
 
     g_signal_connect(web_view, "notify::uri", G_CALLBACK(on_uri), nullptr);
     g_signal_connect(web_view, "notify::title", G_CALLBACK(on_title), nullptr);
@@ -483,13 +631,15 @@ void tab_open(uint32_t id, const std::string &uri)
     g_signal_connect(web_view, "web-process-terminated", G_CALLBACK(on_web_process_terminated), nullptr);
     g_signal_connect(web_view, "create", G_CALLBACK(on_create), nullptr);
     g_signal_connect(webkit_web_view_get_back_forward_list(web_view), "changed", G_CALLBACK(on_history_changed), web_view);
+    add_scroll_reporter(web_view, id);
 
-    resize_view(view);
+    Tab &t = g.tabs[id];
+    resize_view(t);
     webkit_web_view_set_zoom_level(web_view, g.zoom);
     const bool active = id == g.active;
-    wpe_view_set_visible(view, active);
+    set_visible(t, active);
     if (active)
-        wpe_view_focus_in(view);
+        set_focused(t, true);
     if (!uri.empty())
         webkit_web_view_load_uri(web_view, uri.c_str());
     log_msg("tab %u opened (%zu open)", id, g.tabs.size());
@@ -515,13 +665,13 @@ void tab_activate(uint32_t id)
     if (g.active == id)
         return;
     if (Tab *old = active_tab()) {
-        wpe_view_focus_out(old->view);
-        wpe_view_set_visible(old->view, FALSE);
+        set_focused(*old, false);
+        set_visible(*old, false);
     }
     g.active = id;
     if (Tab *tab = active_tab()) {
-        wpe_view_set_visible(tab->view, TRUE);
-        wpe_view_focus_in(tab->view);
+        set_visible(*tab, true);
+        set_focused(*tab, true);
         send_history(id, tab->web_view);
     }
 }
@@ -565,6 +715,14 @@ void set_zoom(uint32_t permille)
     g.zoom = std::clamp(permille, 250u, 5000u) / 1000.0;
     for (auto &[id, tab] : g.tabs)
         webkit_web_view_set_zoom_level(tab.web_view, g.zoom);
+}
+
+void set_scale(uint32_t permille)
+{
+    g.scale = std::clamp(permille, 1000u, 3000u) / 1000.0;
+    for (auto &[id, tab] : g.tabs)
+        resize_view(tab);
+    log_msg("device scale %.2f", g.scale);
 }
 
 // ---- receiving -------------------------------------------------------------------------------------------
@@ -618,31 +776,43 @@ void handle_message(const uint8_t *buf, ssize_t n)
         break;
     case WPE_APP_VISIBLE:
         if (auto *f = payload<WpeFlag>(buf, n, h); f && active)
-            wpe_view_set_visible(active->view, f->value != 0);
+            set_visible(*active, f->value != 0);
         break;
     case WPE_APP_FOCUS:
-        if (auto *f = payload<WpeFlag>(buf, n, h); f && active) {
-            if (f->value)
-                wpe_view_focus_in(active->view);
-            else
-                wpe_view_focus_out(active->view);
-        }
+        if (auto *f = payload<WpeFlag>(buf, n, h); f && active)
+            set_focused(*active, f->value != 0);
         break;
     case WPE_APP_KEY:
-        if (auto *k = payload<WpeKey>(buf, n, h); k && active)
-            handle_key(active->view, *k);
+        if (auto *k = payload<WpeKey>(buf, n, h); k && active) {
+            if (active->direct)
+                direct::key(active->direct, *k);
+            else
+                handle_key(active->view, *k);
+        }
         break;
     case WPE_APP_POINTER:
-        if (auto *p = payload<WpePointer>(buf, n, h); p && active)
-            handle_pointer(active->view, *p);
+        if (auto *p = payload<WpePointer>(buf, n, h); p && active) {
+            if (active->direct)
+                direct::pointer(active->direct, *p, g.buttons);
+            else
+                handle_pointer(active->view, *p);
+        }
         break;
     case WPE_APP_SCROLL:
-        if (auto *s = payload<WpeScroll>(buf, n, h); s && active)
-            handle_scroll(active->view, *s);
+        if (auto *s = payload<WpeScroll>(buf, n, h); s && active) {
+            if (active->direct)
+                direct::scroll(active->direct, *s, g.buttons);
+            else
+                handle_scroll(active->view, *s);
+        }
         break;
     case WPE_APP_TEXT_COMMIT: {
         const std::string text = text_of(buf, n, h);
-        webos_display_commit_text(WEBOS_DISPLAY(g.display), text.c_str());
+        if (g.direct) {
+            if (active)
+                direct::commit_text(active->ime, text.c_str());
+        } else
+            webos_display_commit_text(WEBOS_DISPLAY(g.display), text.c_str());
         break;
     }
     case WPE_APP_FRAME_DONE:
@@ -656,6 +826,10 @@ void handle_message(const uint8_t *buf, ssize_t n)
     case WPE_APP_SET_ZOOM:
         if (auto *z = payload<WpeZoom>(buf, n, h))
             set_zoom(z->permille);
+        break;
+    case WPE_APP_SET_SCALE:
+        if (auto *z = payload<WpeZoom>(buf, n, h))
+            set_scale(z->permille);
         break;
     case WPE_APP_QUIT:
         g_main_loop_quit(g.loop);
@@ -704,6 +878,13 @@ std::string env_or(const char *name, const char *fallback)
 int main(int, char **)
 {
     signal(SIGPIPE, SIG_IGN);
+    // No core dumps from the engine or its WebKit processes (inherited): the kernel writes them into the app's own
+    // folder on the TV's small app partition (8 dumps, 1.4 GB, filled it on 2026-11-10). WPE_BROWSER_CORE_DUMPS=1
+    // keeps them for debugging.
+    if (!getenv("WPE_BROWSER_CORE_DUMPS")) {
+        const struct rlimit none = {0, 0};
+        setrlimit(RLIMIT_CORE, &none);
+    }
     if (fcntl(g.sock, F_GETFD) < 0) {
         fprintf(stderr, "wpe-engine: fd %d is not open; this program is started by the browser app\n", g.sock);
         return 2;
@@ -728,14 +909,35 @@ int main(int, char **)
 
     g.loop = g_main_loop_new(nullptr, FALSE);
 
-    WebOSSink sink { on_frame, on_ime_focus, nullptr };
-    g.display = webos_display_new(&sink);
-    GError *error = nullptr;
-    if (!wpe_display_connect(g.display, &error)) {
-        log_msg("display: %s", error->message);
-        return 4;
+    // Direct presentation (direct.cpp) or SHM frames (platform.cpp). WebKit allows one per process: once a
+    // WPEDisplay exists, views with a libwpe backend are refused, so this is decided before anything else.
+    if (env_or("WPE_BROWSER_PRESENT", "shm") == "direct") {
+        g.direct = !env_or("WPEB_SURFACE_GROUP", "").empty() && direct::init(env_or("WPEB_SURFACE_GROUP", "").c_str(), env_or("WPEB_SURFACE_LAYER", "page").c_str(),
+            on_direct_status);
+        if (!g.direct)
+            log_msg("direct presentation unavailable; using SHM frames");
     }
-    wpe_display_set_primary(g.display);
+
+    GError *error = nullptr;
+    if (!g.direct) {
+        WebOSSink sink { on_frame, on_ime_focus, nullptr };
+        g.display = webos_display_new(&sink);
+        if (!wpe_display_connect(g.display, &error)) {
+            log_msg("display: %s", error->message);
+            return 4;
+        }
+        wpe_display_set_primary(g.display);
+    }
+
+    // Grayscale text antialiasing: LCD subpixel AA (WPE's default, RGB) shows as coloured, soft glyph edges
+    // on a TV panel, more so once the page is scaled to the screen. 0xFF is not a WPE layout; WebKit
+    // patch 0003 reads it as "none". (Direct mode: fontconfig's rgba setting in the bundled fonts.conf.)
+    if (WPESettings *settings = g.display ? wpe_display_get_settings(g.display) : nullptr) {
+        if (!wpe_settings_set_byte(settings, WPE_SETTING_FONT_SUBPIXEL_LAYOUT, 0xFF, WPE_SETTINGS_SOURCE_PLATFORM, &error)) {
+            log_msg("font settings: %s", error->message);
+            g_clear_error(&error);
+        }
+    }
 
     const std::string data_dir = env_or("WPE_BROWSER_DATA_DIR", "/tmp/wpe-browser/data");
     const std::string cache_dir = env_or("WPE_BROWSER_CACHE_DIR", "/tmp/wpe-browser/cache");
@@ -754,6 +956,7 @@ int main(int, char **)
 
     WpeEngineReady ready { WPE_IPC_VERSION, webkit_get_major_version(), webkit_get_minor_version(), webkit_get_micro_version() };
     send_msg(WPE_ENGINE_READY, 0, &ready, sizeof(ready));
+    send_present(0, 0, 0, 0);
     log_msg("ready: WPE WebKit %u.%u.%u, page %ux%u", ready.webkit_major, ready.webkit_minor, ready.webkit_micro,
         g.width, g.height);
 
@@ -767,7 +970,7 @@ int main(int, char **)
         tab_close(g.tabs.begin()->first);
     g_object_unref(g.settings);
     g_object_unref(g.session);
-    g_object_unref(g.display);
+    g_clear_object(&g.display);
     g_main_loop_unref(g.loop);
     return 0;
 }

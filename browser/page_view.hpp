@@ -31,6 +31,14 @@ class PageView : public wnk::ui::GlView {
     void show_tab(TabId tab) {
         if (tab != tab_) tab_ = tab, tex_w_ = tex_h_ = 0;
     }
+    // Direct presentation (DirectOwner): the page is its own surface below the window. Once a tab's surface has
+    // shown a frame, this view becomes a transparent hole over it; until then it stays blank.
+    void set_direct(bool on) { direct_ = on, direct_tab_ = 0; }
+    bool direct() const { return direct_; }
+    void direct_shown(TabId tab, bool shown) {
+        if (shown) direct_tab_ = tab;
+        else if (direct_tab_ == tab) direct_tab_ = 0;
+    }
 
  protected:
     void render_gl(const wnk::render::CustomTarget &target, double now_ms) override;
@@ -49,6 +57,8 @@ class PageView : public wnk::ui::GlView {
     uint32_t tex_w_ = 0, tex_h_ = 0;
     bool editing_ = false;
     TabId tab_ = 0;
+    bool direct_ = false;
+    TabId direct_tab_ = 0;
 };
 
 }  // namespace browser

@@ -148,6 +148,11 @@ class SettingsScreen : public PageScreen {
             changed(ui);
         });
         zoom.set_description("Makes text and pictures on every page larger");
+        auto &sharp = look.add<wnk::ui::Toggle>("Sharp text", s.sharp_text, [&s, changed](Ui &ui, bool on) {
+            s.sharp_text = on;
+            changed(ui);
+        });
+        sharp.set_description("Draws pages at the screen's full resolution. Turn off if pages scroll slowly");
 
         auto &search = section("Search engine");
         std::vector<std::string> engines;

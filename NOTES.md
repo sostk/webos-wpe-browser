@@ -200,3 +200,174 @@
 ## 2026-11-10 GPU and media source publication
 - Committing GPU default-EGL support, opt-in Mali compositing with CPU Skia painting, private GStreamer media packaging, local probes/fixtures and process-environment regression coverage. Software remains the default. No working DRM/CDM integration is included.
 - Validation: browser host tests passed 2/2; completed multimedia pipeline reports exit=0 with staged ARM decoder/URL checks and IPK checks passing. The later TLS-fixed IPK also passed packaging checks. Existing kit working changes match all four tracked patch files; the upstream submodule reference is unchanged. No TV operations were performed for this commit.
+
+
+## 2026-11-10 profile ownership, text rendering (local only; no TV operations)
+- **Injected bundle warning:** already fixed by 1d08f1e (`WEBKIT_INJECTED_BUNDLE_PATH`, bundle staged in engine/lib/injected-bundle). The TV log came from the earlier ipk.
+- **libsoup "attempt to write a readonly database":** WebKit's SQLite cookie storage is libsoup's SoupCookieJarDB. Root test runs left root-owned
+  folders/files under `/media/developer/org.sostk.wpebrowser.data/`; the app (uid 6391) accepted the folder because only the base folder was probed
+  and `make_dir` treats EEXIST as success. Fix: `browser/storage.{hpp,cpp}`: `usable_tree()` walks the profile (dirs rwx, files rw for this uid);
+  `own_usable_dir()` falls back to `<folder>-<uid>` and leaves the other user's files alone. Host test `browser.storage` added (3/3 host tests pass).
+- **User report from the TV run:** pages had "weird colour" and soft text; YouTube stayed on its loading skeleton.
+  - Pixel path re-checked: WebKit reads back with `glReadPixels(GL_BGRA)`, the UI uploads as RGBA and swaps `.bgr` in the shader: consistent.
+  - Cause found for coloured/soft text: WPEPlatform always reports a subpixel layout (default RGB), so `SystemSettings::antialiasMode()` is always
+    `Subpixel` (LCD AA). On an OLED WRGB panel, after the 2/3 render scale is stretched ×1.5 with GL_LINEAR, that shows as colour fringes.
+    WebKit patch **0003** maps an unknown layout byte to "none" (grayscale AA, kUnknown_SkPixelGeometry); the engine sets 0xFF.
+  - Remaining softness is the 2/3 render scale (1280-wide page, linear ×1.5 upscale). Native 1920 rendering would be sharp but costs 2.25× pixels
+    in CPU raster and the per-frame memcpy (~6.7 MB). Not changed; needs a decision.
+  - YouTube: not diagnosed (needs TV logs). Most likely cause is JavaScript speed: CLoop interpreter (no JIT on softfp) running the desktop
+    Polymer app. Candidates: engine log + remote inspector on the next TV run; a lighter YouTube front end via a per-site UA; the hard-float private
+    runtime that would allow the ARMv7 JIT (see the 2026-11-10 CLoop entry).
+- Built: WebKit rebuilt with patch 0003 (`br-font-fix.log`, exit 0), engine restaged (241 MB, 87 libraries, glibc check passes), NDK ipk
+  `browser/build/webos-release/dist/org.sostk.wpebrowser_0.2.0_arm.ipk` (115 MB; includes the media engine, the TLS fix and the profile fix)
+  passes check-package. Not installed; grayscale text not yet seen on the TV.
+- Installed on the TV at the user's request (ares-install -d tv, 2026-11-10). Not launched by Claude.
+- 2026-11-10 21:41 TV log check (read-only, at the user's request; the user launched the app at 21:38):
+  - Engine ready in the normal way; no "readonly database" message this run. /media/developer/org.sostk.wpebrowser.data is 0777 throughout, with
+    some root-owned entries (cookies.sqlite, storage/, mediakeys/), so `usable_tree()` accepts it and the profile stays in place.
+  - One WPEWebProcess ran at 99 % CPU for ~3 min (load average 17) on a Google Images search; it had settled by 21:41:30. RAM: 536 MB available, 338 MB swap in use.
+  - UI: steady 60 fps (median 16.7 ms), 47.8 MB RSS; worst draw 72.9 ms while the page was busy.
+  - **Audio is broken:** libpulse refuses `XDG_RUNTIME_DIR=/tmp/xdg` (root-owned) and `/tmp/xdg/pulse` is empty, so the TV's PulseAudio socket is
+    elsewhere. Needs: find the system socket, then set `PULSE_SERVER` (and a private XDG_RUNTIME_DIR) for the engine.
+  - `WPEWebProcess: WebProcess didn't exit as expected after the UI process connection was closed` (g_error → abort) for an old web process after
+    tab close/reopen. Benign for the user, but leaves an abort in the log.
+  - Harmless: no D-Bus machine-id; platform resource 'missingImage'.
+
+## 2026-11-10 "Full working browser": hard-float engine with JavaScript JIT (user request: "do what is required")
+- **Decision:** build the engine tree hard-float + Thumb-2 with its **own glibc 2.28 and loader**, so JavaScriptCore gets the
+  baseline + DFG JIT and WebAssembly (PlatformEnable.h: `CPU(ARM_THUMB2) && CPU(ARM_HARDFP) && OS(LINUX)`). FTL stays off (32-bit).
+  The UI app stays softfp (NDK + kit). The softfp tree (`br-out`, `build/engine-stage`) is kept as a fallback.
+  - Cost: **GPU (Mali) mode is impossible in this engine**: the firmware EGL/GLES are softfp and can't load into a hard-float
+    process. EngineClient forces software (llvmpipe) when the engine has a private loader. Any future LG hardware-decoder
+    bridge must be a separate softfp process.
+- Pieces:
+  - `toolchain/ct-ng-hf.defconfig` (tuple `arm-webos-linux-gnueabihf`), `buildroot-external/configs/webos_browser_hf_defconfig`
+    (EABIHF, Thumb-2, gconv copied), external.mk keeps the CLoop/JIT-off block for softfp only.
+  - `tools/build-hf.sh start|status`: detached container; toolchain (if missing) → dma-buf.h into the x-tools sysroot →
+    Buildroot `O=/build/br-out-hf` (BR2_JLEVEL=4) → stage to `build/engine-stage-hf/engine`. Log `~/webos-browser-build/br-hf.log`, status `br-hf.status`.
+  - `tools/stage-engine.sh` hard-float mode (auto from `BR2_ARM_EABIHF`): bundles libc & co., `ld-linux-armhf.so.3`, libnss_files/dns
+    (getaddrinfo dlopens them via the TV's nsswitch.conf; the TV's are softfp), `lib/gconv`; sets PT_INTERP of every executable to
+    `/tmp/org.sostk.wpebrowser/ld-linux-armhf.so.3`; fails on any soft-float ELF or a wrong loader.
+  - `browser/private_loader.{hpp,cpp}`: the UI reads wpe-engine's PT_INTERP; if it lies in the app's runtime folder (kit:
+    `/tmp/<app id>`, owned by the app, symlinks rejected), it links it to `engine/lib/<loader>` (atomic rename). Env adds
+    `GCONV_PATH`, clears `LD_PRELOAD`. Host test `browser.private_loader`.
+  - check-package: `--glibc-runtime engine` accepts the tree as is (every DT_NEEDED resolves inside it).
+- **Sharp text setting** (default on): protocol v4 `WPE_APP_SET_SCALE`; the engine calls `wpe_toplevel_scale_changed` so pages keep
+  their CSS size (1280 wide) but render at 1.5x = native 1920. Damage rects are in buffer pixels (as in WPE's Wayland platform), so
+  partial uploads stay correct. Costs 2.25x raster + copy; Settings → Appearance → "Sharp text" turns it off. Not yet measured on the TV.
+- Engine log now records `load started/committed/finished after N ms: <uri>` per tab.
+- Audio: TV unreachable (timeout) when trying to locate the PulseAudio socket; still open.
+- `tools/js-probe.{c,sh}`: host-native IPC driver; the ARM engine runs through binfmt QEMU (softfp needs `QEMU_LD_PREFIX=<br-out sysroot>`;
+  hard-float uses the same /tmp/org.sostk.wpebrowser loader link as the TV). Fixed JS workload (fib(27) + 200k sort), WebAssembly
+  check, optional device scale. **Softfp CLoop baseline under QEMU: 1651 ms, no WebAssembly**; scale 1500 gives 960-px frames for a 640-CSS-px page (pass).
+  QEMU timings are only for comparing builds, not TV speed.
+- Hard-float build fixes: `BR2_ARM_EABIHF` depends on `BR2_ARM_CPU_HAS_FPU`, which on Cortex-A9 needs `BR2_ARM_ENABLE_VFP=y`; without it
+  Kconfig silently fell back to EABI ("Incorrect ABI setting"). After an ABI change the output folder must be fresh (`rm -rf br-out-hf`).
+  Toolchain `x-tools/arm-webos-linux-gnueabihf` built OK. Buildroot restarted 2026-11-10 ~22:20.
+
+## 2026-11-10 Research: Chromium's JIT and GPU path → plan for WebKit (user request)
+- Full write-up: `docs/webkit-like-chromium.md`. Sources: webOS-ports/chromium151 (V8 `macro-assembler-arm.cc`,
+  ozone `wayland_surface_factory.cc`, `gl_surface_wayland.cc`, `extensions/webos/host/`), WPE WebKit 2.50.5, webOS NDK protocol XML.
+- **JIT:** V8 converts doubles only at C-call boundaries on softfp. JSC assumes hardfp there; it once supported softfp (32-bit iOS
+  leftovers). The `pcs("aapcs-vfp")` shortcut is unsafe: GCC 14 drops the attribute in templates (tested). Patch prepared:
+  `buildroot-external/staged-patches/wpewebkit/0004-jsc-arm-softfp-jit.patch` (applies cleanly to 2.50.5; NOT yet compiled).
+  Build switch: `make WPEB_SOFTFP_JIT=y` (external.mk; WebKit as Thumb-2). Tests: `tools/jsc-softfp/{boundary.js,run.sh}`
+  (interpreter vs forced Baseline/DFG, bit-exact hashes; wasm module validated with node). WebAssembly BBQ off on softfp for now.
+  FP-returning JIT operations: 36; all 32-bit call sites go through callOperation*/setupResults except WasmToJS (patched).
+- **GPU:** Chromium renders with EGL into `wl_egl_window` on the window's own surface (no readback); needs GPU work in the
+  window-owning process. webOS 6 SDK has `wl_webos_surface_group_compositor` (multi-client surfaces in one window) and
+  `wl_webos_foreign`. Plan: web process (softfp after phase 1) attaches its own EGL surface to the UI's surface group;
+  WebKit via a libwpe renderer backend ("wpebackend-webos"). Needs a TV probe first.
+- Disk: removed `~/webos-browser-build/ctng-work` (crosstool-ng scratch, ~17 GB incl. tarball cache copies) during the
+  hard-float build; free space went from 25 GB to 42 GB.
+- 2026-11-10 ~23:00 **Hard-float build stopped at the user's request** (was building host-llvm; `br-out-hf` left partial,
+  status file marked "stopped"). **softfp JIT build started:** patch 0004 moved into `patches/wpewebkit/`;
+  `tools/build-softfp-jit.sh start` → `wpewebkit-dirclean` + rebuild in `br-out` with `WPEB_SOFTFP_JIT=y`
+  (CMake: ENABLE_JIT=ON, DFG=ON, FTL=OFF, C_LOOP=OFF, WEBASSEMBLY=ON, `-mthumb`; patches 0001-0004 applied cleanly),
+  then `ninja jsc`, then staging to `build/engine-stage-jit/engine`. Log `br-jit.log`, status `br-jit.status`.
+  The interpreter engine in `build/engine-stage` remains the fallback.
+- 2026-11-10 Decision (user): stay on WPE WebKit 2.50.5 until the JIT and GPU drawing work; upgrade (2.54.2 is current stable, 2026-10-23) afterwards.
+- 2026-11-10 GPU phase prep (local): `tools/sg-probe/{sg-probe.c,build.sh}` → `build/sg-probe/sg-probe` (NDK, softfp, needs only
+  libwayland-client/-egl, libEGL, libGLESv2, glibc 2.4). Owner = webOS app window (`APPID` env) that creates surface group
+  "wpebprobe" + layer "page" (z -1/+1) and leaves its middle transparent; it forks "client" = separate Wayland connection whose
+  wl_surface is `attach`ed to the layer and animated with Mali EGL, logging frame/eglSwapBuffers times. Run on the TV (needs
+  the user's go-ahead): `APPID=org.sostk.wpebrowser ./sg-probe owner below 20` (and `above`). Not yet run.
+
+## 2026-11-10 Direct GPU presentation, code written (user request: "start writing code for direct gpu"; no TV operations)
+- Design and file list: docs/webkit-like-chromium.md, part 2, "Implementation". In short: WPEWebProcess draws
+  each page with the TV's EGL into its own wl_surface. The surface is attached to a webOS surface group that the
+  UI creates on its window (layer "page", z -1). No glReadPixels, no SHM copies, no texture upload.
+- WebKit 2.50.5 still has the libwpe renderer-backend path (AcceleratedSurface::RenderTargetWPEBackend). It is
+  chosen per process: once a WPEDisplay exists, views with a libwpe backend are refused, so the engine decides at
+  start (WPE_BROWSER_PRESENT).
+- Opt-in for testing: the UI needs WPE_BROWSER_RENDERER=gpu and WPE_BROWSER_PRESENT=direct. A negative surface
+  status makes it restart the engine in SHM mode for the rest of the run.
+- Build: `bash tools/build-webos-backend.sh` (host, NDK; the TV's libwayland is 1.11, no wl_proxy_marshal_flags),
+  then stage-engine.sh copies both .so into engine/lib.
+- PC check: `bash tools/direct-probe.sh` PASS. The engine runs in direct mode, the web process loads the backend,
+  the target reports -1 (no compositor on the PC) back to the UI, page JS runs, and no SHM frames are sent.
+- TV (needs the user's go-ahead): run sg-probe first, then the browser with the two env variables.
+- **TV run, 2026-11-10 (user said the TV is on; sg-probe from /tmp/sg-probe, nothing installed).** Screenshots via
+  `script -q -c "luna-send ... com.webos.service.capture/executeOneShot ..." /dev/null`: luna-send only answers with
+  a pty, which is why it printed nothing before. /dev/fb0 can't be read, even as root.
+  - Attaching a second process' surface to the group is accepted. Mali EGL in it renders at 60 fps (16.7 ms
+    interval, eglSwapBuffers ~1.3 ms).
+  - A **bare surface is never drawn**. With a window role (wl_shell toplevel + webOS shell surface, same appId) it
+    is drawn. z -1 puts it below the owner, and it shows through the owner's alpha-0 area; z +1 puts it on top.
+  - LSM **scales the member surface to the whole owner window** (1280x720 filled 1920x1080). It can't be placed
+    in a sub-rectangle, so the page surface is full-window and the chrome must overlay it.
+  - The backend now gives each page surface that window role (WPEB_APP_ID).
+- **Overlay toolbar (user chose the recommendation, 2026-11-10).** The page fills the screen in both modes, and the
+  chrome (tabs, toolbar, bookmarks) lies over its top. It slides away (160 ms) while the page has focus, and a
+  thin progress line shows while it's hidden. It comes back on Red, on Back with no history, or with the pointer
+  at the top edge. Down from the toolbar or bookmarks bar returns to the page. The New Tab page keeps the chrome and
+  starts below it. Hidden views can't take focus, so focus_omnibox() shows the chrome first.
+  Checked on the PC with the QEMU engine: screenshots of the hidden toolbar, Red, Back, and Down back to the page.
+- 2026-11-11 **Softfp JIT build finished** (`tools/build-softfp-jit.sh status`: exit=0, staged `build/engine-stage-jit/engine`, 250 MB).
+  - `tools/jsc-softfp/run.sh`: boundary.js identical in Baseline and DFG vs the interpreter (45 JIT compilations).
+  - js-probe (QEMU, needs `QEMU_LD_PREFIX`=br-out sysroot): same engine 680 ms with JIT vs 1095 ms with `JSC_useJIT=false`;
+    WebAssembly works only with the JIT on. QEMU understates the gain; real numbers need the TV.
+  - ipk built from it (`-DWPEB_ENGINE_STAGE=.../engine-stage-jit/engine`), 120 MB, check-package passes. The kit's checker got
+    `--system-lib` / `SYSTEM_LIBS` so the direct-presentation libraries may need the TV's libwayland-client / libwayland-egl.
+    Not installed.
+- 2026-11-11 **TV test of the JIT + direct-presentation ipk** (installed with the user's go-ahead).
+  - App storage was full (0 bytes free): 8 WPEWebProcess core dumps (1.36 GB) from 2026-11-10 in the app folder. Two
+    (core.6302, core.15329) pulled to ~/webos-browser-build/tv-cores/wpeb-cores, all removed from the TV. Not analysed yet.
+    Core dumps must not land in the app folder (set RLIMIT_CORE 0 or a cwd in /tmp for the engine).
+  - New launch parameters (browser/main.cpp): {"target"|"url": URL} opens a page (also on relaunch);
+    {"wpebRenderer":"gpu","wpebPresent":"direct"} replace the environment variables an installed app never gets.
+  - Normal mode (software, SHM): Wikipedia full screen, toolbar hidden, 60 fps, UI rss 67 MB, load finished 13.4 s.
+  - JIT on the TV: fib(27)+200k sort 644–686 ms over 6 runs, WebAssembly ok (needs the JIT).
+  - **Direct mode works**: group wpeb-<pid>/page, web process connected (compositor, shell, webos shell, surface groups),
+    1280x720 surface attached, status FIRST_FRAME, page shown under the UI with correct placement; UI 60 fps, UI rss 41 MB
+    (no SHM slots), load finished 6.2 s.
+  - Bugs seen in both modes: CSS-mask/SVG icons drawn as coloured vertical stripes (same artifact as the gradient stripes
+    under QEMU, so a rendering bug of our build, not QEMU); a green block at the top-right of Wikipedia's header.
+  - file:// pages show as plain text (no MIME type detection for local files); data: targets are refused ("URL can't be shown").
+- 2026-11-11 **Striped icons/gradients fixed: patch 0005** (`buildroot-external/patches/wpewebkit/0005-skia-arm32-gcc-raster-pipeline-abi.patch`).
+  - Cause: Skia's raster pipeline on ARM32+NEON marks its Stage pointer type `pcs("aapcs-vfp")`; with GCC/softfp the calls and
+    the stage functions disagree on where r,g,b,a go, so each 4-pixel group gets mixed lanes/channels. Affected: CSS and canvas
+    gradients, CSS masks (Wikipedia's icons), colour filters (`filter: invert` drew nothing). Images, solid fills, opacity were fine.
+  - Fix: the attribute only with clang; GCC keeps NEON with its default ABI. Output is pixel-identical to forcing SKRP_CPU_SCALAR.
+  - New PC tool: `bash tools/page-shot.sh ENGINE_DIR URL OUT.png [W H [SETTLE_S]]` (QEMU engine, saves the page frame).
+  - Applied in the existing br-out tree by hand (ninja + `make wpewebkit-reinstall`), engine-stage-jit restaged; ipk installed;
+    Wikipedia on the TV (direct mode) shows its icons correctly. The green block in Wikipedia's header was the same bug.
+- 2026-11-11 **Crash dumps / crash logging**: the two TV cores (old non-JIT build, 2026-11-10) are in WebKit (core.6302 SIGABRT
+  from a WebKit assertion/abort, core.15329 SIGSEGV), different places; that build's unstripped library no longer exists
+  (br-out was rebuilt with the JIT), so they can't be symbolised. Not reproduced yet. Now:
+  - the engine sets RLIMIT_CORE 0 for itself and the WebKit processes (WPE_BROWSER_CORE_DUMPS=1 keeps dumps);
+  - the UI keeps the previous run's log as engine.prev.log next to engine.log (/tmp/org.sostk.wpebrowser on the TV);
+  - "web process crashed" is logged with UTC time and page URL. The current br-out build is unstripped, so new crashes
+    can be symbolised against it.
+  - Omnibox: `data:` URLs were turned into https://data:...; now passed through.
+- 2026-11-11 **Toolbar peeks over the page** (user request: show it at the top of the page and on Back):
+  - engine: per-view user script in its own world ("wpeb") posts at-top changes (document scroll and large scrolling
+    elements, captured scroll events, rechecked after pageshow for back/forward) → WPE_ENGINE_SCROLL (IPC v6). Each view
+    now gets its own WebKitUserContentManager (related views would share the first tab's). WPE_BROWSER_DEBUG_SCROLL=1 logs.
+  - UI: with the page focused, the chrome shows while the page is at its top and for 2.5 s after Back (focus stays on
+    the page, keys still go to it); it slides away when the page scrolls. Red / Back without history / pointer at the top
+    edge still move focus into it.
+  - Verified on the PC (real UI + QEMU engine, long test page): top → shown, PageDown → hidden, Back → shown, then hidden
+    after 2.5 s on the restored scrolled page. Note: the peeking toolbar covers the top ~136 px of the page.
+  - Kit script gotcha: a trailing wait@ has no effect (the shot is taken when the steps end); end with a dummy key (F24).
+  - 2026-11-11 user tested the peeking toolbar on the TV (direct mode): works.

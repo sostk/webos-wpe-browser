@@ -81,6 +81,7 @@ void Profile::load(const std::string &dir) {
         settings.search_engine = std::clamp(j.value("search_engine", 0), 0, static_cast<int>(kSearchEngines.size()) - 1);
         settings.zoom = std::clamp(j.value("zoom", 0), 0, static_cast<int>(kZoomLevels.size()) - 1);
         settings.restore_session = j.value("restore_session", false);
+        settings.sharp_text = j.value("sharp_text", settings.sharp_text);
     }
     if (auto j = parse(read_file(path(kBookmarks))); j.is_array()) {
         for (const auto &b : j) {
@@ -121,7 +122,8 @@ std::string Profile::serialize(unsigned part) const {
         j = {{"show_bookmarks_bar", settings.show_bookmarks_bar},
              {"search_engine", settings.search_engine},
              {"zoom", settings.zoom},
-             {"restore_session", settings.restore_session}};
+             {"restore_session", settings.restore_session},
+             {"sharp_text", settings.sharp_text}};
         break;
     case kBookmarks:
         j = nlohmann::json::array();

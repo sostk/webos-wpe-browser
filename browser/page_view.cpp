@@ -107,6 +107,13 @@ void PageView::upload(const EngineFrame &f) {
 }
 
 void PageView::render_gl(const wnk::render::CustomTarget &, double) {
+    if (direct_) {
+        // Alpha 0 lets the page surface below the window show; the draw call's scissor limits it to this view.
+        const bool hole = tab_ != 0 && direct_tab_ == tab_;
+        glClearColor(hole ? 0 : 1, hole ? 0 : 1, hole ? 0 : 1, hole ? 0 : 1);
+        glClear(GL_COLOR_BUFFER_BIT);
+        return;
+    }
     if (program_ == 0 && !build()) return;
     if (const EngineFrame *f = engine_.frame()) {
         if (f->tab == tab_) upload(*f);

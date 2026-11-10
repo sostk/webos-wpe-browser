@@ -28,9 +28,9 @@ else ()
     message(STATUS "wpebrowser: no staged engine; the package will show 'engine not found'")
 endif ()
 
-add_executable(wpebrowser main.cpp chrome.cpp screens.cpp profile.cpp engine_client.cpp page_view.cpp keys.cpp)
+add_executable(wpebrowser main.cpp chrome.cpp screens.cpp profile.cpp storage.cpp private_loader.cpp engine_client.cpp page_view.cpp keys.cpp direct_owner.cpp)
 target_include_directories(wpebrowser PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../common")
-target_link_libraries(wpebrowser PRIVATE wnk_app)
+target_link_libraries(wpebrowser PRIVATE wnk_app ${CMAKE_DL_LIBS})  # dlopen: libwpeb-owner.so (direct_owner.cpp)
 target_include_directories(wpebrowser SYSTEM PRIVATE "${WNK_KIT_DIR}/third_party")  # nlohmann/json.hpp
 
 # Fonts (Atkinson Hyperlegible, OFL) live in fonts/ next to the executable, on the host and in the ipk.
@@ -50,16 +50,33 @@ wnk_add_webos_package(
         ICON_COLOR "#1f2937"
         EXPECTED_NEEDED "${CMAKE_CURRENT_SOURCE_DIR}/expected-needed.txt"
         EXTRA_DIRS "${WNK_FONT_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/icons"
-        GLIBC_RUNTIMES ${WPEB_ENGINE_EXTRA_DIR})
+        GLIBC_RUNTIMES ${WPEB_ENGINE_EXTRA_DIR}
+        # Direct GPU presentation (engine/lib/libWPEBackend-webos.so, libwpeb-owner.so) must use the TV's own
+        # Wayland client and wayland-egl, the ones its Mali EGL is built against.
+        SYSTEM_LIBS libwayland-client.so.0 libwayland-egl.so)
 
 # Host smoke test: OK on the focused button, then Back twice at the root quits.
 wnk_add_app_test(NAME e2e.wpebrowser.starts_and_quits TARGET wpebrowser PREFIX APP_WPEBROWSER
         KEYS "Escape,Escape" PASS "browser ui ready")
 
 if (NOT CMAKE_CROSSCOMPILING)
-    add_executable(engine-environment-test tests/engine_environment.cpp engine_client.cpp)
+    add_executable(engine-environment-test tests/engine_environment.cpp engine_client.cpp private_loader.cpp)
     target_compile_features(engine-environment-test PRIVATE cxx_std_17)
     target_include_directories(engine-environment-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../common")
     target_link_libraries(engine-environment-test PRIVATE wnk_logging)
     add_test(NAME engine.environment COMMAND engine-environment-test)
+    add_executable(storage-test tests/storage.cpp storage.cpp)
+    target_compile_features(storage-test PRIVATE cxx_std_17)
+    target_include_directories(storage-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME browser.storage COMMAND storage-test)
+    set(LOADER_FIXTURE_INTERP "/tmp/wpe-loader-test/ld-test.so.1")
+    add_executable(loader-fixture tests/loader_fixture.c)
+    target_link_options(loader-fixture PRIVATE "-Wl,--dynamic-linker=${LOADER_FIXTURE_INTERP}")
+    add_executable(private-loader-test tests/private_loader.cpp private_loader.cpp)
+    target_compile_features(private-loader-test PRIVATE cxx_std_17)
+    target_include_directories(private-loader-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_compile_definitions(private-loader-test PRIVATE
+        LOADER_FIXTURE="$<TARGET_FILE:loader-fixture>" LOADER_FIXTURE_INTERP="${LOADER_FIXTURE_INTERP}")
+    add_dependencies(private-loader-test loader-fixture)
+    add_test(NAME browser.private_loader COMMAND private-loader-test)
 endif ()

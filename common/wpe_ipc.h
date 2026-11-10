@@ -24,7 +24,7 @@
 
 #include <stdint.h>
 
-#define WPE_IPC_VERSION 3u
+#define WPE_IPC_VERSION 6u
 #define WPE_IPC_ENGINE_FD 3
 #define WPE_IPC_FRAME_SLOTS 3u
 #define WPE_IPC_MAX_TEXT 2048u   /* bytes including the terminating NUL */
@@ -58,6 +58,7 @@ typedef enum {
     WPE_APP_TAB_ACTIVATE,     /* no payload: show this tab, hide the others */
     WPE_APP_CLEAR_DATA,       /* WpeClearData: delete website data (cookies, site storage, caches) */
     WPE_APP_SET_ZOOM,         /* WpeZoom: page zoom for every tab, now and later */
+    WPE_APP_SET_SCALE,        /* WpeZoom: device scale for every tab (1500 = render 1.5x the CSS size) */
 
     /* engine -> app */
     WPE_ENGINE_READY = 100,   /* WpeEngineReady */
@@ -71,6 +72,8 @@ typedef enum {
     WPE_ENGINE_IME,           /* WpeIme: an editable got or lost focus */
     WPE_ENGINE_ERROR,         /* WpeError */
     WPE_ENGINE_DATA_CLEARED,  /* WpeDataCleared: answer to APP_CLEAR_DATA */
+    WPE_ENGINE_PRESENT,       /* WpePresent: how the tab's page reaches the screen (sent at start and on changes) */
+    WPE_ENGINE_SCROLL,        /* WpeFlag: 1 the page is scrolled to its top, 0 it is not (sent on changes) */
 } WpeMsgType;
 
 typedef struct {
@@ -173,6 +176,17 @@ typedef struct {
 } WpeDataCleared;
 
 typedef struct { uint32_t permille; } WpeZoom; /* 1000 = 100 % */
+
+/* Page presentation. SHM: the engine sends WPE_ENGINE_FRAME and the UI draws it. DIRECT (UI started the engine
+ * with WPE_BROWSER_PRESENT=direct): the web process draws into its own surface in the UI's surface group; the UI
+ * sends no FRAME_DONE and leaves the page area of its window transparent once status is FIRST_FRAME (3).
+ * A negative status means direct presentation failed for that tab (restart the engine in SHM mode). */
+typedef enum { WPE_PRESENT_SHM = 0, WPE_PRESENT_DIRECT = 1 } WpePresentMode;
+typedef struct {
+    uint32_t mode;     /* WpePresentMode */
+    int32_t status;    /* DIRECT: wpeb_webos_status (engine/webos-backend/protocol.h); 0 at start */
+    uint32_t width, height; /* DIRECT: surface size in pixels, when known */
+} WpePresent;
 
 #ifdef __cplusplus
 }

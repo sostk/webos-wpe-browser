@@ -34,6 +34,8 @@ struct EngineCallbacks {
     std::function<void(TabId, const WpeIme &)> ime;
     std::function<void(TabId, WpeErrorKind, uint32_t code, const std::string &)> error;
     std::function<void(uint32_t what, bool ok)> data_cleared;  // answer to clear_data()
+    std::function<void(TabId, bool at_top)> scroll;  // the page reached / left its top (shows the toolbar)
+    std::function<void(TabId, const WpePresent &)> present;  // how the page reaches the screen (direct mode)
     std::function<void(const std::string &why)> exited;  // the engine process went away
 };
 
@@ -47,6 +49,9 @@ struct EngineLaunch {
     // library path); true = the TV's own EGL/GLES (Mali) through the default EGL display, and Skia
     // paints on the CPU pending a Mali tile-rendering fix. Composited frames use SHM in both modes.
     bool gpu = false;
+    // Direct presentation (needs gpu): the web processes draw into their own surfaces in this surface group
+    // (DirectOwner) instead of sending frames. Empty = SHM frames.
+    std::string surface_group, surface_layer, wayland_socket;
 };
 
 class EngineClient {
@@ -89,6 +94,8 @@ class EngineClient {
     // Website data (WPE_CLEAR_* bits; seconds = 0 for all time) and page zoom for every tab.
     void clear_data(uint32_t what, uint32_t seconds);
     void set_zoom(uint32_t permille);
+    // Device scale: the engine renders CSS size x permille/1000 pixels (1500 = native 1080p for a 720p page).
+    void set_scale(uint32_t permille);
 
  private:
     bool send(uint32_t type, TabId tab, const void *payload, uint32_t size);
