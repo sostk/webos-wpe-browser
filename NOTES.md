@@ -138,3 +138,11 @@
   so after a toolchain rebuild or a fresh `br-out`, copy it again (`chmod u+w` the directory first for x-tools). The code that uses it only runs for
   GBM/dma-buf buffers, which the engine never creates. Alternative for a clean rebuild: `-DUSE_GBM=OFF -DUSE_LIBDRM=OFF` (needs reconfigure = full rebuild).
   Resumed with `br-build4.log`.
+- 2026-11-10 **WPE WebKit 2.50.5 built** (br-build4.log, exit 0). Engine compiled (one fix: a lambda inside G_CALLBACK broke the macro) and
+  staged by tools/stage-engine.sh: 200 MB, 57 libraries (largest: libWPEWebKit 58 MB, libLLVM 58 MB, libicudata 32 MB, libgallium 17 MB).
+- 2026-11-10 **TV smoke test from USB** (no install; engine at /tmp/usb/sda/sda1/engine, run with the installed 0.2.0 UI and
+  `WPE_BROWSER_ENGINE_DIR`): wpe-engine and WPEWebProcess load with the bundled libraries; the engine reports
+  "ready: WPE WebKit 2.50.5, page 1280x610" to the UI in about 1.1 s. The USB stick is tfat (no symlinks; execution works).
+  Not yet tested: loading a page. The script step `text@...` did not type into the NTP search box on the TV (works on the host);
+  use D-pad steps instead. The kit script's final `wait@` does not hold: add a trailing `wait@10` step.
+  **User asked to pause TV testing (2026-11-10).**
