@@ -81,6 +81,12 @@ struct wpeb_webos_view {
     int fd; // our end of the channel to the current web process' target
     GSource *source;
     bool attached;
+    // Handoff: WebKit moved the view to another web process (cross-site navigation) while the previous one still
+    // holds the layer; the compositor refuses a second surface on it ("Layer already attached", a protocol error).
+    // The old target is told to detach, and the new one attaches once it confirms (or after kHandoffMs).
+    int old_fd;
+    GSource *old_source;
+    guint handoff_timer;
     char group[WPEB_WEBOS_NAME_MAX], layer[WPEB_WEBOS_NAME_MAX];
     wpeb_webos_status_fn status_fn;
     void *status_user;
@@ -98,12 +104,71 @@ static void view_close_channel(struct wpeb_webos_view *v)
     v->fd = -1;
 }
 
-static void view_send_state(struct wpeb_webos_view *v)
+static void send_state_to(const struct wpeb_webos_view *v, int fd, bool attach)
 {
-    struct wpeb_webos_msg msg = { .type = v->attached ? WPEB_WEBOS_ATTACH : WPEB_WEBOS_DETACH };
+    struct wpeb_webos_msg msg = { .type = attach ? WPEB_WEBOS_ATTACH : WPEB_WEBOS_DETACH };
     copy_name(msg.group, v->group);
     copy_name(msg.layer, v->layer);
-    send_msg(v->fd, &msg);
+    send_msg(fd, &msg);
+}
+
+static void view_send_state(struct wpeb_webos_view *v)
+{
+    // During a handoff the new target waits (detached) until the old one has let go of the layer.
+    send_state_to(v, v->fd, v->attached && v->old_fd < 0);
+}
+
+enum { kHandoffMs = 500 };
+
+static void view_finish_handoff(struct wpeb_webos_view *v, const char *why)
+{
+    if (v->handoff_timer) {
+        g_source_remove(v->handoff_timer);
+        v->handoff_timer = 0;
+    }
+    if (v->old_source) {
+        g_source_destroy(v->old_source);
+        g_source_unref(v->old_source);
+        v->old_source = NULL;
+    }
+    if (v->old_fd >= 0) {
+        close(v->old_fd);
+        v->old_fd = -1;
+        LOG("layer handed to the new web process (%s)", why);
+    }
+    view_send_state(v);
+}
+
+static gboolean view_on_old_channel(gint fd, GIOCondition condition, gpointer data)
+{
+    struct wpeb_webos_view *v = data;
+    bool done = (condition & (G_IO_HUP | G_IO_ERR)) != 0;
+    if (condition & G_IO_IN) {
+        struct wpeb_webos_msg msg;
+        ssize_t n;
+        while ((n = recv(fd, &msg, sizeof(msg), MSG_DONTWAIT)) == (ssize_t)sizeof(msg)) {
+            if (msg.type == WPEB_WEBOS_STATUS && (msg.code == WPEB_WEBOS_STATUS_DETACHED || msg.code < 0))
+                done = true; // detached (or it failed: then it holds nothing either)
+        }
+        if (n == 0 || (n < 0 && errno != EAGAIN && errno != EINTR))
+            done = true;
+    }
+    if (!done)
+        return G_SOURCE_CONTINUE;
+    // view_finish_handoff destroys this source; keep it alive until we return.
+    g_source_ref(v->old_source);
+    GSource *self = v->old_source;
+    view_finish_handoff(v, "old one detached");
+    g_source_unref(self);
+    return G_SOURCE_REMOVE;
+}
+
+static gboolean view_on_handoff_timeout(gpointer data)
+{
+    struct wpeb_webos_view *v = data;
+    v->handoff_timer = 0;
+    view_finish_handoff(v, "timeout");
+    return G_SOURCE_REMOVE;
 }
 
 static gboolean view_on_channel(gint fd, GIOCondition condition, gpointer data)
@@ -140,6 +205,14 @@ static void *view_create(void *params, struct wpe_view_backend *backend)
 static void view_destroy(void *data)
 {
     struct wpeb_webos_view *v = data;
+    if (v->handoff_timer)
+        g_source_remove(v->handoff_timer);
+    if (v->old_source) {
+        g_source_destroy(v->old_source);
+        g_source_unref(v->old_source);
+    }
+    if (v->old_fd >= 0)
+        close(v->old_fd);
     view_close_channel(v);
     g_free(v);
 }
@@ -158,7 +231,24 @@ static int view_get_renderer_host_fd(void *data)
         LOG("socketpair failed: %s", strerror(errno));
         return -1;
     }
-    view_close_channel(v);
+    if (v->fd >= 0 && v->attached && v->old_fd < 0) {
+        // The current target holds the layer: keep its channel to tell it to detach, and wait for it.
+        v->old_fd = v->fd;
+        if (v->source) {
+            g_source_destroy(v->source);
+            g_source_unref(v->source);
+            v->source = NULL;
+        }
+        v->fd = -1;
+        v->old_source = g_unix_fd_source_new(v->old_fd, G_IO_IN | G_IO_HUP | G_IO_ERR);
+        g_source_set_callback(v->old_source, (GSourceFunc)(void (*)(void))view_on_old_channel, v, NULL);
+        g_source_attach(v->old_source, NULL);
+        send_state_to(v, v->old_fd, false);
+        v->handoff_timer = g_timeout_add(kHandoffMs, view_on_handoff_timeout, v);
+        LOG("new web process for this view: asking the previous one to detach");
+    } else {
+        view_close_channel(v);
+    }
     v->fd = fds[0];
     v->source = g_unix_fd_source_new(v->fd, G_IO_IN | G_IO_HUP | G_IO_ERR);
     g_source_set_callback(v->source, (GSourceFunc)(void (*)(void))view_on_channel, v, NULL);
@@ -179,6 +269,7 @@ __attribute__((visibility("default"))) struct wpeb_webos_view *wpeb_webos_view_n
 {
     struct wpeb_webos_view *v = g_new0(struct wpeb_webos_view, 1);
     v->fd = -1;
+    v->old_fd = -1;
     v->width = width ? width : 1;
     v->height = height ? height : 1;
     if (!wpe_view_backend_create_with_backend_interface(&view_interface, v)) {
@@ -471,11 +562,40 @@ static void group_owner_destroyed(void *data, struct wl_webos_surface_group *gro
 }
 static const struct wl_webos_surface_group_listener group_listener = { group_owner_destroyed };
 
+// LSM shows a group member only if it has a window role: a toplevel with the app's appId (TV, 2026-11-10: a bare
+// surface was accepted by attach but never drawn). LSM scales it to the owner window's size. The role exists only
+// while the surface is in the group: a detached toplevel of this app would be shown as a window of its own, on top
+// of the browser (TV, 2026-11-11: black screen after a web-process handoff).
+static void target_add_role(struct target *t)
+{
+    if (t->shell_surface)
+        return;
+    struct renderer *r = t->renderer;
+    t->shell_surface = wl_shell_get_shell_surface(r->shell, t->surface);
+    wl_proxy_set_queue((struct wl_proxy *)t->shell_surface, t->queue);
+    wl_shell_surface_set_toplevel(t->shell_surface);
+    t->webos_surface = wl_webos_shell_get_shell_surface(r->webos_shell, t->surface);
+    wl_proxy_set_queue((struct wl_proxy *)t->webos_surface, t->queue);
+    const char *app_id = getenv("WPEB_APP_ID");
+    wl_webos_shell_surface_set_property(t->webos_surface, "appId", app_id && *app_id ? app_id : "org.sostk.wpebrowser");
+}
+
+static void target_remove_role(struct target *t)
+{
+    if (t->webos_surface)
+        wl_webos_shell_surface_destroy(t->webos_surface);
+    t->webos_surface = NULL;
+    if (t->shell_surface)
+        wl_shell_surface_destroy(t->shell_surface);
+    t->shell_surface = NULL;
+}
+
 static void target_detach(struct target *t)
 {
     if (t->group && t->attached)
         wl_webos_surface_group_detach(t->group, t->surface);
     t->attached = false;
+    target_remove_role(t);
 }
 
 static void target_attach(struct target *t, const char *group, const char *layer)
@@ -494,7 +614,10 @@ static void target_attach(struct target *t, const char *group, const char *layer
         wl_proxy_set_queue((struct wl_proxy *)t->group, t->queue);
         wl_webos_surface_group_add_listener(t->group, &group_listener, t);
     }
+    target_add_role(t);
     wl_webos_surface_group_attach(t->group, t->surface, t->layer_name);
+    // Show what was last drawn: WebKit may have finished drawing before the attach and draw nothing new.
+    wl_surface_commit(t->surface);
     t->attached = true;
     t->waiting_first_frame = true;
     LOG("page surface %ux%u attached to '%s'/'%s'", t->width, t->height, t->group_name, t->layer_name);
@@ -513,6 +636,9 @@ static gboolean target_on_channel(gint fd, GIOCondition condition, gpointer data
                 target_attach(t, msg.group, msg.layer);
             else if (msg.type == WPEB_WEBOS_DETACH && t->attached) {
                 target_detach(t);
+                // The detach must reach the compositor before the view lets another process attach.
+                if (t->renderer->display)
+                    wl_display_flush(t->renderer->display);
                 target_status(t, WPEB_WEBOS_STATUS_DETACHED);
             }
         }
@@ -522,6 +648,12 @@ static gboolean target_on_channel(gint fd, GIOCondition condition, gpointer data
             condition |= G_IO_HUP;
     }
     if (condition & (G_IO_HUP | G_IO_ERR)) {
+        // The view has moved on (another web process, or it is gone): this surface must not keep the layer.
+        if (t->attached) {
+            target_detach(t);
+            if (t->renderer->display)
+                wl_display_flush(t->renderer->display);
+        }
         g_source_unref(t->channel_source);
         t->channel_source = NULL;
         return G_SOURCE_REMOVE;
@@ -619,15 +751,7 @@ static void target_initialize(void *data, void *backend_data, uint32_t width, ui
     t->queue = wl_display_create_queue(r->display);
     t->surface = wl_compositor_create_surface(r->compositor);
     wl_proxy_set_queue((struct wl_proxy *)t->surface, t->queue);
-    // LSM shows a group member only if it has a window role: a toplevel with the app's appId (TV, 2026-11-10:
-    // a bare surface was accepted by attach but never drawn). LSM scales it to the owner window's size.
-    t->shell_surface = wl_shell_get_shell_surface(r->shell, t->surface);
-    wl_proxy_set_queue((struct wl_proxy *)t->shell_surface, t->queue);
-    wl_shell_surface_set_toplevel(t->shell_surface);
-    t->webos_surface = wl_webos_shell_get_shell_surface(r->webos_shell, t->surface);
-    wl_proxy_set_queue((struct wl_proxy *)t->webos_surface, t->queue);
-    const char *app_id = getenv("WPEB_APP_ID");
-    wl_webos_shell_surface_set_property(t->webos_surface, "appId", app_id && *app_id ? app_id : "org.sostk.wpebrowser");
+    // No window role yet: target_attach adds it (see target_add_role).
     t->window = wl_egl_window_create(t->surface, (int)width, (int)height);
 
     WaylandSource *s = (WaylandSource *)g_source_new(&wl_source_funcs, sizeof(WaylandSource));

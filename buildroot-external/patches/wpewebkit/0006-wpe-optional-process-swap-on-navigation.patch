@@ -1,0 +1,22 @@
+WPE: allow turning off process swap on navigation
+
+WPE always swaps web processes on cross-site navigation (and for COOP); GTK has the
+process-swap-on-cross-site-navigation-enabled property for it. The webOS browser's direct
+presentation gives each web process its own compositor surface for a view, and the webOS
+compositor cannot hand the view's layer from one process's surface to another's without
+hiding the app. WPE_BROWSER_NO_PROCESS_SWAP (set by the engine in that mode) keeps a view in its process.
+
+--- a/Source/WebKit/UIProcess/API/glib/WebKitWebContext.cpp
++++ b/Source/WebKit/UIProcess/API/glib/WebKitWebContext.cpp
+@@ -448,7 +448,10 @@
+     configuration.setUseSystemAppearanceForScrollbars(priv->useSystemAppearanceForScrollbars);
+ #endif
+ #else
+-    configuration.setProcessSwapsOnNavigation(true);
++    // webOS browser: WPE_BROWSER_NO_PROCESS_SWAP keeps a view in its web process on cross-site navigation (and COOP).
++    // Direct presentation gives each web process its own compositor surface for the view, and the webOS compositor
++    // cannot move the view's layer from one process's surface to another's without hiding the app.
++    configuration.setProcessSwapsOnNavigation(!g_getenv("WPE_BROWSER_NO_PROCESS_SWAP"));
+ #endif
+     if (priv->memoryPressureSettings) {
+         configuration.setMemoryPressureHandlerConfiguration(webkitMemoryPressureSettingsGetMemoryPressureHandlerConfiguration(priv->memoryPressureSettings));

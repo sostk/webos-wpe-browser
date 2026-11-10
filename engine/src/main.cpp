@@ -916,6 +916,11 @@ int main(int, char **)
             on_direct_status);
         if (!g.direct)
             log_msg("direct presentation unavailable; using SHM frames");
+        // A view keeps its web process across sites (WebKit patch 0006): a new process would need the view's layer,
+        // and the webOS compositor hides the app when it moves from one process's surface to another's (TV,
+        // 2026-11-11, YouTube's COOP swap). All tabs already share one web process here.
+        if (g.direct)
+            g_setenv("WPE_BROWSER_NO_PROCESS_SWAP", "1", TRUE);
     }
 
     GError *error = nullptr;
@@ -951,6 +956,19 @@ int main(int, char **)
     webkit_settings_set_enable_spatial_navigation(g.settings, TRUE);
     webkit_settings_set_user_agent_with_application_details(g.settings, "WPEBrowser-webOS", "0.2");
     webkit_settings_set_enable_developer_extras(g.settings, FALSE);
+    if (g.direct) {
+        // COOP (YouTube sends it) moves a page into a new web process by its own path, which ignores
+        // WPE_BROWSER_NO_PROCESS_SWAP; see there for why direct presentation can't follow a process switch.
+        WebKitFeatureList *features = webkit_settings_get_all_features();
+        for (gsize i = 0; i < webkit_feature_list_get_length(features); ++i) {
+            WebKitFeature *f = webkit_feature_list_get(features, i);
+            if (g_strcmp0(webkit_feature_get_identifier(f), "CrossOriginOpenerPolicy") == 0) {
+                webkit_settings_set_feature_enabled(g.settings, f, FALSE);
+                log_msg("COOP off (direct presentation keeps pages in their web process)");
+            }
+        }
+        webkit_feature_list_unref(features);
+    }
 
     g_unix_fd_add(g.sock, static_cast<GIOCondition>(G_IO_IN | G_IO_HUP | G_IO_ERR), on_socket, nullptr);
 

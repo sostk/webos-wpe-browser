@@ -777,19 +777,25 @@ class App : public wnk::app::Delegate {
         const char *override_dir = std::getenv("WPE_BROWSER_ENGINE_DIR");
         l.engine_dir = override_dir && *override_dir ? override_dir : ctx.launch().app_dir + "/engine";
         l.runtime_dir = ctx.runtime_dir().empty() ? "/tmp" : ctx.runtime_dir();
-        // WPE_BROWSER_RENDERER=gpu selects the TV's Mali through WebKit's default-EGL-display patch
-        // (root probes passed; installed-app validation remains: see NOTES.md). Software stays the default.
-        // Launch parameters {"wpebRenderer":"gpu","wpebPresent":"direct"} do the same as the environment (an
-        // installed app gets no environment from the launcher); a parameter wins.
+        // On the TV pages are drawn by the GPU straight to the screen by default (direct presentation, tested
+        // 2026-11-11; a failure falls back to SHM frames by itself). Launch parameters {"wpebRenderer":"software"|"gpu",
+        // "wpebPresent":"shm"|"direct"} or WPE_BROWSER_RENDERER / WPE_BROWSER_PRESENT choose otherwise (a parameter
+        // wins; an installed app gets no environment from the launcher). Host builds keep software + SHM.
+#if defined(WNK_SDL_WEBOS)
+        constexpr const char *kDefaultRenderer = "gpu", *kDefaultPresent = "direct";
+#else
+        constexpr const char *kDefaultRenderer = "software", *kDefaultPresent = "shm";
+#endif
         const std::string &params = ctx.launch().params_json;
         std::string renderer = launch_param(params, "wpebRenderer");
         if (renderer.empty() && std::getenv("WPE_BROWSER_RENDERER")) renderer = std::getenv("WPE_BROWSER_RENDERER");
+        if (renderer.empty()) renderer = kDefaultRenderer;
         l.gpu = renderer == "gpu";
-        // WPE_BROWSER_PRESENT=direct (with gpu): pages draw straight into a surface below this window
-        // (docs/webkit-like-chromium.md, part 2). Experimental until checked on the TV; falls back by itself.
+        // Direct presentation (with gpu): pages draw into a surface below this window (docs/webkit-like-chromium.md).
         std::string present = launch_param(params, "wpebPresent");
         if (present.empty() && std::getenv("WPE_BROWSER_PRESENT")) present = std::getenv("WPE_BROWSER_PRESENT");
-        WNK_LOGI(kCat, "renderer %s, presentation %s", l.gpu ? "gpu" : "software", present.empty() ? "shm" : present.c_str());
+        if (present.empty()) present = kDefaultPresent;
+        WNK_LOGI(kCat, "renderer %s, presentation %s", l.gpu ? "gpu" : "software", l.gpu ? present.c_str() : "shm");
         if (l.gpu && !direct_failed_ && present == "direct") {
             std::string why;
             if (!direct_.active() && !direct_.open(l.engine_dir, why))

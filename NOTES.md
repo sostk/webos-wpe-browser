@@ -371,3 +371,14 @@
     after 2.5 s on the restored scrolled page. Note: the peeking toolbar covers the top ~136 px of the page.
   - Kit script gotcha: a trailing wait@ has no effect (the shot is taken when the steps end); end with a dummy key (F24).
   - 2026-11-11 user tested the peeking toolbar on the TV (direct mode): works.
+- 2026-11-11 **GPU drawing is the default on the TV**: webOS builds (WNK_SDL_WEBOS) default to renderer gpu + direct presentation; launch params {"wpebRenderer":"software"} / {"wpebPresent":"shm"} or the env vars override; host builds stay software + SHM. Built and package-checked; not yet installed.
+- 2026-11-11 **Direct mode vs web-process switches** (found when GPU drawing became the default: YouTube went black):
+  - WebKit moved the tab into a new web process (YouTube's COOP header; WPE also swaps on cross-site navigation). The new
+    process's surface could not attach ("Layer already attached", Wayland protocol error → SHM fallback). A layer handoff
+    in the backend (old target detaches, new one attaches after it confirms or after 500 ms) fixed the error, but LSM then
+    hid the whole app (NL_VSC visible:false; screenshot pure black), with or without removing the old window role.
+  - Fix: direct mode keeps a view in one web process. WebKit patch 0006 lets WPE honour WPE_BROWSER_NO_PROCESS_SWAP (GTK
+    has a property for it), and the engine turns the CrossOriginOpenerPolicy feature off (COOP swaps take their own
+    path). All tabs already share one web process (related views), so little isolation is lost. Checked on the PC
+    (direct probe: YouTube and a cross-site redirect stay in one process) and on the TV: YouTube draws in direct mode.
+  - The backend keeps the handoff and now gives the surface its window role only while attached (safer for crash restarts).
