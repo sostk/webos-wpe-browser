@@ -30,6 +30,8 @@ class DirectOwner {
     // punch-through directly below the app's main window and cuts out everything under it, the page included:
     // while hardware video plays the page goes above, or the page's own controls over the video vanish.
     void set_page_z(int z);
+    // A new page layer (see wpeb_owner_renew_layer); layer() is its name. False if the library cannot.
+    bool renew_layer();
     int page_z() const { return page_z_; }
     void close();
 
@@ -40,6 +42,8 @@ class DirectOwner {
     void (*dispatch_)(wpeb_owner *) = nullptr;
     void (*destroy_)(wpeb_owner *) = nullptr;
     void (*set_z_)(wpeb_owner *, int) = nullptr;
+    int (*renew_layer_)(wpeb_owner *, const char *) = nullptr;
+    int layer_generation_ = 0;
     int page_z_ = -1;
 };
 

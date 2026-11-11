@@ -24,7 +24,7 @@
 
 #include <stdint.h>
 
-#define WPE_IPC_VERSION 7u
+#define WPE_IPC_VERSION 9u
 #define WPE_IPC_ENGINE_FD 3
 #define WPE_IPC_FRAME_SLOTS 3u
 #define WPE_IPC_MAX_TEXT 2048u   /* bytes including the terminating NUL */
@@ -59,6 +59,8 @@ typedef enum {
     WPE_APP_CLEAR_DATA,       /* WpeClearData: delete website data (cookies, site storage, caches) */
     WPE_APP_SET_ZOOM,         /* WpeZoom: page zoom for every tab, now and later */
     WPE_APP_SET_SCALE,        /* WpeZoom: device scale for every tab (1500 = render 1.5x the CSS size) */
+    WPE_APP_SET_LAYER,        /* WpeText: direct presentation: the surface-group layer pages attach to from now on
+                                 (a new one after a web-process crash; the dead process's surface can keep the old) */
 
     /* engine -> app */
     WPE_ENGINE_READY = 100,   /* WpeEngineReady */
@@ -77,6 +79,8 @@ typedef enum {
     WPE_ENGINE_TAB_CREATED,   /* WpeTabCreated: a page opened a window (window.open, target=_blank); header.tab = the
                                  engine's id for it (WPE_ENGINE_TAB_ID_BASE and up). The UI adds and shows the tab. */
     WPE_ENGINE_TAB_CLOSE,     /* no payload: the page asked to close its window (window.close()) */
+    WPE_ENGINE_FULLSCREEN,    /* WpeFlag: the page entered (1) or left (0) fullscreen (Fullscreen API, a video's
+                                 fullscreen button); the UI hides its chrome meanwhile */
 } WpeMsgType;
 
 /* Tabs the engine opens itself (popups) get ids from here, so they never collide with the UI's. */

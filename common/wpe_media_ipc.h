@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later
  *
- * Hardware video: the web process's GStreamer video sink (engine/gst/wpebmediasink.c) sends the encoded stream to
- * the UI process, which feeds LG's decoder through the kit's NdlBackend (browser/media_server.cpp). The decoder
+ * Hardware video (and its audio): the web process's GStreamer sinks (engine/gst/wpebmediasink.c) send the encoded
+ * streams to the UI process, which feeds LG's media pipeline (browser/media_server.cpp, lg_media_player.cpp). The decoder
  * has to run in the UI process: it registers luna bus names under the app's role, and that role is bound to the
  * app's executable (exeName), not to WPEWebProcess. The picture goes to the TV's video plane under all windows;
  * WebKit punches a transparent hole in the page where the video element is.
@@ -14,7 +14,7 @@
 
 #include <stdint.h>
 
-#define WPEB_MEDIA_IPC_VERSION 2u
+#define WPEB_MEDIA_IPC_VERSION 3u
 #define WPEB_MEDIA_MAX_PAYLOAD (16u * 1024u * 1024u)
 
 enum WpebMediaType {
@@ -25,7 +25,30 @@ enum WpebMediaType {
     WPEB_MEDIA_AREA = 5,    /* payload: WpebMediaArea, page-surface pixels */
     WPEB_MEDIA_UNLOAD = 6,  /* the stream stopped; the decoder is released */
     WPEB_MEDIA_PAUSE = 7,   /* payload: uint32_t paused */
+    /* Audio of the same playback, sent by the audio sink over the video sink's connection (LG's pipeline plays
+     * both, in sync, as Chromium on webOS feeds it). Exactly one of AUDIO_FORMAT / AUDIO_NONE per playback; the UI
+     * holds the LG Load for it (up to a second) unless TRACKS said there is no audio. */
+    WPEB_MEDIA_AUDIO_FORMAT = 8, /* payload: WpebMediaAudio */
+    WPEB_MEDIA_AUDIO_NONE = 9,   /* the audio stays in software (another codec, muted, or no video window) */
+    WPEB_MEDIA_AUDIO = 10,       /* pts_us: media time; payload: one AAC frame with its ADTS header */
+    WPEB_MEDIA_TRACKS = 11,      /* payload: uint32_t has_audio (from the stream collection, when known) */
+    WPEB_MEDIA_VOLUME = 12,      /* payload: WpebMediaVolume */
 };
+
+enum WpebMediaAudioCodec {
+    WPEB_MEDIA_AAC = 1,
+};
+
+typedef struct WpebMediaAudio {
+    uint32_t codec;
+    uint32_t rate;
+    uint32_t channels;
+} WpebMediaAudio;
+
+typedef struct WpebMediaVolume {
+    uint32_t permille; /* 0..1000 */
+    uint32_t muted;
+} WpebMediaVolume;
 
 enum WpebMediaCodec {
     WPEB_MEDIA_H264 = 1,

@@ -36,6 +36,7 @@ struct EngineCallbacks {
     std::function<void(TabId, WpeErrorKind, uint32_t code, const std::string &)> error;
     std::function<void(uint32_t what, bool ok)> data_cleared;  // answer to clear_data()
     std::function<void(TabId, bool at_top)> scroll;  // the page reached / left its top (shows the toolbar)
+    std::function<void(TabId, bool on)> fullscreen;  // the page entered / left fullscreen
     std::function<void(TabId, const WpePresent &)> present;  // how the page reaches the screen (direct mode)
     std::function<void(TabId, TabId opener)> tab_created;      // a page opened a window (the engine's tab id)
     std::function<void(TabId)> tab_close;                       // a page called window.close()
@@ -89,6 +90,9 @@ class EngineClient {
     void reload(TabId tab) { send(WPE_APP_RELOAD, tab, nullptr, 0); }
     void stop_loading(TabId tab) { send(WPE_APP_STOP, tab, nullptr, 0); }
     void run_js(TabId tab, const std::string &script) { send_text(WPE_APP_RUN_JS, tab, script); }
+    // Leaves the page's fullscreen (Back on the remote), from the top document down.
+    void exit_fullscreen(TabId tab) { run_js(tab, "document.fullscreenElement && document.exitFullscreen()"); }
+    void set_layer(const std::string &layer) { send_text(WPE_APP_SET_LAYER, 0, layer); }
 
     // Page size and input: always the active tab.
     void resize(uint32_t w, uint32_t h);

@@ -534,6 +534,15 @@ void on_perf_message(WebKitUserContentManager *, JSCValue *value, gpointer data)
     g_free(text);
 }
 
+gboolean on_fullscreen_changed(WebKitWebView *view, gpointer entered)
+{
+    const uint32_t id = tab_of_web_view(view);
+    WpeFlag flag = {GPOINTER_TO_UINT(entered)};
+    log_msg("tab %u %s fullscreen", id, flag.value ? "entered" : "left");
+    send_msg(WPE_ENGINE_FULLSCREEN, id, &flag, sizeof(flag));
+    return FALSE; // let it happen
+}
+
 void on_scroll_message(WebKitUserContentManager *, JSCValue *value, gpointer data)
 {
     const uint32_t id = GPOINTER_TO_UINT(data);
@@ -773,6 +782,8 @@ void tab_open(uint32_t id, const std::string &uri, WebKitWebView *opener)
     g_signal_connect(web_view, "web-process-terminated", G_CALLBACK(on_web_process_terminated), nullptr);
     g_signal_connect(web_view, "create", G_CALLBACK(on_create), nullptr);
     g_signal_connect(web_view, "close", G_CALLBACK(on_close), nullptr);
+    g_signal_connect(web_view, "enter-fullscreen", G_CALLBACK(on_fullscreen_changed), GUINT_TO_POINTER(1));
+    g_signal_connect(web_view, "leave-fullscreen", G_CALLBACK(on_fullscreen_changed), GUINT_TO_POINTER(0));
     g_signal_connect(webkit_web_view_get_back_forward_list(web_view), "changed", G_CALLBACK(on_history_changed), web_view);
     add_scroll_reporter(web_view, id);
 
@@ -974,6 +985,15 @@ void handle_message(const uint8_t *buf, ssize_t n)
         if (auto *z = payload<WpeZoom>(buf, n, h))
             set_scale(z->permille);
         break;
+    case WPE_APP_SET_LAYER: {
+        const std::string layer = text_of(buf, n, h);
+        if (g.direct && !layer.empty()) {
+            direct::set_layer(layer.c_str());
+            for (auto &[id, t] : g.tabs)
+                direct::reattach(t.direct);
+        }
+        break;
+    }
     case WPE_APP_QUIT:
         g_main_loop_quit(g.loop);
         break;

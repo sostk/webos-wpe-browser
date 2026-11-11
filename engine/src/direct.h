@@ -27,6 +27,9 @@ void set_scale(View *view, double scale);
 // Shown = attached to the UI's surface group and visible to WebKit; hidden = detached and not rendering.
 void set_shown(View *view, bool shown);
 void set_focused(View *view, bool focused);
+// Pages attach to `layer` from now on; a shown view is attached again there (its web process is new or reloading).
+void set_layer(const char *layer);
+void reattach(View *view);
 
 // The TV keyboard: an input method context for the tab's WebKitWebView that reports editable focus (purpose is
 // a WPEInputPurpose, as in SHM mode) and commits the text the UI sends back.

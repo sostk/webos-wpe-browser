@@ -635,8 +635,17 @@ static void target_add_role(struct target *t)
     wl_shell_surface_set_toplevel(t->shell_surface);
     t->webos_surface = wl_webos_shell_get_shell_surface(r->webos_shell, t->surface);
     wl_proxy_set_queue((struct wl_proxy *)t->webos_surface, t->queue);
-    const char *app_id = getenv("WPEB_APP_ID");
-    wl_webos_shell_surface_set_property(t->webos_surface, "appId", app_id && *app_id ? app_id : "org.sostk.wpebrowser");
+    // Not the app's own id: webOS counts a surface with the app's id as one of its windows and minimises the whole
+    // app when one goes away, which a crashed web process does with all its surfaces at once (black screen until
+    // the app was closed; TV, 2026-11-11). Any other non-empty id shows it in the group the same way.
+    const char *page_id = getenv("WPE_BROWSER_DEBUG_PAGE_APPID");
+    char derived[160];
+    if (!page_id || !*page_id) {
+        const char *app_id = getenv("WPEB_APP_ID");
+        snprintf(derived, sizeof(derived), "%s.page", app_id && *app_id ? app_id : "org.sostk.wpebrowser");
+        page_id = derived;
+    }
+    wl_webos_shell_surface_set_property(t->webos_surface, "appId", page_id);
 }
 
 static void target_remove_role(struct target *t)

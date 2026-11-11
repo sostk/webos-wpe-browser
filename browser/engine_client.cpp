@@ -158,6 +158,10 @@ bool EngineClient::start(const EngineLaunch &l, std::string &error) {
     set_env(env, "WPE_BROWSER_RENDERER", gpu ? "gpu" : "software");
     // JavaScript garbage collection marks in parallel on every core.
     set_env(env, "JSC_numberOfGCMarkers", "4");
+    // 32-bit ARM JSC corrupts its heap now and then (SIGSEGV in JSObject::allocateMoreOutOfLineStorage, 5 times on
+    // the TV on 2026-11-11; open upstream: webkit.org/b/295780, b/275099). The only reported mitigation is the
+    // iterative JSON parser (b/275099 comment 3); it costs nothing measurable.
+    set_env(env, "JSC_useRecursiveJSONParse", "false");
     if (gpu && !l.surface_group.empty()) {
         set_env(env, "WPE_BROWSER_PRESENT", "direct");
         set_env(env, "WPEB_SURFACE_GROUP", l.surface_group);
@@ -444,6 +448,13 @@ void EngineClient::handle(const uint8_t *buf, size_t n, int fd) {
         break;
     case WPE_ENGINE_TAB_CLOSE:
         if (cb_.tab_close) cb_.tab_close(h.tab);
+        break;
+    case WPE_ENGINE_FULLSCREEN:
+        if (len >= sizeof(WpeFlag) && cb_.fullscreen) {
+            WpeFlag f;
+            std::memcpy(&f, p, sizeof(f));
+            cb_.fullscreen(h.tab, f.value != 0);
+        }
         break;
     case WPE_ENGINE_SCROLL:
         if (len >= sizeof(WpeFlag) && cb_.scroll) {

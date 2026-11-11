@@ -22,6 +22,7 @@ struct wpeb_owner {
     struct wl_webos_surface_group *group;
     struct wl_webos_surface_group_layer *layer;
     int attached; // page surfaces currently attached to the layer
+    int z_index;
 };
 
 static void registry_global(void *data, struct wl_registry *registry, uint32_t name, const char *interface, uint32_t version)
@@ -74,6 +75,7 @@ WPEB_OWNER_EXPORT struct wpeb_owner *wpeb_owner_create(struct wl_display *displa
     wl_registry_destroy(registry);
 
     o->group = wl_webos_surface_group_compositor_create_surface_group(o->groups, window, group);
+    o->z_index = z_index;
     o->layer = wl_webos_surface_group_create_layer(o->group, layer, z_index);
     wl_webos_surface_group_layer_add_listener(o->layer, &layer_listener, o);
     // A protocol error here (e.g. the name is taken) is fatal for the whole connection, SDL's included, so check
@@ -114,8 +116,26 @@ WPEB_OWNER_EXPORT void wpeb_owner_set_z(struct wpeb_owner *o, int z_index)
     if (!o || !o->layer)
         return;
     wl_webos_surface_group_layer_set_z_index(o->layer, z_index);
+    o->z_index = z_index;
     wl_display_flush(o->display);
     fprintf(stderr, "[wpeb-owner] layer z %d\n", z_index);
+}
+
+WPEB_OWNER_EXPORT int wpeb_owner_renew_layer(struct wpeb_owner *o, const char *layer)
+{
+    if (!o || !o->group || !layer || !*layer)
+        return 0;
+    if (o->layer)
+        wl_webos_surface_group_layer_destroy(o->layer);
+    o->attached = 0;
+    o->layer = wl_webos_surface_group_create_layer(o->group, layer, o->z_index);
+    wl_webos_surface_group_layer_add_listener(o->layer, &layer_listener, o);
+    if (wl_display_roundtrip_queue(o->display, o->queue) < 0) {
+        fprintf(stderr, "[wpeb-owner] new layer '%s' failed (Wayland error %d)\n", layer, wl_display_get_error(o->display));
+        return 0;
+    }
+    fprintf(stderr, "[wpeb-owner] new layer '%s' (z %d)\n", layer, o->z_index);
+    return 1;
 }
 
 WPEB_OWNER_EXPORT int wpeb_owner_attached(struct wpeb_owner *o)

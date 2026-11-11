@@ -115,8 +115,11 @@ struct Tab {
     bool can_back = false, can_forward = false;
     bool live = false;  // has a WebKit view in the engine
     bool at_top = true;  // the page is scrolled to its top (the toolbar peeks over it then)
+    bool fullscreen = false;  // the page is in fullscreen (a video's fullscreen button): no chrome at all
     TabId opener = 0;    // the tab whose page opened this one (window.open), shown again when it closes itself
     double last_shown_ms = 0;
+    bool crashed = false;      // its web process died; reloaded when next shown
+    double crashed_ms = -1e9;  // when (a second crash soon after an automatic reload is left to the user)
 };
 
 class App;
@@ -217,6 +220,7 @@ class App : public wnk::app::Delegate {
         t->last_shown_ms = ctx_->ui().now_ms();
         if (!t->url.empty() && !t->live) open_in_engine(*t, t->url);
         if (t->live) engine_.tab_activate(id);
+        if (t->live && t->crashed) reload_crashed(*t);
         screen_->page_->show_tab(t->live ? id : 0);
         screen_->page_->ime(ctx_->ui(), false);
         refresh_chrome();
@@ -261,6 +265,14 @@ class App : public wnk::app::Delegate {
         else
             engine_.reload(t->id);
     }
+    // A tab whose web process died: load its page again in a new one, unless it died again within
+    // kCrashLoopMs of the last automatic reload (then the user decides, with Green).
+    void reload_crashed(Tab &t) {
+        t.crashed = false;
+        WNK_LOGI(kCat, "tab %u: reloading after its web process crashed", t.id);
+        engine_.reload(t.id);
+    }
+
     void go_home() {
         // Home = this tab's New Tab page, as in Chromium with the default home page.
         Tab *t = tab(active_);
@@ -317,6 +329,7 @@ class App : public wnk::app::Delegate {
         const bool page_mode = ui.focused() == screen_->page_ && t != nullptr && t->live && !t->url.empty() &&
                                !screen_->message_->visible() && ui.top_dialog() == nullptr && nav_->depth() == 1;
         if (!page_mode) return true;
+        if (t->fullscreen) return false;
         // With a hardware video the page goes above the UI while the chrome is hidden (DirectOwner::set_page_z), so
         // being at the top no longer keeps the chrome: it would hide the page's video controls.
         return (t->at_top && !(raise_page_ && media_.video_active())) || ui.now_ms() < peek_until_ms_;
@@ -494,7 +507,9 @@ class App : public wnk::app::Delegate {
         switch (action) {
         case A::Back:
             if (e.down && !e.repeat) {
-                if (t->can_back) {
+                if (t->fullscreen) {
+                    engine_.exit_fullscreen(t->id);  // as Escape on a desktop browser
+                } else if (t->can_back) {
                     engine_.go_back(t->id);
                     peek_chrome();  // show where we are (the address) while the page stays focused
                 } else
@@ -764,6 +779,14 @@ class App : public wnk::app::Delegate {
         };
         cb.tab_created = [this](TabId id, TabId opener) { add_page_tab(id, opener); };
         cb.tab_close = [this](TabId id) { close_page_tab(id); };
+        cb.fullscreen = [this](TabId id, bool on) {
+            Tab *t = tab(id);
+            if (t == nullptr) return;
+            t->fullscreen = on;
+            WNK_LOGI(kCat, "tab %u %s fullscreen", id, on ? "entered" : "left");
+            // The page takes the remote while it is fullscreen (its video controls), and gets it back after.
+            if (on && id == active_) focus_content();
+        };
         cb.scroll = [this](TabId id, bool at_top) {
             if (Tab *t = tab(id)) t->at_top = at_top;
         };
@@ -779,8 +802,25 @@ class App : public wnk::app::Delegate {
         };
         cb.error = [this](TabId id, WpeErrorKind kind, uint32_t code, const std::string &msg) {
             WNK_LOGW(kCat, "engine error tab %u %d/%u: %s", id, static_cast<int>(kind), code, msg.c_str());
-            if (kind == WPE_ERROR_WEB_PROCESS_CRASHED && id == active_)
-                ctx_->ui().toast("This page stopped (" + msg + "). Press Green to reload.", 5000);
+            if (kind != WPE_ERROR_WEB_PROCESS_CRASHED) return;
+            const double now = ctx_->ui().now_ms();
+            if (direct_.active() && now - crash_at_ms_ > 1000) {
+                // The compositor can keep the dead process's surface on the page layer, and the next page's
+                // attach is then refused ("Layer already attached", a fatal Wayland error; TV, 2026-11-11).
+                if (direct_.renew_layer()) engine_.set_layer(direct_.layer());
+            }
+            crash_at_ms_ = now;
+            Tab *t = tab(id);
+            if (t == nullptr) return;
+            t->fullscreen = false;
+            const bool looping = now - t->crashed_ms < kCrashLoopMs;
+            t->crashed_ms = now;
+            t->crashed = !looping;
+            if (looping) {
+                if (id == active_) ctx_->ui().toast("This page stopped again (" + msg + "). Press Green to reload.", 6000);
+            } else if (id == active_) {
+                reload_crashed(*t);
+            }
         };
         cb.data_cleared = [this](uint32_t, bool ok) {
             ctx_->ui().toast(ok ? "Browsing data cleared" : "Some browsing data could not be cleared");
@@ -940,6 +980,8 @@ class App : public wnk::app::Delegate {
     bool focused_once_ = false;
     int32_t last_x_ = 0, last_y_ = 0;
     int restarts_ = 0;
+    static constexpr double kCrashLoopMs = 20000;
+    double crash_at_ms_ = -1e9;  // the last web-process crash
     bool restart_pending_ = false;
     double restart_at_ms_ = 0;
     float chrome_shown_ = 1.0f;  // 0 hidden .. 1 shown (slide position)

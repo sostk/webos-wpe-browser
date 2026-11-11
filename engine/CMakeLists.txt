@@ -23,7 +23,7 @@ set_target_properties(wpe-engine PROPERTIES
 install(TARGETS wpe-engine RUNTIME DESTINATION .)
 
 # Hardware video (engine/gst/wpebmediasink.c): GStreamer sinks that hand the encoded stream to the UI process.
-pkg_check_modules(GSTBASE IMPORTED_TARGET gstreamer-1.0 gstreamer-base-1.0)
+pkg_check_modules(GSTBASE IMPORTED_TARGET gstreamer-1.0 gstreamer-base-1.0 gstreamer-audio-1.0)
 if (GSTBASE_FOUND)
     add_library(gstwpebmedia MODULE gst/wpebmediasink.c)
     target_include_directories(gstwpebmedia PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../common)

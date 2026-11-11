@@ -43,6 +43,7 @@ struct View {
     wpe_view_backend *backend = nullptr;
     double scale = 1.0;
     bool shown = false;
+    bool fullscreen = false;
 };
 
 namespace {
@@ -54,6 +55,27 @@ void on_status(void *user, int32_t status, uint32_t width, uint32_t height)
         log_msg("tab %u direct surface: status %d (%ux%u)", view->tab, status, width, height);
     if (status_fn)
         status_fn(view->tab, status, width, height);
+}
+
+// The page asked for fullscreen (or to leave it): the page surface already covers the screen, so this only
+// confirms. Without a handler libwpe refuses, and WebKit rejects every requestFullscreen() (TV, 2026-11-11).
+// libwpe wants the confirmation after the handler has returned.
+gboolean confirm_fullscreen(gpointer data)
+{
+    auto *view = static_cast<View *>(data);
+    if (view->fullscreen)
+        wpe_view_backend_dispatch_did_enter_fullscreen(view->backend);
+    else
+        wpe_view_backend_dispatch_did_exit_fullscreen(view->backend);
+    return G_SOURCE_REMOVE;
+}
+
+bool on_fullscreen(void *data, bool fullscreen)
+{
+    auto *view = static_cast<View *>(data);
+    view->fullscreen = fullscreen;
+    g_idle_add(confirm_fullscreen, view);
+    return true;
 }
 
 void destroy_view(gpointer data)
@@ -119,6 +141,7 @@ WebKitWebViewBackend *create_backend(uint32_t tab, uint32_t width, uint32_t heig
     }
     view->backend = api.view_get_backend(view->backend_view);
     api.view_set_status_callback(view->backend_view, on_status, view);
+    wpe_view_backend_set_fullscreen_handler(view->backend, on_fullscreen, view);
     // Hidden until the tab is shown: not visible, so WebKit does not render it.
     wpe_view_backend_add_activity_state(view->backend, wpe_view_activity_state_in_window);
     *out = view;
@@ -151,6 +174,18 @@ void set_shown(View *view, bool shown)
         wpe_view_backend_remove_activity_state(view->backend, wpe_view_activity_state_visible);
         api.view_detach(view->backend_view);
     }
+}
+
+void set_layer(const char *layer)
+{
+    layer_name = layer;
+    log_msg("direct presentation: pages attach to layer '%s' now", layer);
+}
+
+void reattach(View *view)
+{
+    if (view && view->shown)
+        api.view_attach(view->backend_view, group_name.c_str(), layer_name.c_str());
 }
 
 void set_focused(View *view, bool focused)

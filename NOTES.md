@@ -501,3 +501,57 @@
     surface-group handle with wl_proxy_destroy (never the destroy request), one lock serialises attach/detach in a
     process, and an attach first detaches any other page of the process holding the layer ("Layer already attached").
   - TV: popup open -> close -> second popup (reused surface): no minimise, opener shown again (screenshots).
+
+## 2026-11-11 Web-process crashes (user request: "fix the stability and smoothness")
+- The "black screen after Google sign-in" and later crashes are SIGSEGV in the web process, not memory kills. LG's
+  crash reporter keeps a report per crash (text, registers, maps, backtraces): /var/log/reports/librdx/RDXDErr2_WPEWebProcess_*.gz
+  (no core dumps needed). Symbolize with the unstripped br-out/build/wpewebkit-2.50.5/lib/libWPEWebKit-2.0.so.1.6.10
+  (same .text as the staged one) and the container's addr2line (offset = pc - r-xp base - 1).
+- All 5 reports (11:25-12:14): JSC::JSObject::allocateMoreOutOfLineStorage, from JIT, LLInt and C++ (DOM prototype
+  creation) callers. A butterfly was bump-allocated at the end of the last 16 KB MarkedBlock of a 1 MB mapping, i.e.
+  a free-list interval ran past its block (heap corruption earlier). Open upstream 32-bit ARM bug: webkit.org/b/295780
+  (bisected to the MarkedBlock footer->header change, 32-bit alignment suspected) and b/275099. No fix upstream.
+- Mitigations: JSC_useRecursiveJSONParse=false (the only reported workaround, b/275099 c3). The UI reloads a crashed
+  tab automatically (once per 20 s; background tabs when shown).
+- Black screen after a crash (fixed, TV-tested with SIGSEGV/SIGKILL on Wikipedia, dash.js, popups, hardware video):
+  webOS minimises an app when a surface with the app's appId goes away (not crashd: SIGKILL does it too, and the
+  minimise comes ~200 ms before WebKit reports the crash). Page surfaces now carry "<appId>.page" (override:
+  WPE_BROWSER_DEBUG_PAGE_APPID); they still show in the group, nothing appears in recents, the foreground app stays
+  ours. The compositor also kept the dead surface on the layer ("Layer already attached", fatal Wayland error 71 for
+  the next page): after a crash the UI makes a new layer "page-N" (wpeb_owner_renew_layer) and tells the engine
+  (WPE_APP_SET_LAYER, IPC v8), which re-attaches its views there.
+  Tried and dropped: _WEBOS_WINDOW_TYPE_OVERLAY (still minimised); relaunching itself (applicationManager/launch is
+  accepted but a minimised window stays minimised); SDL_RestoreWindow / fullscreen toggling (LG's SDL ignores them;
+  SDL_GetWindowWMInfo gives no shell surface to call set_state on).
+- Second crash, during hardware video (fixed in WebKit patch 0007): SIGSEGV on the main thread, fault 0x1,
+  g_object_set_valist -> param_spec_pool_hash. WebKit set urisourcebin's guint64 "ring-buffer-max-size" with an int
+  (2 * MB): on ARM32 the next property name is read from stack garbage. Runs for playbin3 + blob: (MSE) + preload auto.
+
+## 2026-11-11 LG's built-in browser (user request: why NetTV is unstyled there; how its media works)
+- com.webos.app.browser 6.5.6 = `chrome` launcher + lib/libcbe.so (103 MB, softfp, Chrome/87.0.4280.88): webOS "neva"
+  Chromium (neva_app_runtime, webos::WebViewBase) with LG's UI ("crow") and LG's closed webos_tv_impl media code.
+  WebAppMgr uses /usr/lib/libcbe.so (Chrome/79). Copies for analysis: scratchpad lgcbe/ (not in the repo).
+- NetTV is unstyled there because it ships Tailwind v4 CSS: everything inside @layer (Chrome 99+), color-mix/oklch
+  (111+), :has (105+), dvh (108+). Chrome 87 drops the @layer blocks. Its system log has nothing useful (PmLog only
+  shows SM_APPDRM lines).
+- Its media (from libcbe strings / source paths):
+  - MSE: WebMediaPlayerMSE -> MediaPlatformAPIWebOSTV (webos_tv_impl/media/webos_tv/media_platform_api_webos_tv.cc):
+    Chromium demuxes, then feeds BOTH audio and video ES to StarfishMediaAPIs (BUFFERSTREAM, FeedBuffer/FeedAudio,
+    bufferAddr/bufferSize), with video_preroll_msec, max_feed_ahead_msec, SetPlayRate, SeekInternal, HDR metadata,
+    DRM (WIDEVINE_MODULAR/PLAYREADY, svpVersion), windowId from a wl_webos_foreign video window
+    (ozone/media/video_window_controller_impl.cc, foreign_video_window_provider.cc); HoleFrameVideoDecoder punches the hole.
+  - Plain URLs (src=file.mp4, HLS): WebMediaPlayerUMS -> UMediaClientImpl -> uMediaServer::uMediaClient::loadAsync
+    (libumedia_api) with the URL, appId and windowId: LG's own pipeline fetches and plays the file.
+  - Also DirectMediaPlayer ("DIRECTMEDIA-ES-PLAYER"), TV/HbbTV/camera/WebRTC-game pipelines.
+
+## 2026-11-11 Audio into LG's pipeline (lip sync)
+- As LG's own browser (MediaPlatformAPIWebOSTV feeds audio and video ES to one StarfishMediaAPIs): rialtomseaudiosink
+  is now a bin that decides on its first caps. AAC of a playback whose video is on our hardware sink (window, Load
+  under 800 ms ago) and not muted -> WpebAudioHw: ADTS headers from codec_data, sync + 1 s ahead like the video, sent
+  over the video sink's connection (media IPC v3: AUDIO_FORMAT / AUDIO_NONE / AUDIO / TRACKS / VOLUME). Everything else
+  (page sounds, Opus, muted autoplay, audio-only) -> decodebin ! audioconvert ! audioresample ! pulsesink. Dynamically
+  added sinks have async=false (a prerolling one put the playing pipeline back to PAUSED: 18 s start on dash.js).
+- UI: the Load waits up to 1 s for the audio answer (not when TRACKS says no audio), then Loads video + AAC with the
+  kit's verified audio settings (needAudio, audioSync, 1 MB audio buffer, no low-delay); separate audio/video queues.
+- TV, dash.js BBB: one Load "H264 + AAC", resources VDEC + ADEC, audioSinkType main_sound, audio and video fed.
+  Volume/mute while on LG's pipeline: setVolume/setAudioMute JSON keys are guesses (LG's browser never sets them).

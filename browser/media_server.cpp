@@ -122,51 +122,76 @@ void MediaServer::accept_loop() {
 
 void MediaServer::serve(int fd, uint64_t id) {
     WNK_LOGI(kCat, "stream %llu connected", static_cast<unsigned long long>(id));
+    using Clock = std::chrono::steady_clock;
     std::vector<uint8_t> payload;
     std::atomic<uint64_t> units{0}, full_waits{0};
-    // Access units go to a queue fed to the decoder by their own thread, as a media player's feeder does: a
-    // decoder refusing data ("buffer full", e.g. while paused) then never holds up the control messages behind
-    // them (play, pause, seek). The sink is synchronised to the pipeline clock, so the queue stays short.
+    // Access units and audio frames go to queues fed to the decoder by their own thread, as a media player's feeder
+    // does: a decoder refusing data ("buffer full", e.g. while paused) never holds up the control messages behind
+    // them (play, pause, seek), and a full video buffer never holds up the audio (or the other way round): LG's
+    // pipeline waits for both before it plays.
     struct Unit {
         wnk::media::Packet packet;
         uint64_t generation;
     };
     std::mutex qm;
     std::condition_variable qcv;
-    std::deque<Unit> queue;
-    uint64_t generation = 0;  // qm; a flush or load drops what was queued before it
+    std::deque<Unit> queues[2];  // [0] video, [1] audio
+    uint64_t generation = 0;     // qm; a flush or load drops what was queued before it
     bool stop = false;
+    bool ready = false;          // qm; the decoder is loaded (units wait until then)
     std::thread feeder([&] {
+        Clock::time_point blocked_until[2] = {};
         std::unique_lock<std::mutex> ql(qm);
         for (;;) {
-            qcv.wait(ql, [&] { return stop || !queue.empty(); });
+            qcv.wait(ql, [&] { return stop || (ready && (!queues[0].empty() || !queues[1].empty())); });
             if (stop) return;
-            Unit &u = queue.front();
+            const auto now = Clock::now();
+            int pick = -1;
+            for (int t = 0; t < 2; ++t) {
+                if (queues[t].empty() || blocked_until[t] > now) continue;
+                if (pick < 0 || queues[t].front().packet.pts_us < queues[pick].front().packet.pts_us) pick = t;
+            }
+            if (pick < 0) {
+                const uint64_t g = generation;
+                qcv.wait_for(ql, std::chrono::milliseconds(10), [&] { return stop || generation != g; });
+                continue;
+            }
+            Unit &u = queues[pick].front();
             const uint64_t g = u.generation;
             ql.unlock();
             bool full = false;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 if (owner_.load() == id && backend_ && (use_lg_ || ndl_loaded_)) {
-                    full = use_lg_ ? lg_.feed_video(u.packet.data.data(), u.packet.data.size(), u.packet.pts_us) ==
-                                         LgMediaPlayer::Feed::Full
-                                   : backend_->feed(u.packet) == wnk::media::MediaBackend::Feed::Full;
+                    if (use_lg_) {
+                        if (pick == 0 || lg_.has_audio())
+                            full = lg_.feed(pick == 1, u.packet.data.data(), u.packet.data.size(), u.packet.pts_us) ==
+                                   LgMediaPlayer::Feed::Full;
+                    } else if (pick == 0) {
+                        full = backend_->feed(u.packet) == wnk::media::MediaBackend::Feed::Full;
+                    }
                 }
             }
             ql.lock();
             if (full && generation == g) {
                 ++full_waits;
-                qcv.wait_for(ql, std::chrono::milliseconds(10), [&] { return stop || generation != g; });
+                blocked_until[pick] = Clock::now() + std::chrono::milliseconds(10);
                 continue;
             }
-            if (!queue.empty() && queue.front().generation == g) queue.pop_front();
-            ++units;
+            if (!queues[pick].empty() && queues[pick].front().generation == g) queues[pick].pop_front();
+            if (pick == 0) ++units;
         }
     });
     const auto drop_queued = [&] {
         std::lock_guard<std::mutex> ql(qm);
-        queue.clear();
+        queues[0].clear();
+        queues[1].clear();
         ++generation;
+        qcv.notify_all();
+    };
+    const auto set_ready = [&](bool r) {
+        std::lock_guard<std::mutex> ql(qm);
+        ready = r;
         qcv.notify_all();
     };
     const auto release = [&] {
@@ -181,101 +206,179 @@ void MediaServer::serve(int fd, uint64_t id) {
                      static_cast<unsigned long long>(full_waits.load()));
         }
     };
+
+    // The video's Load waits for the audio side's answer (AUDIO_FORMAT or AUDIO_NONE), as LG's pipeline takes both
+    // codecs at once, unless the stream has no audio or the answer does not come within kAudioWait.
+    constexpr auto kAudioWait = std::chrono::milliseconds(1000);
+    enum class AudioState { Unknown, None, Hardware } audio_state = AudioState::Unknown;
+    WpebMediaAudio audio_format{};
+    bool no_audio_track = false;
+    bool load_pending = false;
+    WpebMediaLoad pending{};
+    Clock::time_point load_at{};
+
+    const auto do_load = [&](const WpebMediaLoad &l) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!backend_) return;
+        auto &b = *backend_;
+        wnk::media::StreamFormat f;
+        wnk::media::VideoFormat v;
+        v.codec = l.codec == WPEB_MEDIA_H264 ? wnk::media::CodecId::H264
+                  : l.codec == WPEB_MEDIA_HEVC ? wnk::media::CodecId::Hevc
+                  : l.codec == WPEB_MEDIA_VP9  ? wnk::media::CodecId::Vp9
+                                               : wnk::media::CodecId::Av1;
+        v.width = static_cast<int>(l.width);
+        v.height = static_cast<int>(l.height);
+        v.frame_rate = l.fps_milli / 1000.0;
+        f.video = v;
+        std::string error;
+        // One decoder per app: the newest stream takes it (another tab or element loses its picture).
+        lg_.unload();
+        if (ndl_loaded_) b.unload();
+        use_lg_ = ndl_loaded_ = false;
+        owner_ = id;
+        units = 0;
+        full_waits = 0;
+        const bool with_audio = audio_state == AudioState::Hardware;
+        if (l.window_id[0] && LgMediaPlayer::available()) {
+            const LgMediaPlayer::Codec c = l.codec == WPEB_MEDIA_H264 ? LgMediaPlayer::Codec::H264
+                                           : l.codec == WPEB_MEDIA_HEVC ? LgMediaPlayer::Codec::Hevc
+                                           : l.codec == WPEB_MEDIA_VP9  ? LgMediaPlayer::Codec::Vp9
+                                                                        : LgMediaPlayer::Codec::Av1;
+            LgMediaPlayer::Audio a;
+            a.rate = static_cast<int>(audio_format.rate);
+            a.channels = static_cast<int>(audio_format.channels);
+            use_lg_ = lg_.load("org.sostk.wpebrowser", l.window_id, c, static_cast<int>(l.width),
+                               static_cast<int>(l.height), l.fps_milli / 1000.0, with_audio ? &a : nullptr, &error);
+            if (!use_lg_) WNK_LOGW(kCat, "stream %llu: LG media pipeline: %s; trying NDL", static_cast<unsigned long long>(id), error.c_str());
+        }
+        if (!use_lg_) {
+            error.clear();
+            ndl_loaded_ = b.load(f, &error);
+        }
+        if (use_lg_ || ndl_loaded_)
+            WNK_LOGI(kCat, "stream %llu: %s for %s %ux%u @ %.2f fps%s%s%s", static_cast<unsigned long long>(id),
+                     use_lg_ ? "LG media pipeline" : "NDL", codec_label(l.codec), l.width, l.height, l.fps_milli / 1000.0,
+                     use_lg_ && with_audio ? " with its AAC audio" : "", l.window_id[0] ? ", window " : "", l.window_id);
+        else
+            WNK_LOGW(kCat, "stream %llu: decoder load failed: %s", static_cast<unsigned long long>(id), error.c_str());
+    };
+    const auto maybe_load = [&] {
+        if (!load_pending) return;
+        const bool waited = Clock::now() - load_at >= kAudioWait;
+        if (audio_state == AudioState::Unknown && !no_audio_track && !waited) return;
+        if (audio_state == AudioState::Unknown && waited)
+            WNK_LOGW(kCat, "stream %llu: no word from the audio side: video only", static_cast<unsigned long long>(id));
+        load_pending = false;
+        do_load(pending);
+        set_ready(true);
+    };
+
     for (;;) {
+        pollfd pfd{fd, POLLIN, 0};
+        const int pr = ::poll(&pfd, 1, load_pending ? 100 : -1);
+        if (pr < 0 && errno == EINTR) continue;
+        if (pr < 0) break;
+        if (pr == 0) {
+            maybe_load();
+            continue;
+        }
         WpebMediaHeader h;
         if (!read_all(fd, &h, sizeof(h)) || h.size > WPEB_MEDIA_MAX_PAYLOAD) break;
         payload.resize(h.size);
         if (h.size && !read_all(fd, payload.data(), h.size)) break;
         if (h.type == WPEB_MEDIA_UNLOAD) {
             drop_queued();
+            set_ready(false);
+            load_pending = false;
             release();
             continue;
         }
-        if (h.type == WPEB_MEDIA_VIDEO) {
+        if (h.type == WPEB_MEDIA_VIDEO || h.type == WPEB_MEDIA_AUDIO) {
+            const bool audio = h.type == WPEB_MEDIA_AUDIO;
+            if (audio && audio_state != AudioState::Hardware) continue;
             Unit u;
-            u.packet.type = wnk::media::TrackType::Video;
+            u.packet.type = audio ? wnk::media::TrackType::Audio : wnk::media::TrackType::Video;
             u.packet.pts_us = h.pts_us;
             u.packet.data.assign(payload.begin(), payload.end());
             std::lock_guard<std::mutex> ql(qm);
             u.generation = generation;
-            queue.push_back(std::move(u));
+            queues[audio ? 1 : 0].push_back(std::move(u));
             qcv.notify_all();
             continue;
         }
-        if (h.type == WPEB_MEDIA_LOAD || h.type == WPEB_MEDIA_FLUSH) drop_queued();
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (!backend_) break;
-        auto &b = *backend_;
         switch (h.type) {
         case WPEB_MEDIA_LOAD: {
             if (h.size < sizeof(WpebMediaLoad)) break;
-            WpebMediaLoad l;
-            std::memcpy(&l, payload.data(), sizeof(l));
-            l.window_id[sizeof(l.window_id) - 1] = '\0';
-            wnk::media::StreamFormat f;
-            wnk::media::VideoFormat v;
-            v.codec = l.codec == WPEB_MEDIA_H264 ? wnk::media::CodecId::H264
-                      : l.codec == WPEB_MEDIA_HEVC ? wnk::media::CodecId::Hevc
-                      : l.codec == WPEB_MEDIA_VP9  ? wnk::media::CodecId::Vp9
-                                                   : wnk::media::CodecId::Av1;
-            v.width = static_cast<int>(l.width);
-            v.height = static_cast<int>(l.height);
-            v.frame_rate = l.fps_milli / 1000.0;
-            f.video = v;
-            std::string error;
-            // One decoder per app: the newest stream takes it (another tab or element loses its picture).
-            lg_.unload();
-            if (ndl_loaded_) b.unload();
-            use_lg_ = ndl_loaded_ = false;
-            owner_ = id;
-            units = 0;
-            full_waits = 0;
-            if (l.window_id[0] && LgMediaPlayer::available()) {
-                const LgMediaPlayer::Codec c = l.codec == WPEB_MEDIA_H264 ? LgMediaPlayer::Codec::H264
-                                               : l.codec == WPEB_MEDIA_HEVC ? LgMediaPlayer::Codec::Hevc
-                                               : l.codec == WPEB_MEDIA_VP9  ? LgMediaPlayer::Codec::Vp9
-                                                                            : LgMediaPlayer::Codec::Av1;
-                use_lg_ = lg_.load("org.sostk.wpebrowser", l.window_id, c, static_cast<int>(l.width),
-                                   static_cast<int>(l.height), l.fps_milli / 1000.0, &error);
-                if (!use_lg_) WNK_LOGW(kCat, "stream %llu: LG media pipeline: %s; trying NDL", static_cast<unsigned long long>(id), error.c_str());
-            }
-            if (!use_lg_) {
-                error.clear();
-                ndl_loaded_ = b.load(f, &error);
-            }
-            if (use_lg_ || ndl_loaded_)
-                WNK_LOGI(kCat, "stream %llu: %s for %s %ux%u @ %.2f fps%s%s", static_cast<unsigned long long>(id),
-                         use_lg_ ? "LG media pipeline" : "NDL", codec_label(l.codec), l.width, l.height, l.fps_milli / 1000.0,
-                         l.window_id[0] ? ", window " : "", l.window_id);
-            else
-                WNK_LOGW(kCat, "stream %llu: decoder load failed: %s", static_cast<unsigned long long>(id), error.c_str());
+            drop_queued();
+            set_ready(false);
+            std::memcpy(&pending, payload.data(), sizeof(pending));
+            pending.window_id[sizeof(pending.window_id) - 1] = '\0';
+            load_pending = true;
+            load_at = Clock::now();
+            maybe_load();
             break;
         }
-        case WPEB_MEDIA_FLUSH:
+        case WPEB_MEDIA_AUDIO_FORMAT:
+            if (h.size >= sizeof(WpebMediaAudio)) {
+                std::memcpy(&audio_format, payload.data(), sizeof(audio_format));
+                audio_state = AudioState::Hardware;
+                WNK_LOGI(kCat, "stream %llu: AAC %u Hz, %u channels goes with the video", static_cast<unsigned long long>(id),
+                         audio_format.rate, audio_format.channels);
+                maybe_load();
+            }
+            break;
+        case WPEB_MEDIA_AUDIO_NONE:
+            audio_state = AudioState::None;
+            maybe_load();
+            break;
+        case WPEB_MEDIA_TRACKS:
+            if (h.size >= sizeof(uint32_t)) {
+                uint32_t has_audio;
+                std::memcpy(&has_audio, payload.data(), sizeof(has_audio));
+                no_audio_track = has_audio == 0;
+                maybe_load();
+            }
+            break;
+        case WPEB_MEDIA_FLUSH: {
+            drop_queued();
+            std::lock_guard<std::mutex> lock(mutex_);
             if (owner_.load() == id) {
                 std::string error;
                 if (use_lg_) lg_.flush();
-                else if (ndl_loaded_) b.flush(&error);
+                else if (ndl_loaded_ && backend_) backend_->flush(&error);
             }
             break;
+        }
         case WPEB_MEDIA_AREA: {
             if (h.size < sizeof(WpebMediaArea)) break;
             WpebMediaArea a;
             std::memcpy(&a, payload.data(), sizeof(a));
-            if (a.width > 0 && a.height > 0 && (owner_.load() == id || owner_.load() == 0)) {
-                if (!use_lg_) b.set_area(wnk::Rect{static_cast<float>(a.x), static_cast<float>(a.y), static_cast<float>(a.width),
-                                     static_cast<float>(a.height)});
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (backend_ && a.width > 0 && a.height > 0 && (owner_.load() == id || owner_.load() == 0) && !use_lg_)
+                backend_->set_area(wnk::Rect{static_cast<float>(a.x), static_cast<float>(a.y), static_cast<float>(a.width),
+                                             static_cast<float>(a.height)});
+            break;
+        }
+        case WPEB_MEDIA_PAUSE: {
+            if (h.size < sizeof(uint32_t)) break;
+            uint32_t paused;
+            std::memcpy(&paused, payload.data(), sizeof(paused));
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (owner_.load() == id) {
+                if (use_lg_) lg_.pause(paused != 0);
+                else if (ndl_loaded_ && backend_) backend_->pause(paused != 0);
             }
             break;
         }
-        case WPEB_MEDIA_PAUSE:
-            if (owner_.load() == id && h.size >= sizeof(uint32_t)) {
-                uint32_t paused;
-                std::memcpy(&paused, payload.data(), sizeof(paused));
-                if (use_lg_) lg_.pause(paused != 0);
-                else if (ndl_loaded_) b.pause(paused != 0);
-            }
+        case WPEB_MEDIA_VOLUME: {
+            if (h.size < sizeof(WpebMediaVolume)) break;
+            WpebMediaVolume v;
+            std::memcpy(&v, payload.data(), sizeof(v));
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (owner_.load() == id && use_lg_) lg_.set_volume(v.permille, v.muted != 0);
             break;
+        }
         default:
             break;
         }

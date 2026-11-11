@@ -1,0 +1,22 @@
+From: sostk
+Subject: [PATCH] GStreamer: pass ring-buffer-max-size as guint64
+
+urisourcebin's "ring-buffer-max-size" is a guint64 property, but WebKit passed
+2 * MB, an int, through g_object_set()'s varargs. On 32-bit ARM (EABI) the
+64-bit value is read from an aligned register pair and the next property name
+from whatever follows on the stack: g_object_set_valist() then looks up a
+garbage pointer and the web process crashes (SIGSEGV, fault address 0x1, in
+param_spec_pool_hash) when an MSE/blob: video is set up with playbin3.
+
+---
+--- a/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp	2026-11-11 16:48:28.819616884 +1100
++++ b/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp	2026-11-11 16:48:28.820671524 +1100
+@@ -2681,7 +2681,7 @@
+     // mode. Some demuxers (matroskademux) don't work as well in push mode.
+     if (nameView.startsWith("urisourcebin"_s) && !m_isLegacyPlaybin && m_preload == MediaPlayer::Preload::Auto) {
+         if (isBlob)
+-            g_object_set(element, "ring-buffer-max-size", 2 * MB, nullptr);
++            g_object_set(element, "ring-buffer-max-size", static_cast<guint64>(2 * MB), nullptr);
+         else if (!isMediaSource() && !isMediaStreamPlayer())
+             g_object_set(element, "download", TRUE, nullptr);
+     }

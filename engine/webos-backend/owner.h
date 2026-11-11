@@ -26,6 +26,9 @@ void wpeb_owner_set_z(struct wpeb_owner *owner, int z_index);
 // Page surfaces attached to the layer right now.
 int wpeb_owner_attached(struct wpeb_owner *owner);
 void wpeb_owner_destroy(struct wpeb_owner *owner);
+// Replaces the page layer with a new one named `layer` (same z). After a web process died, the compositor can keep
+// its surface on the old layer ("Layer already attached" for the next page). False on a Wayland error.
+int wpeb_owner_renew_layer(struct wpeb_owner *owner, const char *layer);
 
 #ifdef __cplusplus
 }

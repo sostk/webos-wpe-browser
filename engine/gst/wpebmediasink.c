@@ -11,11 +11,14 @@
  *
  *   rialtomsevideosink: encoded H.264/HEVC (Annex B, whole access units) or VP9, sent to the UI process at the
  *     pipeline clock's pace (a sync sink), which feeds LG's decoder (NDL). The picture is on the video plane.
- *   rialtomseaudiosink: audio stays in software for now (audioconvert ! audioresample ! pulsesink). It also
- *     plays every page sound, and LG's decoder has one session per app: a click sound must not take it.
+ *   rialtomseaudiosink: a bin that decides on its first caps. AAC of a playback whose video is on the sink above
+ *     (and not muted) goes to the same LG pipeline as the video, over the video sink's connection: LG's pipeline
+ *     then keeps them in sync, as Chromium on webOS does (MediaPlatformAPIWebOSTV feeds both). Everything else
+ *     (page sounds, Opus, muted autoplay) is decoded here and played by PulseAudio: LG's pipeline is one per app.
  */
 #include "wpe_media_ipc.h"
 
+#include <gst/audio/streamvolume.h>
 #include <gst/base/gstbasesink.h>
 #include <gst/gst.h>
 
@@ -75,7 +78,13 @@ struct _WpebVideoSink {
     gboolean have_window;
     GByteArray *parameter_sets; /* Annex B */
     GByteArray *scratch;
+    gint64 load_time;     /* monotonic µs of the last LOAD (g_caps_lock): the audio sink must decide soon after */
+    gboolean tracks_sent;
 };
+
+/* Video caps arriving (an audio sink waiting to know whether this playback has video on the LG pipeline). */
+static GMutex g_caps_lock;
+static GCond g_caps_cond;
 
 G_DEFINE_TYPE(WpebVideoSink, wpeb_video_sink, GST_TYPE_BASE_SINK)
 
@@ -316,6 +325,7 @@ static gboolean wpeb_video_sink_set_caps(GstBaseSink *sink, GstCaps *caps)
     if (load.codec == self->codec)
         return TRUE;
     self->codec = load.codec;
+    self->tracks_sent = FALSE;
     video_window_init();
     if (video_window.open && !self->have_window && !g_getenv("WPE_BROWSER_DEBUG_NO_VIDEO_WINDOW"))
         self->have_window = video_window.open(load.window_id, sizeof(load.window_id), 1000) != 0;
@@ -328,12 +338,45 @@ static gboolean wpeb_video_sink_set_caps(GstBaseSink *sink, GstCaps *caps)
             video_window.place(width, height, self->area.x, self->area.y, self->area.width, self->area.height);
         g_mutex_unlock(&self->lock);
     }
-    return send_msg(self, WPEB_MEDIA_LOAD, 0, &load, sizeof(load));
+    gboolean sent = send_msg(self, WPEB_MEDIA_LOAD, 0, &load, sizeof(load));
+    g_mutex_lock(&g_caps_lock);
+    self->load_time = g_get_monotonic_time();
+    g_cond_broadcast(&g_caps_cond);
+    g_mutex_unlock(&g_caps_lock);
+    return sent;
+}
+
+/* Whether the stream collection (decodebin3 forwards it downstream) has an audio stream: -1 unknown. */
+static int collection_has_audio(GstPad *pad)
+{
+    GstEvent *e = gst_pad_get_sticky_event(pad, GST_EVENT_STREAM_COLLECTION, 0);
+    if (!e)
+        return -1;
+    GstStreamCollection *c = NULL;
+    gst_event_parse_stream_collection(e, &c);
+    int audio = c ? 0 : -1;
+    for (guint i = 0; c && i < gst_stream_collection_get_size(c); ++i) {
+        if (gst_stream_get_stream_type(gst_stream_collection_get_stream(c, i)) & GST_STREAM_TYPE_AUDIO)
+            audio = 1;
+    }
+    if (c)
+        gst_object_unref(c);
+    gst_event_unref(e);
+    return audio;
 }
 
 static GstFlowReturn wpeb_video_sink_render(GstBaseSink *sink, GstBuffer *buffer)
 {
     WpebVideoSink *self = WPEB_VIDEO_SINK(sink);
+    if (!self->tracks_sent) {
+        /* The UI holds LG's Load for the audio side's answer; a stream without audio need not wait. */
+        self->tracks_sent = TRUE;
+        int audio = collection_has_audio(GST_BASE_SINK_PAD(sink));
+        if (audio >= 0) {
+            uint32_t has_audio = (uint32_t)audio;
+            send_msg(self, WPEB_MEDIA_TRACKS, 0, &has_audio, sizeof(has_audio));
+        }
+    }
     GstClockTime pts = GST_BUFFER_PTS_IS_VALID(buffer) ? GST_BUFFER_PTS(buffer) : GST_BUFFER_DTS(buffer);
     /* Media time, as Chromium feeds LG's pipeline (a seek re-anchors it there: WPEB_MEDIA_FLUSH). */
     guint64 stream = gst_segment_to_stream_time(&sink->segment, GST_FORMAT_TIME, pts);
@@ -478,48 +521,397 @@ static void wpeb_video_sink_class_init(WpebVideoSinkClass *klass)
         "Sends encoded video to the browser UI, which decodes it on LG's video plane", "wpebrowser");
 }
 
-/* ---- audio sink ------------------------------------------------------------------------------------------- */
+/* ---- audio: LG's pipeline (hardware) ---------------------------------------------------------------------- */
+
+/* The video sink of the pipeline `element` is in (a new reference), or NULL. */
+static WpebVideoSink *find_video_sink(GstElement *element)
+{
+    GstObject *top = gst_object_ref(GST_OBJECT(element));
+    for (GstObject *p; (p = gst_object_get_parent(top));) {
+        gst_object_unref(top);
+        top = p;
+    }
+    WpebVideoSink *found = NULL;
+    if (GST_IS_BIN(top)) {
+        GstIterator *it = gst_bin_iterate_recurse(GST_BIN(top));
+        GValue v = G_VALUE_INIT;
+        while (!found && gst_iterator_next(it, &v) == GST_ITERATOR_OK) {
+            GstElement *e = g_value_get_object(&v);
+            if (WPEB_IS_VIDEO_SINK(e))
+                found = WPEB_VIDEO_SINK(gst_object_ref(e));
+            g_value_reset(&v);
+        }
+        g_value_unset(&v);
+        gst_iterator_free(it);
+    }
+    gst_object_unref(top);
+    return found;
+}
+
+#define WPEB_TYPE_AUDIO_HW (wpeb_audio_hw_get_type())
+G_DECLARE_FINAL_TYPE(WpebAudioHw, wpeb_audio_hw, WPEB, AUDIO_HW, GstBaseSink)
+
+struct _WpebAudioHw {
+    GstBaseSink parent;
+    WpebVideoSink *video; /* whose connection carries the audio */
+    gboolean adts;        /* the stream already has ADTS headers */
+    guint8 profile, freq_index, channel_config;
+    GByteArray *frame;
+    guint64 sent;
+};
+
+G_DEFINE_TYPE(WpebAudioHw, wpeb_audio_hw, GST_TYPE_BASE_SINK)
+
+static GstStaticPadTemplate audio_hw_template = GST_STATIC_PAD_TEMPLATE("sink", GST_PAD_SINK, GST_PAD_ALWAYS,
+    GST_STATIC_CAPS("audio/mpeg, mpegversion = (int) { 2, 4 }, stream-format = (string) { raw, adts }"));
+
+static gboolean wpeb_audio_hw_set_caps(GstBaseSink *sink, GstCaps *caps)
+{
+    WpebAudioHw *self = WPEB_AUDIO_HW(sink);
+    GstStructure *s = gst_caps_get_structure(caps, 0);
+    const char *format = gst_structure_get_string(s, "stream-format");
+    int rate = 0, channels = 0;
+    gst_structure_get_int(s, "rate", &rate);
+    gst_structure_get_int(s, "channels", &channels);
+    self->adts = format && g_str_equal(format, "adts");
+    if (!self->adts) {
+        /* MP4's raw AAC: an ADTS header per frame, from the AudioSpecificConfig (ISO 14496-3 1.6.2.1), as Chromium's
+         * FFmpegAACBitstreamConverter does for LG's pipeline. HE-AAC plays as its AAC-LC core (SBR is implicit). */
+        const GValue *v = gst_structure_get_value(s, "codec_data");
+        GstBuffer *cd = v && G_VALUE_HOLDS(v, GST_TYPE_BUFFER) ? gst_value_get_buffer(v) : NULL;
+        GstMapInfo m;
+        if (!cd || !gst_buffer_map(cd, &m, GST_MAP_READ) || m.size < 2) {
+            GST_ELEMENT_ERROR(self, STREAM, FORMAT, ("AAC without codec_data"), (NULL));
+            return FALSE;
+        }
+        guint object = m.data[0] >> 3;
+        self->freq_index = (guint8)(((m.data[0] & 7) << 1) | (m.data[1] >> 7));
+        self->channel_config = (guint8)((m.data[1] >> 3) & 0xf);
+        gst_buffer_unmap(cd, &m);
+        self->profile = (guint8)(object >= 1 && object <= 4 ? object - 1 : 1);
+        if (self->freq_index > 12) {
+            GST_ELEMENT_ERROR(self, STREAM, FORMAT, ("Unsupported AAC sampling rate"), (NULL));
+            return FALSE;
+        }
+    }
+    WpebMediaAudio a = {WPEB_MEDIA_AAC, (uint32_t)rate, (uint32_t)channels};
+    GST_INFO_OBJECT(self, "caps %" GST_PTR_FORMAT, caps);
+    return self->video && send_msg(self->video, WPEB_MEDIA_AUDIO_FORMAT, 0, &a, sizeof(a));
+}
+
+static GstFlowReturn wpeb_audio_hw_render(GstBaseSink *sink, GstBuffer *buffer)
+{
+    WpebAudioHw *self = WPEB_AUDIO_HW(sink);
+    GstClockTime pts = GST_BUFFER_PTS_IS_VALID(buffer) ? GST_BUFFER_PTS(buffer) : GST_BUFFER_DTS(buffer);
+    guint64 stream = gst_segment_to_stream_time(&sink->segment, GST_FORMAT_TIME, pts);
+    int64_t pts_us = GST_CLOCK_TIME_IS_VALID(stream) ? (int64_t)(stream / 1000) : 0;
+    GstMapInfo map;
+    if (!gst_buffer_map(buffer, &map, GST_MAP_READ))
+        return GST_FLOW_ERROR;
+    const guint8 *data = map.data;
+    gsize size = map.size;
+    if (!self->adts) {
+        gsize len = map.size + 7;
+        guint8 h[7] = {
+            0xff, 0xf1, /* sync, MPEG-4, layer 0, no CRC */
+            (guint8)((self->profile << 6) | (self->freq_index << 2) | (self->channel_config >> 2)),
+            (guint8)(((self->channel_config & 3) << 6) | ((len >> 11) & 3)),
+            (guint8)((len >> 3) & 0xff),
+            (guint8)(((len & 7) << 5) | 0x1f),
+            0xfc,
+        };
+        g_byte_array_set_size(self->frame, 0);
+        g_byte_array_append(self->frame, h, 7);
+        g_byte_array_append(self->frame, map.data, (guint)map.size);
+        data = self->frame->data;
+        size = self->frame->len;
+    }
+    /* A failed send means the video sink has stopped (or the UI is gone, which the video sink reports): the
+     * audio has nowhere to go and is dropped quietly. */
+    if (!self->video || !send_msg(self->video, WPEB_MEDIA_AUDIO, pts_us, data, (uint32_t)size))
+        GST_DEBUG_OBJECT(self, "audio frame dropped: no media connection");
+    gst_buffer_unmap(buffer, &map);
+    if (++self->sent == 1)
+        GST_INFO_OBJECT(self, "first audio frame: media time %" G_GINT64_FORMAT " us", pts_us);
+    return GST_FLOW_OK;
+}
+
+static void wpeb_audio_hw_finalize(GObject *object)
+{
+    WpebAudioHw *self = WPEB_AUDIO_HW(object);
+    if (self->video)
+        gst_object_unref(self->video);
+    g_byte_array_unref(self->frame);
+    G_OBJECT_CLASS(wpeb_audio_hw_parent_class)->finalize(object);
+}
+
+static void wpeb_audio_hw_init(WpebAudioHw *self)
+{
+    self->frame = g_byte_array_new();
+    /* Paced like the video (same clock, same second ahead): LG's pipeline syncs them by their timestamps. */
+    gst_base_sink_set_sync(GST_BASE_SINK(self), TRUE);
+    gst_base_sink_set_max_lateness(GST_BASE_SINK(self), -1);
+    gst_base_sink_set_qos_enabled(GST_BASE_SINK(self), FALSE);
+    gst_base_sink_set_ts_offset(GST_BASE_SINK(self), -(GstClockTimeDiff)GST_SECOND);
+    /* Added to a running pipeline (see wpeb_audio_sink_build): a sink that prerolls would put it back to PAUSED
+     * until someone sets it playing again (18 s on dash.js, TV 2026-11-11). The video sink prerolls for both. */
+    gst_base_sink_set_async_enabled(GST_BASE_SINK(self), FALSE);
+}
+
+static void wpeb_audio_hw_class_init(WpebAudioHwClass *klass)
+{
+    G_OBJECT_CLASS(klass)->finalize = wpeb_audio_hw_finalize;
+    GST_BASE_SINK_CLASS(klass)->set_caps = wpeb_audio_hw_set_caps;
+    GST_BASE_SINK_CLASS(klass)->render = wpeb_audio_hw_render;
+    gst_element_class_add_static_pad_template(GST_ELEMENT_CLASS(klass), &audio_hw_template);
+    gst_element_class_set_static_metadata(GST_ELEMENT_CLASS(klass), "webOS browser hardware audio", "Sink/Audio/Hardware",
+        "AAC to LG's media pipeline, with the playback's hardware video", "wpebrowser");
+}
+
+/* ---- audio sink: the bin WebKit uses ---------------------------------------------------------------------- */
 
 #define WPEB_TYPE_AUDIO_SINK (wpeb_audio_sink_get_type())
 G_DECLARE_FINAL_TYPE(WpebAudioSink, wpeb_audio_sink, WPEB, AUDIO_SINK, GstBin)
 
 struct _WpebAudioSink {
     GstBin parent;
+    GstPad *ghost;
+    GstElement *pulse; /* software path's sink (volume and mute go there) */
+    GstElement *hw;    /* hardware path */
+    gboolean built;
+    double volume;
+    gboolean mute;
 };
 
-G_DEFINE_TYPE(WpebAudioSink, wpeb_audio_sink, GST_TYPE_BIN)
+static void wpeb_audio_sink_stream_volume_init(GstStreamVolumeInterface *iface) { (void)iface; }
 
-static GstStaticPadTemplate audio_sink_template
-    = GST_STATIC_PAD_TEMPLATE("sink", GST_PAD_SINK, GST_PAD_ALWAYS, GST_STATIC_CAPS("audio/x-raw"));
+G_DEFINE_TYPE_WITH_CODE(WpebAudioSink, wpeb_audio_sink, GST_TYPE_BIN,
+    G_IMPLEMENT_INTERFACE(GST_TYPE_STREAM_VOLUME, wpeb_audio_sink_stream_volume_init))
+
+enum { AUDIO_PROP_0, AUDIO_PROP_VOLUME, AUDIO_PROP_MUTE };
+
+/* What decodebin3 may hand over undecoded: AAC (for the hardware path, or decoded here) and raw audio. */
+static GstStaticPadTemplate audio_sink_template = GST_STATIC_PAD_TEMPLATE("sink", GST_PAD_SINK, GST_PAD_ALWAYS,
+    GST_STATIC_CAPS("audio/x-raw; audio/mpeg, mpegversion = (int) { 2, 4 }, stream-format = (string) { raw, adts }"));
+
+static gboolean is_aac(GstCaps *caps)
+{
+    GstStructure *s = gst_caps_get_structure(caps, 0);
+    int version = 0;
+    return g_str_equal(gst_structure_get_name(s), "audio/mpeg") && gst_structure_get_int(s, "mpegversion", &version)
+        && (version == 2 || version == 4);
+}
+
+/* The video sink of this playback, if its video is on LG's pipeline and its Load was moments ago (the UI holds the
+ * Load for this answer for a second). Waits a little for video caps that have not come yet. */
+static WpebVideoSink *hardware_partner(WpebAudioSink *self)
+{
+    WpebVideoSink *video = find_video_sink(GST_ELEMENT(self));
+    if (!video)
+        return NULL;
+    gint64 deadline = g_get_monotonic_time() + 400 * G_TIME_SPAN_MILLISECOND;
+    gboolean ok = FALSE;
+    g_mutex_lock(&g_caps_lock);
+    for (;;) {
+        g_mutex_lock(&video->lock);
+        gboolean ready = video->codec != 0 && video->fd >= 0 && video->have_window;
+        g_mutex_unlock(&video->lock);
+        if (ready) {
+            ok = g_get_monotonic_time() - video->load_time < 800 * G_TIME_SPAN_MILLISECOND;
+            break;
+        }
+        if (!g_cond_wait_until(&g_caps_cond, &g_caps_lock, deadline))
+            break;
+    }
+    g_mutex_unlock(&g_caps_lock);
+    if (!ok) {
+        gst_object_unref(video);
+        return NULL;
+    }
+    return video;
+}
+
+static void decodebin_pad_added(GstElement *decodebin, GstPad *pad, gpointer next)
+{
+    (void)decodebin;
+    GstPad *sinkpad = gst_element_get_static_pad(GST_ELEMENT(next), "sink");
+    if (!gst_pad_is_linked(sinkpad))
+        gst_pad_link(pad, sinkpad);
+    gst_object_unref(sinkpad);
+}
+
+static GstElement *make_software_chain(WpebAudioSink *self, gboolean decode)
+{
+    GstElement *first = NULL, *prev = NULL;
+    const char *names[] = {decode ? "decodebin" : NULL, "audioconvert", "audioresample", "pulsesink"};
+    for (guint i = 0; i < G_N_ELEMENTS(names); ++i) {
+        if (!names[i])
+            continue;
+        GstElement *e = gst_element_factory_make(names[i], NULL);
+        if (!e) {
+            GST_ERROR_OBJECT(self, "%s missing", names[i]);
+            return NULL;
+        }
+        gst_bin_add(GST_BIN(self), e);
+        if (!first)
+            first = e;
+        if (prev && decode && prev == first) {
+            /* decodebin's source pad appears with the stream */
+            g_signal_connect_object(prev, "pad-added", G_CALLBACK(decodebin_pad_added), e, 0);
+        } else if (prev) {
+            gst_element_link(prev, e);
+        }
+        prev = e;
+    }
+    self->pulse = prev;
+    /* The pipeline's clock must not be the sound server's: a PulseAudio stream that has not started (or is held)
+     * does not advance it, and the video, fed to LG's pipeline against that clock, froze with it (TV, 2026-11-11). */
+    g_object_set(self->pulse, "provide-clock", FALSE, "volume", self->volume, "mute", self->mute, NULL);
+    /* Added to a running pipeline: no preroll of its own (see wpeb_audio_hw_init). */
+    g_object_set(self->pulse, "async", FALSE, NULL);
+    return first;
+}
+
+/* The first caps decide the path; later caps go to what was built. */
+static gboolean wpeb_audio_sink_build(WpebAudioSink *self, GstCaps *caps)
+{
+    gboolean aac = is_aac(caps);
+    WpebVideoSink *video = NULL;
+    if (aac && !self->mute && self->volume > 0.001 && !g_getenv("WPE_BROWSER_DEBUG_NO_HW_AUDIO"))
+        video = hardware_partner(self);
+    GstElement *first;
+    if (video) {
+        self->hw = g_object_new(WPEB_TYPE_AUDIO_HW, NULL);
+        WPEB_AUDIO_HW(self->hw)->video = video;
+        gst_bin_add(GST_BIN(self), self->hw);
+        first = self->hw;
+        GST_INFO_OBJECT(self, "AAC with hardware video: LG's media pipeline plays it");
+    } else {
+        if (aac) {
+            /* The UI may be holding LG's Load for this playback's audio: tell it to go ahead without. */
+            WpebVideoSink *v = find_video_sink(GST_ELEMENT(self));
+            if (v) {
+                send_msg(v, WPEB_MEDIA_AUDIO_NONE, 0, NULL, 0);
+                gst_object_unref(v);
+            }
+        }
+        first = make_software_chain(self, aac);
+        if (!first)
+            return FALSE;
+        GST_INFO_OBJECT(self, "%s: software audio (PulseAudio)", aac ? "AAC" : "raw audio");
+    }
+    GstPad *target = gst_element_get_static_pad(first, "sink");
+    gst_ghost_pad_set_target(GST_GHOST_PAD(self->ghost), target);
+    gst_object_unref(target);
+    /* Children follow the bin's current state (we are in its streaming thread, it is at least PAUSED). */
+    GstIterator *it = gst_bin_iterate_elements(GST_BIN(self));
+    GValue v = G_VALUE_INIT;
+    while (gst_iterator_next(it, &v) == GST_ITERATOR_OK) {
+        gst_element_sync_state_with_parent(GST_ELEMENT(g_value_get_object(&v)));
+        g_value_reset(&v);
+    }
+    g_value_unset(&v);
+    gst_iterator_free(it);
+    self->built = TRUE;
+    return TRUE;
+}
+
+static gboolean wpeb_audio_sink_pad_event(GstPad *pad, GstObject *parent, GstEvent *event)
+{
+    WpebAudioSink *self = WPEB_AUDIO_SINK(parent);
+    if (GST_EVENT_TYPE(event) == GST_EVENT_CAPS && !self->built) {
+        GstCaps *caps;
+        gst_event_parse_caps(event, &caps);
+        if (!wpeb_audio_sink_build(self, caps)) {
+            gst_event_unref(event);
+            return FALSE;
+        }
+    }
+    return gst_pad_event_default(pad, parent, event);
+}
+
+/* Until the first caps build the chain, the ghost pad has no target to ask: answer from the template. */
+static gboolean wpeb_audio_sink_pad_query(GstPad *pad, GstObject *parent, GstQuery *query)
+{
+    WpebAudioSink *self = WPEB_AUDIO_SINK(parent);
+    if (!self->built) {
+        GstCaps *templ = gst_pad_get_pad_template_caps(pad);
+        gboolean handled = TRUE;
+        if (GST_QUERY_TYPE(query) == GST_QUERY_CAPS) {
+            GstCaps *filter, *result;
+            gst_query_parse_caps(query, &filter);
+            result = filter ? gst_caps_intersect_full(filter, templ, GST_CAPS_INTERSECT_FIRST) : gst_caps_ref(templ);
+            gst_query_set_caps_result(query, result);
+            gst_caps_unref(result);
+        } else if (GST_QUERY_TYPE(query) == GST_QUERY_ACCEPT_CAPS) {
+            GstCaps *caps;
+            gst_query_parse_accept_caps(query, &caps);
+            gst_query_set_accept_caps_result(query, gst_caps_can_intersect(caps, templ));
+        } else {
+            handled = FALSE;
+        }
+        gst_caps_unref(templ);
+        if (handled)
+            return TRUE;
+    }
+    return gst_pad_query_default(pad, parent, query);
+}
+
+static void send_volume(WpebAudioSink *self)
+{
+    if (self->pulse)
+        g_object_set(self->pulse, "volume", self->volume, "mute", self->mute, NULL);
+    if (self->hw && WPEB_AUDIO_HW(self->hw)->video) {
+        WpebMediaVolume v = {(uint32_t)(CLAMP(self->volume, 0.0, 1.0) * 1000 + 0.5), self->mute ? 1u : 0u};
+        send_msg(WPEB_AUDIO_HW(self->hw)->video, WPEB_MEDIA_VOLUME, 0, &v, sizeof(v));
+    }
+}
+
+static void wpeb_audio_sink_set_property(GObject *object, guint id, const GValue *value, GParamSpec *pspec)
+{
+    WpebAudioSink *self = WPEB_AUDIO_SINK(object);
+    switch (id) {
+    case AUDIO_PROP_VOLUME: self->volume = g_value_get_double(value); break;
+    case AUDIO_PROP_MUTE: self->mute = g_value_get_boolean(value); break;
+    default: G_OBJECT_WARN_INVALID_PROPERTY_ID(object, id, pspec); return;
+    }
+    send_volume(self);
+}
+
+static void wpeb_audio_sink_get_property(GObject *object, guint id, GValue *value, GParamSpec *pspec)
+{
+    WpebAudioSink *self = WPEB_AUDIO_SINK(object);
+    switch (id) {
+    case AUDIO_PROP_VOLUME: g_value_set_double(value, self->volume); break;
+    case AUDIO_PROP_MUTE: g_value_set_boolean(value, self->mute); break;
+    default: G_OBJECT_WARN_INVALID_PROPERTY_ID(object, id, pspec); break;
+    }
+}
 
 static void wpeb_audio_sink_init(WpebAudioSink *self)
 {
-    GstElement *convert = gst_element_factory_make("audioconvert", NULL);
-    GstElement *resample = gst_element_factory_make("audioresample", NULL);
-    GstElement *sink = gst_element_factory_make("pulsesink", NULL);
-    if (!convert || !resample || !sink) {
-        GST_ERROR_OBJECT(self, "audioconvert, audioresample or pulsesink missing");
-        return;
-    }
-    /* The pipeline's clock must not be the sound server's: a PulseAudio stream that has not started (or is held)
-     * does not advance it, and the video, fed to LG's pipeline against that clock, froze with it (TV, 2026-11-11:
-     * no sink input at all while the video stalled). The system clock runs regardless; audio follows it. */
-    g_object_set(sink, "provide-clock", FALSE, NULL);
-    gst_bin_add_many(GST_BIN(self), convert, resample, sink, NULL);
-    gst_element_link_many(convert, resample, sink, NULL);
-    GstPad *target = gst_element_get_static_pad(convert, "sink");
+    self->volume = 1.0;
     GstPadTemplate *templ = gst_static_pad_template_get(&audio_sink_template);
-    gst_element_add_pad(GST_ELEMENT(self), gst_ghost_pad_new_from_template("sink", target, templ));
+    self->ghost = gst_ghost_pad_new_no_target_from_template("sink", templ);
     gst_object_unref(templ);
-    gst_object_unref(target);
+    gst_pad_set_event_function(self->ghost, wpeb_audio_sink_pad_event);
+    gst_pad_set_query_function(self->ghost, wpeb_audio_sink_pad_query);
+    gst_element_add_pad(GST_ELEMENT(self), self->ghost);
+    /* A sink for the pipeline's bookkeeping (async state changes, EOS) before its children exist. */
+    GST_OBJECT_FLAG_SET(self, GST_ELEMENT_FLAG_SINK);
 }
 
 static void wpeb_audio_sink_class_init(WpebAudioSinkClass *klass)
 {
+    GObjectClass *object_class = G_OBJECT_CLASS(klass);
     GstElementClass *element_class = GST_ELEMENT_CLASS(klass);
+    object_class->set_property = wpeb_audio_sink_set_property;
+    object_class->get_property = wpeb_audio_sink_get_property;
+    g_object_class_override_property(object_class, AUDIO_PROP_VOLUME, "volume");
+    g_object_class_override_property(object_class, AUDIO_PROP_MUTE, "mute");
     gst_element_class_add_static_pad_template(element_class, &audio_sink_template);
     gst_element_class_set_static_metadata(element_class, "webOS browser audio sink", "Sink/Audio",
-        "Software audio output (PulseAudio) for pages using the hardware video sink", "wpebrowser");
+        "AAC with hardware video to LG's media pipeline; other audio decoded and played by PulseAudio", "wpebrowser");
 }
 
 /* ---- plugin ----------------------------------------------------------------------------------------------- */

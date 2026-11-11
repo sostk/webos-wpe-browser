@@ -26,11 +26,17 @@ public:
 
     static bool available();  // false in host builds
 
-    // Video only for now (audio stays on PulseAudio in the web process).
+    // The playback's audio, when it goes to the same pipeline (AAC with ADTS headers): LG then syncs the video to it.
+    struct Audio {
+        int rate = 0, channels = 0;
+    };
     bool load(const std::string &app_id, const std::string &window_id, Codec codec, int width, int height, double fps,
-              std::string *error);
-    // One access unit (Annex B for H.264/HEVC), presentation time in microseconds of media time.
-    Feed feed_video(const uint8_t *data, size_t size, int64_t pts_us);
+              const Audio *audio, std::string *error);
+    // One access unit (Annex B for H.264/HEVC) or AAC frame, presentation time in microseconds of media time.
+    Feed feed(bool audio, const uint8_t *data, size_t size, int64_t pts_us);
+    bool has_audio() const { return has_audio_; }
+    // The element's volume and mute (best effort: LG's browser does not set them on this pipeline at all).
+    void set_volume(unsigned permille, bool muted);
     // A seek: the next access unit fed starts the new position (LG's Seek at its time).
     void flush();
     void pause(bool paused);
@@ -45,7 +51,8 @@ private:
     StarfishMediaAPIs *api_ = nullptr;
     std::atomic<bool> load_completed_{false};
     bool playing_ = false, paused_ = false, seek_pending_ = true;
-    int64_t fed_ = 0, full_ = 0, last_pts_us_ = 0;
+    bool has_audio_ = false;
+    int64_t fed_ = 0, full_ = 0, last_pts_us_ = 0, audio_fed_ = 0;
     std::atomic<int64_t> frames_{0};  // from the pipeline's thread
     int64_t stats_at_ms_ = 0;
 };

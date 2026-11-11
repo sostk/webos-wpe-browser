@@ -42,6 +42,7 @@ bool DirectOwner::open(const std::string &engine_dir, std::string &why, int page
     dispatch_ = reinterpret_cast<void (*)(wpeb_owner *)>(::dlsym(lib_, "wpeb_owner_dispatch"));
     destroy_ = reinterpret_cast<void (*)(wpeb_owner *)>(::dlsym(lib_, "wpeb_owner_destroy"));
     set_z_ = reinterpret_cast<void (*)(wpeb_owner *, int)>(::dlsym(lib_, "wpeb_owner_set_z"));  // optional
+    renew_layer_ = reinterpret_cast<int (*)(wpeb_owner *, const char *)>(::dlsym(lib_, "wpeb_owner_renew_layer"));
     page_z_ = page_z;
     if (create == nullptr || dispatch_ == nullptr || destroy_ == nullptr) {
         why = "libwpeb-owner.so is incomplete";
@@ -80,6 +81,18 @@ void DirectOwner::set_page_z(int z) {
     WNK_LOGI(kCat, "page layer %s the UI window", z > 0 ? "above" : "below");
 }
 
+bool DirectOwner::renew_layer() {
+    if (owner_ == nullptr || renew_layer_ == nullptr) return false;
+    const std::string name = "page-" + std::to_string(++layer_generation_);
+    if (!renew_layer_(owner_, name.c_str())) {
+        WNK_LOGE(kCat, "could not make page layer %s", name.c_str());
+        return false;
+    }
+    layer_ = name;
+    WNK_LOGI(kCat, "page layer is now %s", name.c_str());
+    return true;
+}
+
 void DirectOwner::close() {
     if (owner_ != nullptr) destroy_(owner_);
     owner_ = nullptr;
@@ -88,6 +101,7 @@ void DirectOwner::close() {
     dispatch_ = nullptr;
     destroy_ = nullptr;
     set_z_ = nullptr;
+    renew_layer_ = nullptr;
 }
 
 }  // namespace browser
