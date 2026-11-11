@@ -28,6 +28,7 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -500,6 +501,39 @@ constexpr const char *kScrollScript = R"JS((function () {
     recheck();
 })();)JS";
 
+// Page-load timing (Navigation Timing, after the load event), one log line per page: where the time goes (network:
+// DNS, connect/TLS, server, transfer; then parsing, scripts and layout up to DOMContentLoaded / load). Milliseconds
+// from the start of the navigation.
+constexpr const char *kPerfScript = R"JS((function () {
+    addEventListener('load', function () {
+        setTimeout(function () {
+            var n = performance.getEntriesByType('navigation')[0];
+            if (!n) return;
+            var res = performance.getEntriesByType('resource'), kb = 0;
+            for (var i = 0; i < res.length; i++) kb += (res[i].transferSize || 0) / 1024;
+            var fcp = 0, paints = performance.getEntriesByType('paint');
+            for (var j = 0; j < paints.length; j++) if (paints[j].name === 'first-contentful-paint') fcp = paints[j].startTime;
+            var r = function (x) { return Math.round(x); };
+            window.webkit.messageHandlers.wpebPerf.postMessage(
+                'dns ' + r(n.domainLookupEnd - n.domainLookupStart) +
+                ' connect ' + r(n.connectEnd - n.connectStart) +
+                ' (tls ' + r(n.secureConnectionStart > 0 ? n.connectEnd - n.secureConnectionStart : 0) + ')' +
+                ' ttfb ' + r(n.responseStart - n.requestStart) +
+                ' html ' + r(n.responseEnd - n.responseStart) +
+                ' | interactive ' + r(n.domInteractive) + ' dcl ' + r(n.domContentLoadedEventEnd) +
+                ' fcp ' + r(fcp) + ' load ' + r(n.loadEventStart) +
+                ' | ' + res.length + ' resources ' + r(kb) + ' KB | ' + location.host);
+        }, 0);
+    });
+})();)JS";
+
+void on_perf_message(WebKitUserContentManager *, JSCValue *value, gpointer data)
+{
+    gchar *text = jsc_value_to_string(value);
+    log_msg("tab %u timing: %s", GPOINTER_TO_UINT(data), text);
+    g_free(text);
+}
+
 void on_scroll_message(WebKitUserContentManager *, JSCValue *value, gpointer data)
 {
     const uint32_t id = GPOINTER_TO_UINT(data);
@@ -509,8 +543,88 @@ void on_scroll_message(WebKitUserContentManager *, JSCValue *value, gpointer dat
     send_msg(WPE_ENGINE_SCROLL, id, &flag, sizeof(flag));
 }
 
+// Media limits. Video is decoded on the CPU (GStreamer libav/libvpx); the TV's 4 A55 cores keep up with H.264 at 720p30.
+// Offered more, sites stream what they think the screen deserves: YouTube sent VP9 1080p60 for the 1920x1080 page,
+// the decoder dropped most frames and the web process grew to ~800 MB until webOS (sam) killed it (TV, 2026-11-11).
+// Sites ask MediaSource.isTypeSupported('...; width=; height=; framerate='), canPlayType and mediaCapabilities, so
+// answering "no" beyond the limit makes them pick a stream we can play. Page world, every frame (embedded players).
+// WPE_BROWSER_DEBUG_MEDIA="off" or "PIXELS@FPS[+vp9]" (e.g. "2073600@60+vp9") changes it.
+constexpr const char *kMediaLimitScript = R"JS((function () {
+  const cfg = __WPEB_MEDIA__;
+  const num = (t, k) => { const m = t.match(new RegExp('[;\\s]' + k + '\\s*=\\s*"?([0-9.]+)')); return m ? parseFloat(m[1]) : 0; };
+  const tooBig = (w, h, fps) => (w || 0) * (h || 0) > cfg.pixels || (fps || 0) > cfg.fps + 0.5;
+  // Dolby (AC-3/E-AC-3): YouTube then sends 5.1 E-AC-3, decoded in software to 6 channels for a stereo
+  // PulseAudio stream; the audio branch stalled and held the video 3 s ahead of it (TV, 2026-11-11). AAC/Opus play.
+  const codecOk = (t) => !/av01|av1/.test(t) && !/ec-3|ac-3/.test(t) && (cfg.vp9 || !/^video\/.*(vp9|vp09)/.test(t));
+  const ok = (type) => {
+    if (typeof type !== 'string') return true;
+    const t = type.toLowerCase();
+    return codecOk(t) && !tooBig(num(t, 'width'), num(t, 'height'), num(t, 'framerate'));
+  };
+  for (const name of ['MediaSource', 'ManagedMediaSource', 'WebKitMediaSource']) {
+    const MS = window[name];
+    if (!MS || typeof MS.isTypeSupported !== 'function') continue;
+    const original = MS.isTypeSupported.bind(MS);
+    Object.defineProperty(MS, 'isTypeSupported', { value: function isTypeSupported(t) { return ok(t) && original(t); }, configurable: true, writable: true });
+  }
+  if (window.HTMLMediaElement) {
+    const original = HTMLMediaElement.prototype.canPlayType;
+    Object.defineProperty(HTMLMediaElement.prototype, 'canPlayType', { value: function canPlayType(t) { return ok(t) ? original.call(this, t) : ''; }, configurable: true, writable: true });
+  }
+  const mc = navigator.mediaCapabilities;
+  if (mc && typeof mc.decodingInfo === 'function') {
+    const original = mc.decodingInfo.bind(mc);
+    mc.decodingInfo = function decodingInfo(config) {
+      const v = config && config.video;
+      if (v && (!ok(String(v.contentType || '')) || tooBig(v.width, v.height, v.framerate)))
+        return Promise.resolve({ supported: false, smooth: false, powerEfficient: false, configuration: config });
+      return original(config);
+    };
+  }
+})();)JS";
+
+std::string media_limit_script()
+{
+    unsigned long pixels = 1280 * 720, fps = 30;
+    bool vp9 = false;
+    // LG's decoder (hardware video, WPEB_MEDIA_SOCKET) plays 4K60 H.264/HEVC/VP9.
+    if (getenv("WPEB_MEDIA_SOCKET")) {
+        pixels = 3840 * 2160;
+        fps = 60;
+        vp9 = true;
+    }
+    if (const char *v = getenv("WPE_BROWSER_DEBUG_MEDIA")) {
+        if (!strcmp(v, "off"))
+            return {};
+        char *end = nullptr;
+        if (unsigned long p = strtoul(v, &end, 10)) pixels = p;
+        if (end && *end == '@') fps = strtoul(end + 1, &end, 10);
+        vp9 = strstr(v, "+vp9") != nullptr;
+        log_msg("media limit: %lu pixels, %lu fps%s", pixels, fps, vp9 ? ", VP9 allowed" : "");
+    }
+    char cfg[128];
+    snprintf(cfg, sizeof(cfg), "{pixels: %lu, fps: %lu, vp9: %s}", pixels, fps, vp9 ? "true" : "false");
+    std::string script = kMediaLimitScript;
+    const std::string marker = "__WPEB_MEDIA__";
+    script.replace(script.find(marker), marker.size(), cfg);
+    return script;
+}
+
+void add_media_limits(WebKitWebView *web_view)
+{
+    static const std::string source = media_limit_script();
+    WebKitUserContentManager *ucm = webkit_web_view_get_user_content_manager(web_view);
+    if (!ucm || source.empty())
+        return;
+    WebKitUserScript *script = webkit_user_script_new(source.c_str(), WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, nullptr, nullptr);
+    webkit_user_content_manager_add_script(ucm, script);
+    webkit_user_script_unref(script);
+}
+
 void add_scroll_reporter(WebKitWebView *web_view, uint32_t id)
 {
+    add_media_limits(web_view);
     WebKitUserContentManager *ucm = webkit_web_view_get_user_content_manager(web_view);
     if (!ucm || !webkit_user_content_manager_register_script_message_handler(ucm, "wpebScroll", kScrollWorld))
         return;
@@ -519,6 +633,13 @@ void add_scroll_reporter(WebKitWebView *web_view, uint32_t id)
         WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_END, kScrollWorld, nullptr, nullptr);
     webkit_user_content_manager_add_script(ucm, script);
     webkit_user_script_unref(script);
+    if (webkit_user_content_manager_register_script_message_handler(ucm, "wpebPerf", kScrollWorld)) {
+        g_signal_connect(ucm, "script-message-received::wpebPerf", G_CALLBACK(on_perf_message), GUINT_TO_POINTER(id));
+        script = webkit_user_script_new_for_world(kPerfScript, WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
+            WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, kScrollWorld, nullptr, nullptr);
+        webkit_user_content_manager_add_script(ucm, script);
+        webkit_user_script_unref(script);
+    }
 }
 
 void on_history_changed(WebKitBackForwardList *, WebKitBackForwardListItem *, gpointer, gpointer web_view)
@@ -527,12 +648,30 @@ void on_history_changed(WebKitBackForwardList *, WebKitBackForwardListItem *, gp
     send_history(tab_of_web_view(view), view);
 }
 
-// target=_blank and window.open load in the same tab: the UI decides about new tabs, not pages.
-WebKitWebView *on_create(WebKitWebView *view, WebKitNavigationAction *action, gpointer)
+void tab_open(uint32_t id, const std::string &uri, WebKitWebView *opener = nullptr);
+
+// window.close() from a page: the UI closes the tab (and shows its opener).
+void on_close(WebKitWebView *view, gpointer)
 {
-    if (WebKitURIRequest *request = webkit_navigation_action_get_request(action))
-        webkit_web_view_load_uri(view, webkit_uri_request_get_uri(request));
-    return nullptr;
+    if (const uint32_t id = tab_of_web_view(view))
+        send_msg(WPE_ENGINE_TAB_CLOSE, id, nullptr, 0);
+}
+
+// window.open and target=_blank: a real new window, as a new tab. Sign-in popups (Google, Apple, ...) need it: they
+// talk to window.opener and close themselves. WebKit loads the request into the view returned here.
+WebKitWebView *on_create(WebKitWebView *view, WebKitNavigationAction *, gpointer)
+{
+    static uint32_t next = WPE_ENGINE_TAB_ID_BASE;
+    const uint32_t opener = tab_of_web_view(view);
+    const uint32_t id = next++;
+    tab_open(id, {}, view);
+    Tab *tab = tab_by_id(id);
+    if (!tab)
+        return nullptr;
+    WpeTabCreated c { opener };
+    send_msg(WPE_ENGINE_TAB_CREATED, id, &c, sizeof(c));
+    log_msg("tab %u opened by tab %u (window.open)", id, opener);
+    return tab->web_view;  // still ours (WebKit only takes its page)
 }
 
 // ---- direct presentation (direct.cpp) -------------------------------------------------------------------
@@ -574,16 +713,19 @@ void set_focused(Tab &tab, bool focused)
 
 // ---- tabs ------------------------------------------------------------------------------------------------
 
-void tab_open(uint32_t id, const std::string &uri)
+// `opener`: a popup's opener (window.open): WebKit requires the new view to be related to it, and the page gets its
+// window.opener. Otherwise related to the first tab.
+void tab_open(uint32_t id, const std::string &uri, WebKitWebView *opener)
 {
     if (!id || tab_by_id(id))
         return;
     // Related views share the first view's web process: one process for every tab saves a lot of memory
     // on a TV (a page crash then takes all tabs down, and the UI reloads them).
-    WebKitWebView *related = nullptr;
+    WebKitWebView *related = opener;
     for (auto &[other, tab] : g.tabs) {
+        if (related)
+            break;
         related = tab.web_view;
-        break;
     }
     Tab tab { id };
     WebKitWebView *web_view = nullptr;
@@ -630,6 +772,7 @@ void tab_open(uint32_t id, const std::string &uri)
     g_signal_connect(web_view, "load-failed-with-tls-errors", G_CALLBACK(on_tls_error), nullptr);
     g_signal_connect(web_view, "web-process-terminated", G_CALLBACK(on_web_process_terminated), nullptr);
     g_signal_connect(web_view, "create", G_CALLBACK(on_create), nullptr);
+    g_signal_connect(web_view, "close", G_CALLBACK(on_close), nullptr);
     g_signal_connect(webkit_web_view_get_back_forward_list(web_view), "changed", G_CALLBACK(on_history_changed), web_view);
     add_scroll_reporter(web_view, id);
 
@@ -954,8 +1097,37 @@ int main(int, char **)
 
     g.settings = webkit_settings_new();
     webkit_settings_set_enable_spatial_navigation(g.settings, TRUE);
-    webkit_settings_set_user_agent_with_application_details(g.settings, "WPEBrowser-webOS", "0.2");
+    // No "webOS" in the user agent: sites' mobile checks list it (Palm's phones), e.g. webtv.nettv.com.np's
+    // /iPhone|...|webOS|.../i showed its mobile page (2026-11-11). The rest is WPE's desktop Linux agent.
+    webkit_settings_set_user_agent_with_application_details(g.settings, "WPEBrowser", "0.2");
     webkit_settings_set_enable_developer_extras(g.settings, FALSE);
+    // Experiments: WPE_BROWSER_DEBUG_SETTINGS="enable-javascript=false;enable-page-cache=0" sets WebKitSettings properties
+    // (booleans, integers, strings), e.g. from the launch parameter {"wpebEnv": {"WPE_BROWSER_DEBUG_SETTINGS": "..."}}.
+    if (const char *debug = getenv("WPE_BROWSER_DEBUG_SETTINGS")) {
+        gchar **pairs = g_strsplit(debug, ";", -1);
+        for (gchar **p = pairs; *p; ++p) {
+            gchar **kv = g_strsplit(*p, "=", 2);
+            GParamSpec *spec = kv[0] && kv[1] ? g_object_class_find_property(G_OBJECT_GET_CLASS(g.settings), kv[0]) : nullptr;
+            if (!spec) {
+                if (**p) log_msg("debug setting %s: unknown", *p);
+            } else if (spec->value_type == G_TYPE_BOOLEAN) {
+                g_object_set(g.settings, kv[0], (gboolean)(g_strcmp0(kv[1], "true") == 0 || g_strcmp0(kv[1], "1") == 0), nullptr);
+                log_msg("debug setting %s=%s", kv[0], kv[1]);
+            } else if (spec->value_type == G_TYPE_UINT || spec->value_type == G_TYPE_INT) {
+                GValue v = G_VALUE_INIT;
+                g_value_init(&v, spec->value_type);
+                if (spec->value_type == G_TYPE_UINT) g_value_set_uint(&v, (guint)atoi(kv[1])); else g_value_set_int(&v, atoi(kv[1]));
+                g_object_set_property(G_OBJECT(g.settings), kv[0], &v);
+                g_value_unset(&v);
+                log_msg("debug setting %s=%s", kv[0], kv[1]);
+            } else if (spec->value_type == G_TYPE_STRING) {
+                g_object_set(g.settings, kv[0], kv[1], nullptr);
+                log_msg("debug setting %s=%s", kv[0], kv[1]);
+            }
+            g_strfreev(kv);
+        }
+        g_strfreev(pairs);
+    }
     if (g.direct) {
         // COOP (YouTube sends it) moves a page into a new web process by its own path, which ignores
         // WPE_BROWSER_NO_PROCESS_SWAP; see there for why direct presentation can't follow a process switch.

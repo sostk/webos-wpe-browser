@@ -25,6 +25,9 @@
 
 #include "wayland-webos-shell-client-protocol.h"
 #include "webos-surface-group-client-protocol.h"
+#include "webos-foreign-client-protocol.h"
+#include <pthread.h>
+#include <time.h>
 
 #define LOG(...) do { fprintf(stderr, "[wpebackend-webos %d] ", (int)getpid()); fprintf(stderr, __VA_ARGS__); fputc('\n', stderr); } while (0)
 
@@ -317,6 +320,17 @@ struct renderer {
     struct wl_shell *shell;
     struct wl_webos_shell *webos_shell;
     struct wl_webos_surface_group_compositor *groups;
+    struct wl_seat *seat;
+    struct wl_webos_foreign *foreign;
+    // Page surfaces of closed pages, unmapped, with their window role (see target_pool_surface).
+    pthread_mutex_t pool_lock;
+    GPtrArray *pool; // struct pooled_surface *
+};
+
+struct pooled_surface {
+    struct wl_surface *surface;
+    struct wl_shell_surface *shell_surface;
+    struct wl_webos_shell_surface *webos_surface;
 };
 
 static void registry_global(void *data, struct wl_registry *registry, uint32_t name, const char *interface, uint32_t version)
@@ -331,6 +345,10 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
         r->webos_shell = wl_registry_bind(registry, name, &wl_webos_shell_interface, 1);
     else if (!strcmp(interface, "wl_webos_surface_group_compositor"))
         r->groups = wl_registry_bind(registry, name, &wl_webos_surface_group_compositor_interface, 1);
+    else if (!strcmp(interface, "wl_webos_foreign") && !r->foreign)
+        r->foreign = wl_registry_bind(registry, name, &wl_webos_foreign_interface, 1);
+    else if (!strcmp(interface, "wl_seat") && !r->seat)
+        r->seat = wl_registry_bind(registry, name, &wl_seat_interface, 1);
 }
 static void registry_global_remove(void *data, struct wl_registry *registry, uint32_t name) { (void)data; (void)registry; (void)name; }
 static const struct wl_registry_listener registry_listener = { registry_global, registry_global_remove };
@@ -367,6 +385,8 @@ static void *renderer_create(int host_fd)
     if (host_fd >= 0)
         close(host_fd);
     struct renderer *r = g_new0(struct renderer, 1);
+    pthread_mutex_init(&r->pool_lock, NULL);
+    r->pool = g_ptr_array_new();
     r->display = connect_display();
     if (!r->display) {
         LOG("cannot connect to the compositor (WPEB_WAYLAND_SOCKET=%s)", getenv("WPEB_WAYLAND_SOCKET"));
@@ -386,6 +406,10 @@ static void *renderer_create(int host_fd)
 static void renderer_destroy(void *data)
 {
     struct renderer *r = data;
+    if (r->seat)
+        wl_seat_destroy(r->seat);
+    if (r->foreign)
+        wl_webos_foreign_destroy(r->foreign);
     if (r->groups)
         wl_proxy_destroy((struct wl_proxy *)r->groups);
     if (r->webos_shell)
@@ -491,11 +515,46 @@ struct target {
     struct wl_webos_shell_surface *webos_surface;
     struct wl_egl_window *window;
     struct wl_webos_surface_group *group;
+    struct wl_keyboard *keyboard;
+    struct wl_webos_exported *video; // the page's video window (wpeb_webos_video_open), NULL without one
     struct wl_callback *frame;
     uint32_t width, height;
     bool attached, waiting_first_frame, failed, swap_interval_set;
     char group_name[WPEB_WEBOS_NAME_MAX], layer_name[WPEB_WEBOS_NAME_MAX];
 };
+
+// Keyboard focus. The UI window takes the remote's keys and forwards them to the engine. While hardware video plays,
+// the UI raises the page layer above its window (LG's video punch-through cuts out everything below the app's main
+// window), and the compositor then gives keyboard focus to this surface: hand it straight back to the group owner.
+// (The owner's own focus_owner, or a key index, made LG's compositor drop the group; TV 2026-11-11.)
+static void keyboard_keymap(void *data, struct wl_keyboard *k, uint32_t format, int32_t fd, uint32_t size)
+{
+    (void)data; (void)k; (void)format; (void)size;
+    close(fd);
+}
+static void keyboard_enter(void *data, struct wl_keyboard *k, uint32_t serial, struct wl_surface *surface, struct wl_array *keys)
+{
+    struct target *t = data;
+    (void)k; (void)serial; (void)keys;
+    if (surface != t->surface || !t->group)
+        return;
+    // focus_owner here is a protocol error on LG's compositor (Wayland error 22, TV 2026-11-11): only log.
+    LOG("keyboard focus came to the page surface");
+}
+static void keyboard_leave(void *data, struct wl_keyboard *k, uint32_t serial, struct wl_surface *surface) { (void)data; (void)k; (void)serial; (void)surface; }
+static void keyboard_key(void *data, struct wl_keyboard *k, uint32_t serial, uint32_t time, uint32_t key, uint32_t state) { (void)data; (void)k; (void)serial; (void)time; (void)key; (void)state; }
+static void keyboard_modifiers(void *data, struct wl_keyboard *k, uint32_t serial, uint32_t d, uint32_t l, uint32_t lk, uint32_t g) { (void)data; (void)k; (void)serial; (void)d; (void)l; (void)lk; (void)g; }
+static const struct wl_keyboard_listener keyboard_listener = { keyboard_keymap, keyboard_enter, keyboard_leave, keyboard_key, keyboard_modifiers, NULL };
+
+// A page's handle on the UI's surface group is only freed here, never destroyed with the protocol's destroy request:
+// LG's compositor takes that request as the group itself going away, and webOS then minimises the whole app (TV,
+// 2026-11-11: closing a tab or a window.open popup sent the browser to the background; likely also the black screen
+// after a web-process handoff). The group belongs to the UI window, which destroys it.
+static void release_group_handle(struct wl_webos_surface_group *group)
+{
+    if (group)
+        wl_proxy_destroy((struct wl_proxy *)group);
+}
 
 static void target_status(struct target *t, int32_t code)
 {
@@ -555,7 +614,7 @@ static void group_owner_destroyed(void *data, struct wl_webos_surface_group *gro
     (void)group;
     struct target *t = data;
     LOG("surface group '%s' destroyed by its owner", t->group_name);
-    wl_webos_surface_group_destroy(t->group);
+    release_group_handle(t->group);
     t->group = NULL;
     t->attached = false;
     target_status(t, WPEB_WEBOS_STATUS_OWNER_GONE);
@@ -590,22 +649,72 @@ static void target_remove_role(struct target *t)
     t->shell_surface = NULL;
 }
 
-static void target_detach(struct target *t)
+// Hardware video window (end of file).
+static pthread_mutex_t g_video_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct target *g_shown_target; // the last attached page target (g_video_lock)
+static void target_close_video(struct target *t); // g_video_lock held
+
+// Attaching and detaching pages of this process run on each page's own WebKit thread; one lock serialises them,
+// so taking the layer from another page (target_attach) never interleaves with that page's own detach.
+static pthread_mutex_t g_layer_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void target_detach_locked(struct target *t)
 {
-    if (t->group && t->attached)
+    pthread_mutex_lock(&g_video_lock);
+    if (g_shown_target == t)
+        g_shown_target = NULL;
+    pthread_mutex_unlock(&g_video_lock);
+    const bool was_attached = t->group && t->attached;
+    if (was_attached)
         wl_webos_surface_group_detach(t->group, t->surface);
     t->attached = false;
-    target_remove_role(t);
+    // The window role stays for the page's whole life: webOS counts each page surface as one of the app's windows,
+    // and removing a role (or destroying a surface that has one) looked to it like the app's window closing; it then
+    // minimised the browser on tab switches and when a window.open popup closed (TV, 2026-11-11). Hidden, the surface
+    // is unmapped instead, so a detached page is not drawn on its own. target_destroy removes the role.
+    if (was_attached && t->surface) {
+        wl_surface_attach(t->surface, NULL, 0, 0);
+        wl_surface_commit(t->surface);
+    }
 }
 
+static void target_detach(struct target *t)
+{
+    pthread_mutex_lock(&g_layer_lock);
+    target_detach_locked(t);
+    pthread_mutex_unlock(&g_layer_lock);
+}
+
+static void target_attach_locked(struct target *t, const char *group, const char *layer);
+
 static void target_attach(struct target *t, const char *group, const char *layer)
+{
+    pthread_mutex_lock(&g_layer_lock);
+    target_attach_locked(t, group, layer);
+    pthread_mutex_unlock(&g_layer_lock);
+}
+
+static void target_attach_locked(struct target *t, const char *group, const char *layer)
 {
     if (!t->surface || t->failed)
         return;
     if (t->group && strcmp(t->group_name, group) != 0) {
-        target_detach(t);
-        wl_webos_surface_group_destroy(t->group);
+        target_detach_locked(t);
+        release_group_handle(t->group);
         t->group = NULL;
+    }
+    // One surface per layer: another page of this web process may still hold it (tab switches send its detach and
+    // our attach through separate threads; a window.open popup attached before its opener let go: "Layer already
+    // attached", TV 2026-11-11). Every page of the process shares this Wayland connection, so detaching it here
+    // first reaches the compositor before our attach.
+    pthread_mutex_lock(&g_video_lock);
+    struct target *other = g_shown_target != t ? g_shown_target : NULL;
+    pthread_mutex_unlock(&g_video_lock);
+    if (other && other->attached && other->renderer == t->renderer && !strcmp(other->layer_name, layer)) {
+        target_detach_locked(other);
+        wl_display_flush(t->renderer->display);
+        target_status(other, WPEB_WEBOS_STATUS_DETACHED);
+        LOG("detached the page that held the layer before attaching this one");
     }
     copy_name(t->group_name, group);
     copy_name(t->layer_name, layer);
@@ -622,6 +731,9 @@ static void target_attach(struct target *t, const char *group, const char *layer
     t->waiting_first_frame = true;
     LOG("page surface %ux%u attached to '%s'/'%s'", t->width, t->height, t->group_name, t->layer_name);
     target_status(t, WPEB_WEBOS_STATUS_ATTACHED);
+    pthread_mutex_lock(&g_video_lock);
+    g_shown_target = t;
+    pthread_mutex_unlock(&g_video_lock);
 }
 
 static gboolean target_on_channel(gint fd, GIOCondition condition, gpointer data)
@@ -692,18 +804,41 @@ static void target_deinitialize(void *data)
         wl_callback_destroy(t->frame);
     t->frame = NULL;
     target_detach(t);
+    pthread_mutex_lock(&g_video_lock);
+    target_close_video(t);
+    pthread_mutex_unlock(&g_video_lock);
+    if (t->keyboard)
+        wl_keyboard_destroy(t->keyboard);
+    t->keyboard = NULL;
     if (t->group)
-        wl_webos_surface_group_destroy(t->group);
+        release_group_handle(t->group);
     t->group = NULL;
     if (t->window)
         wl_egl_window_destroy(t->window);
     t->window = NULL;
-    if (t->webos_surface)
-        wl_webos_shell_surface_destroy(t->webos_surface);
-    t->webos_surface = NULL;
-    if (t->shell_surface)
-        wl_shell_surface_destroy(t->shell_surface);
-    t->shell_surface = NULL;
+    if (t->surface && t->shell_surface && t->renderer && t->renderer->pool) {
+        // Destroying a surface that has a window role made webOS minimise the whole app (TV, 2026-11-11, even
+        // unmapped): webOS counts it as one of the app's windows closing. It is kept, unmapped, for the next page.
+        wl_surface_attach(t->surface, NULL, 0, 0);
+        wl_surface_commit(t->surface);
+        struct pooled_surface *p = g_new0(struct pooled_surface, 1);
+        p->surface = t->surface;
+        p->shell_surface = t->shell_surface;
+        p->webos_surface = t->webos_surface;
+        // Off this page's queue, which is destroyed below; their events are never dispatched (none are needed).
+        wl_proxy_set_queue((struct wl_proxy *)p->surface, t->renderer->queue);
+        wl_proxy_set_queue((struct wl_proxy *)p->shell_surface, t->renderer->queue);
+        if (p->webos_surface)
+            wl_proxy_set_queue((struct wl_proxy *)p->webos_surface, t->renderer->queue);
+        pthread_mutex_lock(&t->renderer->pool_lock);
+        g_ptr_array_add(t->renderer->pool, p);
+        pthread_mutex_unlock(&t->renderer->pool_lock);
+        t->surface = NULL;
+        t->shell_surface = NULL;
+        t->webos_surface = NULL;
+        LOG("page closed: its surface is kept for the next page");
+    }
+    target_remove_role(t);
     if (t->surface)
         wl_surface_destroy(t->surface);
     t->surface = NULL;
@@ -749,8 +884,37 @@ static void target_initialize(void *data, void *backend_data, uint32_t width, ui
         return;
     }
     t->queue = wl_display_create_queue(r->display);
-    t->surface = wl_compositor_create_surface(r->compositor);
+    struct pooled_surface *reuse = NULL;
+    pthread_mutex_lock(&r->pool_lock);
+    if (r->pool->len)
+        reuse = g_ptr_array_steal_index(r->pool, r->pool->len - 1);
+    pthread_mutex_unlock(&r->pool_lock);
+    if (reuse) {
+        // A closed page's surface, still with its window role (and empty input region): see target_pool_surface.
+        t->surface = reuse->surface;
+        t->shell_surface = reuse->shell_surface;
+        t->webos_surface = reuse->webos_surface;
+        g_free(reuse);
+        if (t->shell_surface)
+            wl_proxy_set_queue((struct wl_proxy *)t->shell_surface, t->queue);
+        if (t->webos_surface)
+            wl_proxy_set_queue((struct wl_proxy *)t->webos_surface, t->queue);
+        LOG("reusing a closed page's surface");
+    } else {
+        t->surface = wl_compositor_create_surface(r->compositor);
+    }
     wl_proxy_set_queue((struct wl_proxy *)t->surface, t->queue);
+    // Input always goes to the UI window, which forwards it to the engine: an empty input region lets pointer
+    // events fall through even when the page layer is above the UI (while hardware video plays: the compositor
+    // cuts everything below the app's main window out where the video is).
+    struct wl_region *no_input = wl_compositor_create_region(r->compositor);
+    wl_surface_set_input_region(t->surface, no_input);
+    wl_region_destroy(no_input);
+    if (r->seat) {
+        t->keyboard = wl_seat_get_keyboard(r->seat);
+        wl_proxy_set_queue((struct wl_proxy *)t->keyboard, t->queue);
+        wl_keyboard_add_listener(t->keyboard, &keyboard_listener, t);
+    }
     // No window role yet: target_attach adds it (see target_add_role).
     t->window = wl_egl_window_create(t->surface, (int)width, (int)height);
 
@@ -859,3 +1023,94 @@ static void *load_object(const char *name)
 __attribute__((visibility("default"))) struct wpe_loader_interface _wpe_loader_interface = {
     .load_object = load_object,
 };
+
+// ===== hardware video window (web process) =====================================================================
+// As Chromium does on webOS (ui/ozone/platform/wayland/extensions/webos/host/webos_foreign_video_window.cc): LG's
+// video plane is bound to an exported window made on the surface that draws the page, so the compositor punches
+// the video through below *this* surface and everything the page draws above its hole stays on top. (NDL's video
+// is bound to the app's main window instead, which cut our page layer out under the UI.) The media sink
+// (engine/gst/wpebmediasink.c, same process) asks for it; the window id goes to the UI's Starfish pipeline
+// (option.windowId). One video window per page target; the newest attached target is the one shown.
+
+static pthread_cond_t g_video_cond = PTHREAD_COND_INITIALIZER;
+static char g_video_id[128]; // window_id_assigned (g_video_lock)
+
+static void video_window_id_assigned(void *data, struct wl_webos_exported *exported, const char *id, uint32_t type)
+{
+    (void)data; (void)exported; (void)type;
+    pthread_mutex_lock(&g_video_lock);
+    snprintf(g_video_id, sizeof(g_video_id), "%s", id ? id : "");
+    pthread_cond_broadcast(&g_video_cond);
+    pthread_mutex_unlock(&g_video_lock);
+    LOG("video window id %s", id ? id : "(none)");
+}
+static const struct wl_webos_exported_listener video_listener = { video_window_id_assigned };
+
+static void target_close_video(struct target *t)
+{
+    if (t->video) {
+        wl_webos_exported_destroy(t->video);
+        t->video = NULL;
+        if (t->renderer && t->renderer->display)
+            wl_display_flush(t->renderer->display);
+        LOG("video window closed");
+    }
+}
+
+// Creates the video window on the shown page surface and waits up to timeout_ms for its id. 1 with id, 0 if not.
+__attribute__((visibility("default"))) int wpeb_webos_video_open(char *id, size_t size, unsigned timeout_ms)
+{
+    pthread_mutex_lock(&g_video_lock);
+    struct target *t = g_shown_target;
+    if (!t || !t->surface || !t->renderer->foreign) {
+        pthread_mutex_unlock(&g_video_lock);
+        LOG("video window: %s", !t ? "no page surface shown" : "no wl_webos_foreign");
+        return 0;
+    }
+    target_close_video(t);
+    g_video_id[0] = '\0';
+    t->video = wl_webos_foreign_export_element(t->renderer->foreign, t->surface, WL_WEBOS_FOREIGN_WEBOS_EXPORTED_TYPE_VIDEO_OBJECT);
+    // The event arrives on the target's queue, which WebKit's compositing thread dispatches.
+    wl_proxy_set_queue((struct wl_proxy *)t->video, t->queue);
+    wl_webos_exported_add_listener(t->video, &video_listener, NULL);
+    wl_display_flush(t->renderer->display);
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_sec += timeout_ms / 1000;
+    until.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+    if (until.tv_nsec >= 1000000000L) { until.tv_sec++; until.tv_nsec -= 1000000000L; }
+    while (!g_video_id[0] && pthread_cond_timedwait(&g_video_cond, &g_video_lock, &until) == 0) { }
+    int ok = g_video_id[0] != '\0';
+    if (ok)
+        snprintf(id, size, "%s", g_video_id);
+    else
+        LOG("video window: no id within %u ms", timeout_ms);
+    pthread_mutex_unlock(&g_video_lock);
+    return ok;
+}
+
+// Source: the coded picture; destination: page-surface pixels (the page surface covers the screen).
+__attribute__((visibility("default"))) void wpeb_webos_video_place(int sw, int sh, int x, int y, int w, int h)
+{
+    pthread_mutex_lock(&g_video_lock);
+    struct target *t = g_shown_target;
+    if (t && t->video && w > 0 && h > 0) {
+        struct wl_region *src = wl_compositor_create_region(t->renderer->compositor);
+        wl_region_add(src, 0, 0, sw > 0 ? sw : w, sh > 0 ? sh : h);
+        struct wl_region *dst = wl_compositor_create_region(t->renderer->compositor);
+        wl_region_add(dst, x, y, w, h);
+        wl_webos_exported_set_exported_window(t->video, src, dst);
+        wl_region_destroy(src);
+        wl_region_destroy(dst);
+        wl_display_flush(t->renderer->display);
+    }
+    pthread_mutex_unlock(&g_video_lock);
+}
+
+__attribute__((visibility("default"))) void wpeb_webos_video_close(void)
+{
+    pthread_mutex_lock(&g_video_lock);
+    if (g_shown_target)
+        target_close_video(g_shown_target);
+    pthread_mutex_unlock(&g_video_lock);
+}

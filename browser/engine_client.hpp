@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <utility>
 #include <sys/types.h>
 #include <vector>
 
@@ -36,6 +37,8 @@ struct EngineCallbacks {
     std::function<void(uint32_t what, bool ok)> data_cleared;  // answer to clear_data()
     std::function<void(TabId, bool at_top)> scroll;  // the page reached / left its top (shows the toolbar)
     std::function<void(TabId, const WpePresent &)> present;  // how the page reaches the screen (direct mode)
+    std::function<void(TabId, TabId opener)> tab_created;      // a page opened a window (the engine's tab id)
+    std::function<void(TabId)> tab_close;                       // a page called window.close()
     std::function<void(const std::string &why)> exited;  // the engine process went away
 };
 
@@ -45,13 +48,18 @@ struct EngineLaunch {
     std::string cache_dir;
     std::string runtime_dir;  // logs
     uint32_t width = 1280, height = 720;  // page size, CSS px
-    // Graphics for WPEWebProcess: false = bundled Mesa llvmpipe (software GL, engine/lib/mesa on the
-    // library path); true = the TV's own EGL/GLES (Mali) through the default EGL display, and Skia
-    // paints on the CPU pending a Mali tile-rendering fix. Composited frames use SHM in both modes.
+    // Graphics for WPEWebProcess: false = bundled Mesa llvmpipe (software GL, engine/lib/mesa on the library path),
+    // Skia paints on the CPU; true = the TV's own EGL/GLES (Mali) through the default EGL display, Skia paints with
+    // GPU and CPU (hybrid). Frames reach the screen by SHM or, with surface_group, directly.
     bool gpu = false;
     // Direct presentation (needs gpu): the web processes draw into their own surfaces in this surface group
     // (DirectOwner) instead of sending frames. Empty = SHM frames.
     std::string surface_group, surface_layer, wayland_socket;
+    // Hardware video (browser/media_server.hpp): the UI's decoder service, empty when there is none.
+    std::string media_socket;
+    // Extra engine environment for experiments (launch parameter {"wpebEnv": {"WEBKIT_...": "..."}}): applied last,
+    // only names starting with WEBKIT_, JSC_, WPE_BROWSER_DEBUG or GST_DEBUG.
+    std::vector<std::pair<std::string, std::string>> extra_env;
 };
 
 class EngineClient {

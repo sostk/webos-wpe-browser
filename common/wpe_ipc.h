@@ -24,7 +24,7 @@
 
 #include <stdint.h>
 
-#define WPE_IPC_VERSION 6u
+#define WPE_IPC_VERSION 7u
 #define WPE_IPC_ENGINE_FD 3
 #define WPE_IPC_FRAME_SLOTS 3u
 #define WPE_IPC_MAX_TEXT 2048u   /* bytes including the terminating NUL */
@@ -74,7 +74,17 @@ typedef enum {
     WPE_ENGINE_DATA_CLEARED,  /* WpeDataCleared: answer to APP_CLEAR_DATA */
     WPE_ENGINE_PRESENT,       /* WpePresent: how the tab's page reaches the screen (sent at start and on changes) */
     WPE_ENGINE_SCROLL,        /* WpeFlag: 1 the page is scrolled to its top, 0 it is not (sent on changes) */
+    WPE_ENGINE_TAB_CREATED,   /* WpeTabCreated: a page opened a window (window.open, target=_blank); header.tab = the
+                                 engine's id for it (WPE_ENGINE_TAB_ID_BASE and up). The UI adds and shows the tab. */
+    WPE_ENGINE_TAB_CLOSE,     /* no payload: the page asked to close its window (window.close()) */
 } WpeMsgType;
+
+/* Tabs the engine opens itself (popups) get ids from here, so they never collide with the UI's. */
+#define WPE_ENGINE_TAB_ID_BASE 0x40000000u
+
+typedef struct {
+    uint32_t opener; /* the tab whose page opened it (0 if unknown) */
+} WpeTabCreated;
 
 typedef struct {
     uint32_t type; /* WpeMsgType */

@@ -14,6 +14,7 @@
 #include "chrome.hpp"
 #include "direct_owner.hpp"
 #include "engine_client.hpp"
+#include "media_server.hpp"
 #include "keys.hpp"
 #include "page_view.hpp"
 #include "profile.hpp"
@@ -114,6 +115,7 @@ struct Tab {
     bool can_back = false, can_forward = false;
     bool live = false;  // has a WebKit view in the engine
     bool at_top = true;  // the page is scrolled to its top (the toolbar peeks over it then)
+    TabId opener = 0;    // the tab whose page opened this one (window.open), shown again when it closes itself
     double last_shown_ms = 0;
 };
 
@@ -158,23 +160,53 @@ class App : public wnk::app::Delegate {
         activate(t.id);
     }
 
-    void close_tab(TabId id) {
+    // A page opened a window (window.open, target=_blank, sign-in popups): the engine already has its view, which
+    // WebKit is loading. It goes right after its opener and is shown, beyond the tab limit if need be (a sign-in
+    // must not fail for it).
+    void add_page_tab(TabId id, TabId opener) {
+        if (tab(id) != nullptr) return;
+        Tab t;
+        t.id = id;
+        t.live = true;
+        t.loading = true;
+        t.opener = opener;
+        auto at = find(opener);
+        tabs_.insert(at == tabs_.end() ? tabs_.end() : at + 1, t);
+        activate(id);
+    }
+
+    // window.close(): close it and show the page that opened it.
+    // window.close(): show the opener now and destroy the page's view a little later. Destroying it straight after
+    // the switch made webOS minimise the app (TV, 2026-11-11).
+    void close_page_tab(TabId id) {
+        Tab *t = tab(id);
+        if (t == nullptr) return;
+        WNK_LOGI(kCat, "tab %u closed itself (window.close)", id);
+        if (id == active_ && t->opener != 0 && tab(t->opener) != nullptr) activate(t->opener);
+        pending_closes_.push_back({id, ctx_->ui().now_ms() + 1500});
+    }
+
+    // `then`: the tab to show if this one was shown (its neighbour otherwise). The next tab is shown before the closed
+    // one's view is destroyed: webOS takes a page window vanishing with none to replace it as the app's window
+    // closing and minimises the app (TV, 2026-11-11, closing a window.open popup).
+    void close_tab(TabId id, TabId then = 0) {
         auto it = find(id);
         if (it == tabs_.end()) return;
-        if (it->live) engine_.tab_close(id);
         const size_t index = static_cast<size_t>(it - tabs_.begin());
-        tabs_.erase(it);
+        const bool live = it->live;
+        if (id == active_ && tabs_.size() > 1) {
+            TabId next = then != 0 && then != id && tab(then) != nullptr ? then : 0;
+            if (next == 0) next = tabs_[index + 1 < tabs_.size() ? index + 1 : index - 1].id;
+            activate(next);
+        }
+        if (live) engine_.tab_close(id);
+        tabs_.erase(find(id));
         if (tabs_.empty()) {
             active_ = 0;
             new_tab();  // a TV browser never closes its window: start over with a New Tab page
             return;
         }
-        if (id == active_) {
-            active_ = 0;
-            activate(tabs_[std::min(index, tabs_.size() - 1)].id);
-        } else {
-            refresh_chrome();
-        }
+        refresh_chrome();
     }
 
     void activate(TabId id) {
@@ -285,7 +317,9 @@ class App : public wnk::app::Delegate {
         const bool page_mode = ui.focused() == screen_->page_ && t != nullptr && t->live && !t->url.empty() &&
                                !screen_->message_->visible() && ui.top_dialog() == nullptr && nav_->depth() == 1;
         if (!page_mode) return true;
-        return t->at_top || ui.now_ms() < peek_until_ms_;
+        // With a hardware video the page goes above the UI while the chrome is hidden (DirectOwner::set_page_z), so
+        // being at the top no longer keeps the chrome: it would hide the page's video controls.
+        return (t->at_top && !(raise_page_ && media_.video_active())) || ui.now_ms() < peek_until_ms_;
     }
 
     void peek_chrome() { peek_until_ms_ = ctx_->ui().now_ms() + kChromePeekMs; }
@@ -377,7 +411,18 @@ class App : public wnk::app::Delegate {
 
     void on_frame(wnk::app::Context &ctx, float) override {
         engine_.poll();
+        for (size_t i = 0; i < pending_closes_.size();) {
+            if (ctx.ui().now_ms() < pending_closes_[i].second) { ++i; continue; }
+            const TabId id = pending_closes_[i].first;
+            pending_closes_.erase(pending_closes_.begin() + static_cast<long>(i));
+            WNK_LOGI(kCat, "tab %u: closing its view", id);
+            close_tab(id);
+        }
         direct_.dispatch();
+        // Experimental ({"wpebRaisePage":"1"}): the page above the UI while hardware video plays shows the page's
+        // video controls, but the compositor then gives the page surface keyboard focus (remote keys lost).
+        if (direct_.active() && raise_page_)
+            direct_.set_page_z(media_.video_active() && !screen_->chrome_->visible() ? 1 : -1);
         if (direct_fallback_pending_) {
             // Direct presentation failed: start again with SHM frames (outside engine_.poll()).
             direct_fallback_pending_ = false;
@@ -517,17 +562,22 @@ class App : public wnk::app::Delegate {
     void on_lifecycle(wnk::app::Context &, const wnk::app::Lifecycle::Transition &t) override {
         using S = wnk::app::State;
         if (t.to == S::Suspended) {
+            browser::MediaServer::set_foreground(false);
             engine_.set_visible(false);
             save_session();
             profile_.flush_now();  // the TV may close a backgrounded app without warning
         }
-        if (t.to == S::Running) engine_.set_visible(true);
+        if (t.to == S::Running) {
+            browser::MediaServer::set_foreground(true);
+            engine_.set_visible(true);
+        }
     }
 
     void on_stop(wnk::app::Context &) override {
         save_session();
         profile_.flush_now();
         engine_.stop();
+        media_.stop();  // after the engine: its web processes held the streams
     }
 
  private:
@@ -712,6 +762,8 @@ class App : public wnk::app::Delegate {
                 refresh_chrome();
             }
         };
+        cb.tab_created = [this](TabId id, TabId opener) { add_page_tab(id, opener); };
+        cb.tab_close = [this](TabId id) { close_page_tab(id); };
         cb.scroll = [this](TabId id, bool at_top) {
             if (Tab *t = tab(id)) t->at_top = at_top;
         };
@@ -798,13 +850,31 @@ class App : public wnk::app::Delegate {
         WNK_LOGI(kCat, "renderer %s, presentation %s", l.gpu ? "gpu" : "software", l.gpu ? present.c_str() : "shm");
         if (l.gpu && !direct_failed_ && present == "direct") {
             std::string why;
-            if (!direct_.active() && !direct_.open(l.engine_dir, why))
+            // Page layer below the UI window (z -1): the chrome is drawn over the page, which shows through where
+            // the UI is transparent. {"wpebPageZ": "1"} puts it above (experiments).
+            raise_page_ = launch_param(params, "wpebRaisePage") == "1";
+            const std::string z = launch_param(params, "wpebPageZ");
+            if (!direct_.active() && !direct_.open(l.engine_dir, why, z.empty() ? -1 : std::atoi(z.c_str())))
                 WNK_LOGW(kCat, "direct presentation unavailable: %s", why.c_str());
             if (direct_.active()) {
                 l.surface_group = direct_.group();
                 l.surface_layer = direct_.layer();
                 l.wayland_socket = direct_.socket();
+                // {"wpebVideo":"software"} keeps video on the CPU (GStreamer's own decoders, drawn into the page).
+                std::string why;
+                if (launch_param(params, "wpebVideo") == "software")
+                    WNK_LOGI(kCat, "hardware video off (launch parameter)");
+                else if (media_.running() || media_.start(l.runtime_dir + "/media.sock", &why))
+                    l.media_socket = media_.path();
+                else
+                    WNK_LOGW(kCat, "hardware video unavailable: %s", why.c_str());
             }
+        }
+        if (!params.empty()) {
+            const auto j = nlohmann::json::parse(params, nullptr, false);
+            if (j.is_object() && j.contains("wpebEnv") && j["wpebEnv"].is_object())
+                for (const auto &[k, v] : j["wpebEnv"].items())
+                    if (v.is_string()) l.extra_env.emplace_back(k, v.get<std::string>());
         }
         l.data_dir = data_dir_ + "/webkit";
         l.cache_dir = l.data_dir + "/cache";
@@ -877,6 +947,9 @@ class App : public wnk::app::Delegate {
     double last_chrome_ms_ = 0;
     double peek_until_ms_ = 0;
     browser::DirectOwner direct_;
+    browser::MediaServer media_;
+    bool raise_page_ = false;
+    std::vector<std::pair<TabId, double>> pending_closes_;  // window.close(): destroyed a little later  // hardware video for pages (direct presentation only)
     bool direct_failed_ = false;           // stays in SHM mode for the rest of this run
     bool direct_fallback_pending_ = false;
 };

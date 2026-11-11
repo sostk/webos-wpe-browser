@@ -33,6 +33,10 @@ READELF=$BR/host/bin/arm-webos-linux-gnueabi-readelf
 
 # The TV provides these (glibc 2.28); bundling them would break the loader.
 SYSTEM_LIBS=' ld-linux.so.3 libc.so.6 libm.so.6 libdl.so.2 libpthread.so.0 librt.so.1 libresolv.so.2 libutil.so.1 libanl.so.1 libnsl.so.1 libcrypt.so.1 '
+# Sound: the TV's PulseAudio 9.0 (LG-patched, system mode) drops newer clients when they open a stream (our
+# PulseAudio 17 libpulse: "Connection terminated", memfd/SHM off made no difference; TV, 2026-11-11). Its own
+# libpulse.so.0 works with our GStreamer pulsesink, so the engine uses that one, with its own dependencies.
+SYSTEM_LIBS="$SYSTEM_LIBS"'libpulse.so.0 '
 # Hard-float: nothing comes from the TV; the loader itself is copied below and is in no DT_NEEDED closure.
 [ "$HF" = yes ] && SYSTEM_LIBS=' ld-linux-armhf.so.3 '
 
@@ -82,6 +86,12 @@ if [ -f "$TARGET/usr/lib/libgstreamer-1.0.so.0" ]; then
             exit 1
         }
     done
+    # The browser's hardware-video sinks (engine/gst), built with wpe-engine.
+    if [ -f "$ENGINE_BUILD/libgstwpebmedia.so" ]; then
+        cp "$ENGINE_BUILD/libgstwpebmedia.so" "$OUT/lib/gstreamer-1.0/"
+        "$BR"/host/bin/*-strip "$OUT/lib/gstreamer-1.0/libgstwpebmedia.so" 2>/dev/null || true
+        MEDIA_SEEDS="$MEDIA_SEEDS $OUT/lib/gstreamer-1.0/libgstwpebmedia.so"
+    fi
     scanner="$TARGET/usr/libexec/gstreamer-1.0/gst-plugin-scanner"
     [ -x "$scanner" ] || { echo "missing GStreamer plugin scanner" >&2; exit 1; }
     cp "$scanner" "$OUT/libexec/"

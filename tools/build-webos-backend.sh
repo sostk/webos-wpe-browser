@@ -19,6 +19,10 @@ mkdir -p "$out/wpe-link"
     "$out/webos-surface-group-client-protocol.h"
 "$ndk/bin/wayland-scanner" private-code "$sysroot/usr/share/wayland-webos/webos-surface-group.xml" \
     "$out/webos-surface-group-protocol.c"
+"$ndk/bin/wayland-scanner" client-header "$sysroot/usr/share/wayland-webos/webos-foreign.xml" \
+    "$out/webos-foreign-client-protocol.h"
+"$ndk/bin/wayland-scanner" private-code "$sysroot/usr/share/wayland-webos/webos-foreign.xml" \
+    "$out/webos-foreign-protocol.c"
 shell_xml=$(ls "$sysroot"/usr/share/wayland-webos/webos-shell.xml 2>/dev/null || ls "$project"/browser/build/webos-release/third_party/sdl-webos-build/src/wnk_sdl_webos_ext/wayland-protocols/webos-shell.xml)
 "$ndk/bin/wayland-scanner" private-code "$shell_xml" "$out/webos-shell-protocol.c"
 # Only libwpe from the Buildroot tree, so nothing else of it can leak into the link.
@@ -28,7 +32,7 @@ ln -sf "$(readlink -f "$br_sysroot/usr/lib/libwpe-1.0.so")" "$out/wpe-link/libwp
     -fvisibility=hidden -Wl,-soname,libWPEBackend-webos.so -Wl,--no-undefined -Wl,--as-needed \
     -I"$src" -I"$out" -I"$br_sysroot/usr/include/wpe-1.0" \
     $(PKG_CONFIG_SYSROOT_DIR=$sysroot PKG_CONFIG_LIBDIR=$sysroot/usr/lib/pkgconfig pkg-config --cflags glib-2.0) \
-    -o "$out/libWPEBackend-webos.so" "$src/wpebackend-webos.c" "$out/webos-surface-group-protocol.c" "$out/webos-shell-protocol.c" \
+    -o "$out/libWPEBackend-webos.so" "$src/wpebackend-webos.c" "$out/webos-surface-group-protocol.c" "$out/webos-shell-protocol.c" "$out/webos-foreign-protocol.c" \
     -L"$out/wpe-link" -lwpe-1.0 -lwayland-client -lwayland-egl -lglib-2.0 -ldl
 # The UI's half (window owner): only the TV's libwayland-client, dlopen()ed by the browser UI.
 "$ndk/bin/arm-webos-linux-gnueabi-gcc" -shared -fPIC -O2 -g0 -Wall -Wextra -Werror -std=gnu11 \

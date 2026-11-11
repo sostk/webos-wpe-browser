@@ -13,13 +13,11 @@
 namespace browser {
 namespace {
 constexpr const char *kCat = "direct";
-// Below the UI window: the chrome is drawn over the page, and the page shows through where the UI is transparent.
-constexpr int kPageZ = -1;
 }  // namespace
 
 DirectOwner::~DirectOwner() { close(); }
 
-bool DirectOwner::open(const std::string &engine_dir, std::string &why) {
+bool DirectOwner::open(const std::string &engine_dir, std::string &why, int page_z) {
     close();
 #if defined(SDL_VIDEO_DRIVER_WAYLAND)
     SDL_Window *window = SDL_GL_GetCurrentWindow();
@@ -43,6 +41,8 @@ bool DirectOwner::open(const std::string &engine_dir, std::string &why) {
     auto create = reinterpret_cast<Create>(::dlsym(lib_, "wpeb_owner_create"));
     dispatch_ = reinterpret_cast<void (*)(wpeb_owner *)>(::dlsym(lib_, "wpeb_owner_dispatch"));
     destroy_ = reinterpret_cast<void (*)(wpeb_owner *)>(::dlsym(lib_, "wpeb_owner_destroy"));
+    set_z_ = reinterpret_cast<void (*)(wpeb_owner *, int)>(::dlsym(lib_, "wpeb_owner_set_z"));  // optional
+    page_z_ = page_z;
     if (create == nullptr || dispatch_ == nullptr || destroy_ == nullptr) {
         why = "libwpeb-owner.so is incomplete";
         close();
@@ -51,7 +51,7 @@ bool DirectOwner::open(const std::string &engine_dir, std::string &why) {
     // Surface group names are global in the compositor: one per app instance.
     group_ = "wpeb-" + std::to_string(::getpid());
     char socket[108] = {};
-    owner_ = create(info.info.wl.display, info.info.wl.surface, group_.c_str(), layer_.c_str(), kPageZ, socket,
+    owner_ = create(info.info.wl.display, info.info.wl.surface, group_.c_str(), layer_.c_str(), page_z, socket,
                     sizeof(socket));
     if (owner_ == nullptr) {
         why = "the compositor did not create the surface group (see the log)";
@@ -73,6 +73,13 @@ void DirectOwner::dispatch() {
     if (owner_ != nullptr) dispatch_(owner_);
 }
 
+void DirectOwner::set_page_z(int z) {
+    if (owner_ == nullptr || set_z_ == nullptr || z == page_z_) return;
+    set_z_(owner_, z);
+    page_z_ = z;
+    WNK_LOGI(kCat, "page layer %s the UI window", z > 0 ? "above" : "below");
+}
+
 void DirectOwner::close() {
     if (owner_ != nullptr) destroy_(owner_);
     owner_ = nullptr;
@@ -80,6 +87,7 @@ void DirectOwner::close() {
     lib_ = nullptr;
     dispatch_ = nullptr;
     destroy_ = nullptr;
+    set_z_ = nullptr;
 }
 
 }  // namespace browser

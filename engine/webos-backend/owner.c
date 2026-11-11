@@ -109,6 +109,15 @@ WPEB_OWNER_EXPORT void wpeb_owner_dispatch(struct wpeb_owner *o)
         wl_display_dispatch_queue_pending(o->display, o->queue);
 }
 
+WPEB_OWNER_EXPORT void wpeb_owner_set_z(struct wpeb_owner *o, int z_index)
+{
+    if (!o || !o->layer)
+        return;
+    wl_webos_surface_group_layer_set_z_index(o->layer, z_index);
+    wl_display_flush(o->display);
+    fprintf(stderr, "[wpeb-owner] layer z %d\n", z_index);
+}
+
 WPEB_OWNER_EXPORT int wpeb_owner_attached(struct wpeb_owner *o)
 {
     return o ? o->attached : 0;

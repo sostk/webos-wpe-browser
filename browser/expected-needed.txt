@@ -4,6 +4,8 @@
 ld-linux.so.3
 libc.so.6
 libm.so.6           # maths for layout and animation (glibc; every firmware)
+libgcc_s.so.1?      # the kit's media library (hardware video via NDL) brings libdovi's Rust unwinder; every firmware 1.2-11.2 (kit fw-lib-matrix)
+libplayerAPIs.so.1  # LG's buffer-feed media pipeline (StarfishMediaAPIs, webOS 3.4+): hardware video bound to the page's window
 libdl.so.2          # the app shell can dlopen libcurl and the Luna libraries (storage) on demand
 libpthread.so.0     # glibc 2.12 keeps pthreads here (worker pool for image decoding)
 librt.so.1          # glibc 2.12 keeps clock_gettime here

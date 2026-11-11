@@ -18,7 +18,7 @@ static const char* names[] = {
     "LD_LIBRARY_PATH", "WPE_BROWSER_CA_FILE", "WEBKIT_SKIA_ENABLE_CPU_RENDERING", "WPE_BROWSER_RENDERER",
     "GST_PLUGIN_PATH", "GST_PLUGIN_PATH_1_0", "GST_PLUGIN_SYSTEM_PATH", "GST_PLUGIN_SYSTEM_PATH_1_0",
     "GST_PLUGIN_SCANNER", "GST_PLUGIN_SCANNER_1_0", "GST_REGISTRY", "GST_REGISTRY_1_0",
-    "GIO_MODULE_DIR", "GIO_EXTRA_MODULES", "WEBKIT_INJECTED_BUNDLE_PATH", "PULSE_CLIENTCONFIG", "WEBKIT_GST_ENABLE_HLS_SUPPORT", "WEBKIT_GST_ENABLE_DASH_SUPPORT"
+    "GIO_MODULE_DIR", "GIO_EXTRA_MODULES", "WEBKIT_INJECTED_BUNDLE_PATH", "PULSE_CLIENTCONFIG", "PULSE_RUNTIME_PATH", "GST_REGISTRY_UPDATE", "WEBKIT_GST_ENABLE_HLS_SUPPORT", "WEBKIT_GST_ENABLE_DASH_SUPPORT"
 };
 
 static void require(bool condition, const std::string& why) {
@@ -86,6 +86,7 @@ int main(int argc, char** argv) {
             expect("LD_LIBRARY_PATH", launch.engine_dir + "/lib" + (gpu ? "" : ":" + launch.engine_dir + "/lib/mesa"));
             expect("WPE_BROWSER_CA_FILE", launch.engine_dir + "/etc/ssl/certs/ca-certificates.crt");
             expect("WPE_BROWSER_RENDERER", gpu ? "gpu" : "software");
+            // Skia paints on the CPU in both modes (GPU painting's caches cost ~270 MB on YouTube).
             expect("WEBKIT_SKIA_ENABLE_CPU_RENDERING", "1");
             for (auto key : {"GST_PLUGIN_PATH", "GST_PLUGIN_PATH_1_0"}) expect(key, "");
             for (auto key : {"GST_PLUGIN_SYSTEM_PATH", "GST_PLUGIN_SYSTEM_PATH_1_0"}) expect(key, launch.engine_dir + "/lib/gstreamer-1.0");
@@ -95,6 +96,8 @@ int main(int argc, char** argv) {
             expect("GIO_EXTRA_MODULES", "");
             expect("WEBKIT_INJECTED_BUNDLE_PATH", launch.engine_dir + "/lib/injected-bundle");
             expect("PULSE_CLIENTCONFIG", launch.engine_dir + "/etc/pulse/client.conf");
+            expect("PULSE_RUNTIME_PATH", launch.runtime_dir + "/pulse");
+            expect("GST_REGISTRY_UPDATE", "<unset>");
             expect("WEBKIT_GST_ENABLE_HLS_SUPPORT", "1");
             expect("WEBKIT_GST_ENABLE_DASH_SUPPORT", "1");
         }

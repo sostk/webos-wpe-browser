@@ -38,6 +38,13 @@ void set_env(std::vector<std::string> &env, const std::string &name, const std::
     env.push_back(prefix + value);
 }
 
+void unset_env(std::vector<std::string> &env, const std::string &name) {
+    const std::string prefix = name + "=";
+    env.erase(std::remove_if(env.begin(), env.end(),
+                             [&](const std::string &e) { return e.compare(0, prefix.size(), prefix) == 0; }),
+              env.end());
+}
+
 uint64_t monotonic_ms() {
     timespec ts{};
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -109,7 +116,21 @@ bool EngineClient::start(const EngineLaunch &l, std::string &error) {
     set_env(env, "GST_PLUGIN_SCANNER_1_0", d + "/libexec/gst-plugin-scanner");
     set_env(env, "GST_REGISTRY", l.cache_dir + "/gstreamer-registry.bin");
     set_env(env, "GST_REGISTRY_1_0", l.cache_dir + "/gstreamer-registry.bin");
+    // webOS sets GST_REGISTRY_UPDATE=no for its own GStreamer; inherited, our cached registry would never notice
+    // plugins changed by an app update. Unset, GStreamer compares the plugin files' times and sizes at start.
+    unset_env(env, "GST_REGISTRY_UPDATE");
     set_env(env, "PULSE_CLIENTCONFIG", d + "/etc/pulse/client.conf");
+    // Sound: webOS runs PulseAudio in system mode (auth-anonymous) at /var/run/pulse/native, which the app jail mounts.
+    // libpulse would otherwise look in XDG_RUNTIME_DIR (/tmp/xdg, owned by root), refuse it and play nothing.
+    // Its own runtime files go to our runtime folder instead.
+    static const char kSystemPulse[] = "/var/run/pulse/native";
+    if (::access(kSystemPulse, W_OK) == 0) {
+        set_env(env, "PULSE_SERVER", std::string("unix:") + kSystemPulse);
+        // LG's policy module routes the virtual sinks to the speakers at their own volume; a stream on the
+        // hardware sink (pcm_output, the default) gets 0 %. pmedia is the one for media playback.
+        set_env(env, "PULSE_SINK", "pmedia");
+    }
+    set_env(env, "PULSE_RUNTIME_PATH", l.runtime_dir + "/pulse");
     set_env(env, "WEBKIT_GST_ENABLE_HLS_SUPPORT", "1");
     set_env(env, "WEBKIT_GST_ENABLE_DASH_SUPPORT", "1");
     set_env(env, "FONTCONFIG_FILE", d + "/etc/fonts/fonts.conf");
@@ -119,10 +140,15 @@ bool EngineClient::start(const EngineLaunch &l, std::string &error) {
     set_env(env, "XDG_CONFIG_HOME", l.data_dir + "/config");
     set_env(env, "HOME", l.data_dir);
     if (gpu) {
-        // C1/webOS 6.5.3: Mali compositing + WebGL pass, but Skia GPU painting
-        // corrupts ordinary page tiles. Keep CPU tile painting until that is fixed.
+        // Skia paints on the CPU; the GPU composites and presents. WebKit's hybrid GPU+CPU painting made Wikipedia's
+        // first paint 3.9 → 3.5 s, but its Skia GPU contexts cache up to 256 MB each: on a YouTube watch page the
+        // web process held 407 MB of Mali buffers instead of 140 MB, and webOS killed it under memory pressure
+        // during playback (TV, 2026-11-11). {"wpebEnv": {"WEBKIT_SKIA_ENABLE_CPU_RENDERING": "0"}} tries hybrid again.
         set_env(env, "WEBKIT_SKIA_ENABLE_CPU_RENDERING", "1");
         set_env(env, "WEBKIT_DISABLE_DEFAULT_EGL_DISPLAY", "0");
+        // More painting threads than WebKit's default (half the cores): the main thread is the bottleneck, and the
+        // sooner its paint work is taken off it the better (Wikipedia on the TV, 2026-11-11).
+        set_env(env, "WEBKIT_SKIA_CPU_PAINTING_THREADS", "4");
     } else {
         set_env(env, "GALLIUM_DRIVER", "llvmpipe");
         set_env(env, "MESA_SHADER_CACHE_DIR", l.cache_dir + "/mesa");
@@ -130,6 +156,8 @@ bool EngineClient::start(const EngineLaunch &l, std::string &error) {
         set_env(env, "WEBKIT_SKIA_ENABLE_CPU_RENDERING", "1");
     }
     set_env(env, "WPE_BROWSER_RENDERER", gpu ? "gpu" : "software");
+    // JavaScript garbage collection marks in parallel on every core.
+    set_env(env, "JSC_numberOfGCMarkers", "4");
     if (gpu && !l.surface_group.empty()) {
         set_env(env, "WPE_BROWSER_PRESENT", "direct");
         set_env(env, "WPEB_SURFACE_GROUP", l.surface_group);
@@ -137,8 +165,25 @@ bool EngineClient::start(const EngineLaunch &l, std::string &error) {
         set_env(env, "WPEB_SURFACE_LAYER", l.surface_layer.empty() ? "page" : l.surface_layer);
         // The full socket path, so the web processes need not share our XDG_RUNTIME_DIR / WAYLAND_DISPLAY.
         if (!l.wayland_socket.empty()) set_env(env, "WPEB_WAYLAND_SOCKET", l.wayland_socket);
+        if (!l.media_socket.empty()) {
+            // Video goes to LG's decoder on the video plane under the page (engine/gst/wpebmediasink.c): WebKit's
+            // generic "rialto" quirks find our sinks by name and punch a hole in the page where the video is.
+            // Needs playbin3 (WebKit only punches holes there) and direct presentation (a page surface with alpha
+            // above the video plane).
+            set_env(env, "WPEB_MEDIA_SOCKET", l.media_socket);
+            set_env(env, "WEBKIT_GST_QUIRKS", "rialto");
+            set_env(env, "WEBKIT_GST_HOLE_PUNCH_QUIRK", "rialto");
+            set_env(env, "WEBKIT_GST_USE_PLAYBIN3", "1");
+        }
     } else {
         set_env(env, "WPE_BROWSER_PRESENT", "shm");
+    }
+    for (const auto &[name, value] : l.extra_env) {
+        if (name.rfind("WEBKIT_", 0) == 0 || name.rfind("JSC_", 0) == 0 || name.rfind("WPE_BROWSER_DEBUG", 0) == 0 ||
+            name.rfind("GST_DEBUG", 0) == 0) {
+            set_env(env, name, value);
+            WNK_LOGI(kCat, "engine env %s=%s (launch parameter)", name.c_str(), value.c_str());
+        }
     }
     set_env(env, "WPE_BROWSER_DATA_DIR", l.data_dir);
     set_env(env, "WPE_BROWSER_CACHE_DIR", l.cache_dir);
@@ -389,6 +434,16 @@ void EngineClient::handle(const uint8_t *buf, size_t n, int fd) {
             std::memcpy(&hi, p, sizeof(hi));
             cb_.history(h.tab, hi.can_go_back != 0, hi.can_go_forward != 0);
         }
+        break;
+    case WPE_ENGINE_TAB_CREATED:
+        if (len >= sizeof(WpeTabCreated) && cb_.tab_created) {
+            WpeTabCreated c;
+            std::memcpy(&c, p, sizeof(c));
+            cb_.tab_created(h.tab, c.opener);
+        }
+        break;
+    case WPE_ENGINE_TAB_CLOSE:
+        if (cb_.tab_close) cb_.tab_close(h.tab);
         break;
     case WPE_ENGINE_SCROLL:
         if (len >= sizeof(WpeFlag) && cb_.scroll) {

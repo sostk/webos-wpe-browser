@@ -382,3 +382,122 @@
     path). All tabs already share one web process (related views), so little isolation is lost. Checked on the PC
     (direct probe: YouTube and a cross-site redirect stay in one process) and on the TV: YouTube draws in direct mode.
   - The backend keeps the handoff and now gives the surface its window role only while attached (safer for crash restarts).
+- 2026-11-11 **Page-load speed investigation** (TV: 4x Cortex-A55, 2.6 GB RAM, ~1 GB free, all 4 cores allowed, no cgroup limit):
+  - Engine logs Navigation Timing per page ("tab N timing: dns/connect/ttfb/html | interactive dcl fcp load | resources").
+  - Launch parameter {"wpebEnv": {"WEBKIT_*"/"JSC_*"/"WPE_BROWSER_DEBUG*": "..."}} passes engine environment for
+    experiments; WPE_BROWSER_DEBUG_SETTINGS="prop=value;..." sets WebKitSettings properties (e.g. user-agent,
+    enable-javascript-markup).
+  - Wikipedia (desktop): network ~0.6 s, DOM interactive ~1.0 s, first paint 3.5-4.2 s (run-to-run noise ~0.4 s).
+    Page JS off: no change. example.com: first paint 0.23-0.5 s. The main thread is at 100% of one core from
+    navigation to first paint; painting/JIT threads mostly idle. UI uses ~15% CPU constantly (60 fps redraw).
+  - tools/tv-sampler (ptrace sampler pushed to /tmp on the TV, report.py on the PC against the unstripped WebKit):
+    before first paint the main thread is in layout 25%, text/fonts 18% (fontconfig, FreeType, ICU, HarfBuzz),
+    waiting 15%, style 12%, parsing/DOM 8%, JS 6%: no single hotspot. After load, layout+style continue (Wikipedia's
+    deferred scripts). gdbserver over a network port / SSH was refused by the permission system; ares-shell's stdin
+    pipe works for gdb but interrupt-based sampling did not.
+  - GPU painting (WebKit hybrid) now renders correctly (the 2026-11-10 "Mali tile corruption" was the Skia ABI bug,
+    patch 0005) and is the GPU-mode default; first paint ~10% earlier in back-to-back runs.
+  - Mobile sites are much cheaper: YouTube desktop interactive 10.3 s / load 10.6 s / 23 core-s vs m.youtube.com
+    2.8 s / 3.7 s / 11 core-s. Wikipedia's mobile redirect needs another UA string.
+  - WebKit is compiled for -mcpu=cortex-a9 (Buildroot BR2_GCC_TARGET_CPU); the TV is Cortex-A55. Division helpers
+    are 0% of samples; re-tuning would mainly help scheduling (estimate ~10%, ~5 h rebuild).
+- 2026-11-11 **More WebKit threads** (GPU mode defaults now): WEBKIT_SKIA_CPU_PAINTING_THREADS=4,
+  WEBKIT_SKIA_GPU_PAINTING_THREADS=2, JSC_numberOfGCMarkers=4. Wikipedia, 3 runs each: default first paint 4.09 s /
+  load 4.59 s; with the threads 3.57 / 4.03 (A/B via wpebEnv) and 3.80 / 4.25 after installing them as defaults:
+  ~7-13 % faster. Layout/style/parsing stay on the one main thread (WebKit design; same in Chrome).
+  - Maximum threads (8 CPU + 4 GPU painting): first paint 3.83 s / load 4.38 s vs 3.73 / 4.18 with 4+2 (4 runs each):
+    slower (painting threads crowd the main thread on 4 cores). GPU-affine hybrid strategy: 3.80 / 4.24; with 4 GPU
+    threads 3.63 / 4.20: within noise. Kept 4 CPU + 2 GPU, WPE's default CPU-affine strategy.
+- 2026-11-11 **YouTube video** (user: "fixing video playback on youtube"; TV tests with the user's go-ahead):
+  - **Sound** never worked: libpulse looked in XDG_RUNTIME_DIR=/tmp/xdg (root's). The TV's PulseAudio (9.0, LG-patched,
+    system mode, auth-anonymous) is at /var/run/pulse/native, mounted in the app jail. Our PulseAudio 17 libpulse is
+    dropped by it on stream creation ("Connection terminated"; memfd/SHM off made no difference), the TV's own
+    libpulse.so.0 works: stage-engine.sh no longer bundles it (system lib). PULSE_SERVER + PULSE_SINK=pmedia
+    (LG's policy gives streams on the hardware sink pcm_output 0 % volume; pmedia/pdefaultapp 100 %, pndk 0 %),
+    PULSE_RUNTIME_PATH in our runtime folder. GST_REGISTRY_UPDATE=no (inherited from webOS) is unset.
+  - **Black screen mid-video = webOS killed the web process**: SIGTERM from `sam` (seen with gdb over the ares-shell
+    stdin pipe: `target remote | ares-shell -d tv -r "gdbserver - --attach PID"`, NDK gdb). memchute
+    (com.webos.memorymanager, getCurrentMemState/getUnitList via luna-send in a pty) went "medium" with the web
+    process at ~800-900 MB. Hybrid GPU painting held 407 MB of Mali buffers vs 140 MB with CPU painting on the same
+    page (Skia GPU caches, 256 MB per context, no limit set by WebKit): GPU mode now paints on the CPU again
+    (WEBKIT_SKIA_ENABLE_CPU_RENDERING=1; GPU composites and presents). YouTube's watch page alone is ~600 MB.
+  - Software decoding: YouTube chose VP9 1080p60 (dropped frames, memory). Engine user script (all frames, page
+    world) answers MediaSource.isTypeSupported / canPlayType / mediaCapabilities "no" above 1280x720@30 and for
+    VP9/AV1 when decoding is in software; WPE_BROWSER_DEBUG_MEDIA="off" | "PIXELS@FPS[+vp9]". Still not smooth.
+  - **Hardware video (works, user: "The video is smooth")**: engine/gst/wpebmediasink.c registers `rialtomsevideosink`
+    and `rialtomseaudiosink`; WebKit 2.50's generic "rialto" quirks (WEBKIT_GST_QUIRKS=rialto,
+    WEBKIT_GST_HOLE_PUNCH_QUIRK=rialto, WEBKIT_GST_USE_PLAYBIN3=1) make decodebin stop at encoded H.264/HEVC/VP9 and
+    use them as the hole-punch video sink (no WebKit rebuild). The sink (sync to the pipeline clock) streams access
+    units over a socket (common/wpe_media_ipc.h, $runtime/media.sock) to the UI process, whose MediaServer feeds the
+    kit's NdlBackend: LG's media stack registers bus names under the app's luna role, which is bound to the
+    `wpebrowser` executable, not WPEWebProcess. Picture on the video plane under the page (page surface below the
+    UI window, both transparent there). First run: VP9 854x480 NDL load 2.2 s, Init 0.4 s, SetAppState -> -1 (logged
+    only), area follows WebKit's rectangle. Audio still software (pulsesink in our audio sink): one NDL session per
+    app, page sounds must not take it. Off: launch parameter {"wpebVideo":"software"} or non-direct presentation.
+  - Open: A/V sync (audio separate from NDL), pipeline pause/resume every ~8 s in the log (buffering?), web process
+    ~85 % CPU on YouTube's desktop page, fullscreen, seeking (NDL splice), tab switch/background with video.
+- 2026-11-11 **Hardware video: comparison with webOS-ports/chromium151** (Chromium 151 on LG's webOS OSE Chromium 120 port):
+  - Page overlays: our NDL video is a punch-through LG places directly below the app's main window, which cuts out
+    the page layer below it (YouTube controls vanished). Raising the page above the UI fixed the picture but gave
+    the page surface keyboard focus; `focus_owner` (owner or client side) and `set_key_index -1` are rejected by
+    LG's compositor (group destroyed / Wayland error 22). Page raising is now opt-in ({"wpebRaisePage":"1"}).
+  - Chromium never has this problem: page and controls are one surface, the video element becomes a viz
+    VideoHoleDrawQuad (transparent hole), and the video plane is bound to an **exported window** created on that
+    surface with LG's `wl_webos_foreign.export_element(surface, video_object=0)` (ui/ozone/platform/wayland/
+    extensions/webos/host/webos_foreign_video_window*.cc). `window_id_assigned` gives the id; geometry goes through
+    `wl_webos_exported.set_exported_window(src, dst)` or `set_crop_region`; `set_property("mute", on/off)` hides it.
+  - The id goes to LG's media pipeline as `option.windowId` (media/neva/webos/umediaclient_impl.cc, uMediaServer
+    `uMediaClient` for URL/HLS playback; MSE on OSE goes through media/gpu/webos `mcil` decoding into GL textures,
+    which this TV does not have: no libmcil; it has libplayerAPIs (StarfishMediaAPIs), libumedia_api, libNDL*).
+  - So the Chromium-equivalent for this TV: export a video window on **our page surface** (backend, web process),
+    send its window id over the media socket, and play through the kit's StarfishBackend (libplayerAPIs; already
+    uses option.windowId with SDL-webOS exported windows; needs a "use this window id" option) in the UI process.
+    That keeps the page above its own video, no z-order flip or focus problem, and Starfish takes compressed audio
+    (AAC/Opus) and has pause/seek/position, unlike NDL v2.
+- 2026-11-11 **Hardware video now Chromium-style** (user: "Can we update ours to match chromium"):
+  - Backend (web process) binds wl_webos_foreign and exports `wpeb_webos_video_open/place/close`: export_element
+    (video_object) on the shown page surface, window_id_assigned awaited (1 s, event on the target's queue),
+    set_exported_window(src = coded picture, dst = WebKit's hole rectangle). The media sink (same process,
+    dlopen RTLD_NOLOAD of libWPEBackend-webos.so) opens it at caps time and sends the id in WPEB_MEDIA_LOAD (IPC v2).
+  - UI MediaServer: a load with a window id plays through the kit's StarfishBackend (libplayerAPIs) with
+    StarfishOptions::window_id (kit patch 0006: use an external exported window, never create/place/destroy it);
+    without one, NDL as before. TV: test page H.264 720p30 via Starfish, window _Window_Id_18, ~30 fps shown,
+    0 dropped after start; overlays draw over the video with the page *below* the UI (no z flip, no focus issue);
+    loop restart used LG's Seek(0). YouTube: Starfish VP9 854x480 on its own page window.
+  - Page raising (wpebRaisePage) is no longer needed; kept opt-in. Audio still PulseAudio (next: AAC/Opus into the
+    same Starfish load for A/V sync).
+- 2026-11-11 **No kit Starfish: own LG media pipeline client** (user: "Donot use kit starfish do what chromium does"):
+  - webOS-ports/chromium151: URL playback = uMediaServer uMediaClient (libumedia_api) with option.windowId = the
+    exported window (media/neva/webos/umediaclient_impl.cc). Its MSE path is mcil (media/gpu/webos), absent on this
+    TV; uMediaClient has no buffer feed (checked the TV's libumedia_api exports). User chose: Chromium's
+    uMediaServer path for URLs (not done yet: needs WebKit to hand the URL over) + our own StarfishMediaAPIs client
+    for MSE. Kit patch 0006 removed again.
+  - browser/lg_media_player.{hpp,cpp}: links libplayerAPIs through the NDK's starfish-media-pipeline header
+    (StarfishMediaAPIs in a 64 KiB block, never freed); BUFFERSTREAM Load with option.windowId, appId, codec,
+    envelope from smp::util::getMaxVideoResolution; Feed {"bufferAddr","bufferSize","pts" ns,"esData":1}; media
+    (stream) time from the sink; Seek(ms) at the first unit after a load/flush; real Pause/Play; Unload on a worker.
+  - MediaServer: per-stream feeder thread with a queue (generation counter dropped on flush/load), so a "BufferFull"
+    decoder (paused) never blocks pause/play/seek messages (one run stuck after a pause before this).
+  - TV: test page H.264 720p plays, loops via Seek(0); YouTube VP9 480p on _Window_Id_23 with YouTube's controls
+    drawn over the video (screenshot), first frame 0.6 s after Load. A Pause at 0:11 without user input: open.
+- 2026-11-11 **User agent**: "WPEBrowser-webOS/0.2" -> "WPEBrowser/0.2". Sites' mobile checks list "webOS" (Palm phones):
+  webtv.nettv.com.np (client-side, index-*.js: /iPhone|iPad|...|webOS|Tablet|.../i, blockMobileBrowser) showed its
+  mobile page; with the new agent it loads the desktop site (login page, TV 2026-11-11).
+- 2026-11-11 **YouTube findings**: desktop YouTube stalled ~3 s in (only the first segment arrives; then 5.1 E-AC-3 audio
+  also held video 3 s ahead: Dolby now refused by the media-limits script, pulsesink provide-clock off). m.youtube.com
+  with an Android Chrome agent played smoothly on the LG pipeline with its controls over the video, then YouTube's
+  player showed "Something went wrong" at media time 60 s (twice; network idle, no console errors): likely YouTube's
+  bot check (PO token) rejecting a WebKit engine claiming to be Chrome. iPhone Safari agent: streams VP9 360p over MSE;
+  the 60 s mark not yet tested. dash.js sample (Akamai BBB, MSE) plays on the LG pipeline (starts at 320x180).
+- 2026-11-11 **window.open / target=_blank as new tabs** (user: Google sign-in opens a window):
+  - Engine on_create makes a real related view (tab ids from WPE_ENGINE_TAB_ID_BASE 0x40000000, IPC v7
+    WPE_ENGINE_TAB_CREATED {opener}); "close" (window.close) -> WPE_ENGINE_TAB_CLOSE. UI adds the tab after its opener
+    and shows it; on window.close it shows the opener and closes the view 1.5 s later; closing a shown tab shows the
+    next one first.
+  - webOS minimised the whole browser (black screen, user's "crash" on tab switch and after Google sign-in) whenever
+    a page surface's window role was removed or a surface with one was destroyed (even unmapped): webOS counts every
+    page surface as an app window. Backend now: role kept for the surface's life; hidden = detach + unmap (NULL
+    buffer); closed pages' surfaces (with role) are kept in a per-process pool and reused. Also: pages free their
+    surface-group handle with wl_proxy_destroy (never the destroy request), one lock serialises attach/detach in a
+    process, and an attach first detaches any other page of the process holding the layer ("Layer already attached").
+  - TV: popup open -> close -> second popup (reused surface): no minimise, opener shown again (screenshots).

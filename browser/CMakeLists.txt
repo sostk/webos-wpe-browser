@@ -28,9 +28,14 @@ else ()
     message(STATUS "wpebrowser: no staged engine; the package will show 'engine not found'")
 endif ()
 
-add_executable(wpebrowser main.cpp chrome.cpp screens.cpp profile.cpp storage.cpp private_loader.cpp engine_client.cpp page_view.cpp keys.cpp direct_owner.cpp)
+add_executable(wpebrowser main.cpp chrome.cpp screens.cpp profile.cpp storage.cpp private_loader.cpp engine_client.cpp page_view.cpp keys.cpp direct_owner.cpp media_server.cpp lg_media_player.cpp)
 target_include_directories(wpebrowser PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../common")
-target_link_libraries(wpebrowser PRIVATE wnk_app ${CMAKE_DL_LIBS})  # dlopen: libwpeb-owner.so (direct_owner.cpp)
+target_link_libraries(wpebrowser PRIVATE wnk_app wnk_media_ndl ${CMAKE_DL_LIBS})
+if (WNK_WEBOS)
+    # LG's buffer-feed media pipeline (lg_media_player.cpp), from the NDK's starfish-media-pipeline header.
+    target_include_directories(wpebrowser SYSTEM PRIVATE "${CMAKE_SYSROOT}/usr/include/starfish-media-pipeline")
+    target_link_libraries(wpebrowser PRIVATE playerAPIs)
+endif ()  # dlopen: libwpeb-owner.so (direct_owner.cpp)
 target_include_directories(wpebrowser SYSTEM PRIVATE "${WNK_KIT_DIR}/third_party")  # nlohmann/json.hpp
 
 # Fonts (Atkinson Hyperlegible, OFL) live in fonts/ next to the executable, on the host and in the ipk.
@@ -53,7 +58,8 @@ wnk_add_webos_package(
         GLIBC_RUNTIMES ${WPEB_ENGINE_EXTRA_DIR}
         # Direct GPU presentation (engine/lib/libWPEBackend-webos.so, libwpeb-owner.so) must use the TV's own
         # Wayland client and wayland-egl, the ones its Mali EGL is built against.
-        SYSTEM_LIBS libwayland-client.so.0 libwayland-egl.so)
+        # Sound goes through the TV's libpulse: its PulseAudio 9.0 server rejects our newer client (tools/stage-engine.sh).
+        SYSTEM_LIBS libwayland-client.so.0 libwayland-egl.so libpulse.so.0 libplayerAPIs.so.1)
 
 # Host smoke test: OK on the focused button, then Back twice at the root quits.
 wnk_add_app_test(NAME e2e.wpebrowser.starts_and_quits TARGET wpebrowser PREFIX APP_WPEBROWSER
