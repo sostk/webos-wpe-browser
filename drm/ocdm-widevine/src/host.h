@@ -41,6 +41,10 @@ public:
     void setTimeout(int64_t delay_ms, IClient* client, void* context) override;
     void cancel(IClient* client) override;
 
+    // The CDM must not be entered from two threads at once. When set, timer callbacks (which call into the
+    // CDM) run with this lock held, the same lock every other CDM call takes. Set before any timer is armed.
+    void set_cdm_lock(std::recursive_mutex* lock) { cdm_lock_ = lock; }
+
 private:
     struct Timer {
         int64_t due_ms;
@@ -57,6 +61,7 @@ private:
     bool usable_ = false;
     std::mutex storage_mutex_;
 
+    std::recursive_mutex* cdm_lock_ = nullptr;
     std::mutex timer_mutex_;
     std::condition_variable timer_cv_;
     std::vector<Timer> timers_;

@@ -236,7 +236,11 @@ void Host::timer_loop()
         Timer due = *next;
         timers_.erase(next);
         lock.unlock();
-        due.client->onTimerExpired(due.context);
+        if (cdm_lock_) {
+            std::lock_guard<std::recursive_mutex> cdm(*cdm_lock_);
+            due.client->onTimerExpired(due.context);
+        } else
+            due.client->onTimerExpired(due.context);
         lock.lock();
     }
 }

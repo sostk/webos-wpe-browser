@@ -96,6 +96,19 @@ int main()
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
         CHECK(b.fired == 1);
 
+        // With a CDM lock set, a timer callback waits while another thread holds that lock.
+        std::recursive_mutex cdm_lock;
+        host.set_cdm_lock(&cdm_lock);
+        Client c;
+        {
+            std::lock_guard<std::recursive_mutex> held(cdm_lock);
+            host.setTimeout(5, &c, nullptr);
+            std::this_thread::sleep_for(std::chrono::milliseconds(60));
+            CHECK(c.fired == 0);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        CHECK(c.fired == 1);
+
         // A pending timer must not fire after the host is destroyed.
         host.setTimeout(100, &a, nullptr);
     }
