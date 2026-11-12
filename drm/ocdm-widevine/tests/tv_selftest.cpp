@@ -7,6 +7,7 @@
 // samples.vec: kid(16) count(u32 LE) then per sample: iv_len(u8) iv  n(u16 LE) {clear u32 LE, protected u32 LE}*n
 // len(u32 LE) data. expected-clear.bin: the decrypted samples back to back (independently verified).
 // The license request is posted with the TV's curl binary. Run as the browser's jail user.
+#include <gst/gst.h>
 #include <ocdm/open_cdm_adapter.h>
 
 #include <condition_variable>

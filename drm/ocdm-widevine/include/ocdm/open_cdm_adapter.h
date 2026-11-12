@@ -6,7 +6,10 @@
 
 #include "open_cdm.h"
 
-#include <gst/gst.h>
+/* Forward declarations instead of <gst/gst.h>: WebKit detects opencdm_gstreamer_session_decrypt_buffer with a
+ * CMake symbol check that compiles this header without GStreamer's include path. Identical to GStreamer's own. */
+typedef struct _GstBuffer GstBuffer;
+typedef struct _GstCaps GstCaps;
 
 #ifdef __cplusplus
 extern "C" {

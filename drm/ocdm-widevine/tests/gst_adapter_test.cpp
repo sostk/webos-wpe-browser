@@ -1,5 +1,6 @@
 // Decrypts GstBuffers carrying a GstProtectionMeta, as WebKit's decryptor hands them to libocdm, against the
 // fake CDM. Usage: gst_adapter_test <path to fake CDM .so>
+#include <gst/gst.h>
 #include <ocdm/open_cdm_adapter.h>
 
 #include <cstdio>
