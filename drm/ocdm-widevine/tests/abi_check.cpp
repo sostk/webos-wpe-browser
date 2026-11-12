@@ -52,6 +52,7 @@ int main()
         { "getExpiration", 23, slot_of(&Cdm::getExpiration) },
         { "getKeyStatuses", 24, slot_of(&Cdm::getKeyStatuses) },
         { "close", 27, slot_of(&Cdm::close) },
+        { "decrypt", 33, slot_of(&Cdm::decrypt) },
         { "IEventListener::onMessage", 0, slot_of(&Cdm::IEventListener::onMessage) },
         { "IEventListener::onKeyStatusesChange", 1, slot_of(&Cdm::IEventListener::onKeyStatusesChange) },
         { "IStorage::read", 0, slot_of(&Cdm::IStorage::read) },

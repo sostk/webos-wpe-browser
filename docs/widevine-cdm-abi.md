@@ -45,6 +45,29 @@ Run through the repo's `cdm.h` and `Host`, as the jail user:
 | `getExpiration` (slot 23) | `kSuccess`, -1 (no expiry) |
 | `close` (slot 27) | `kSuccess`; afterwards `getKeyStatuses` returns `kSessionNotFound` |
 
+### Decryption: v16 batch API (slot 33)
+
+v16 no longer has the old `decrypt(InputBuffer, OutputBuffer)`. Slot 33 is
+`decrypt(const std::string& session_id, const DecryptionBatch& batch)`, found by disassembling the pulled
+library: it is the one vtable method that calls the engine's virtual `DecryptV16`
+(`wvcdm::CdmEngine::DecryptV16`, exported). Its code gives the layouts (32-bit):
+
+- `DecryptionBatch` (36 bytes): samples\*, count, key_id\*, key_id_length, pattern encrypted/clear blocks
+  (must be 0/0 for AES-CTR), `bool is_secure` (+24), scheme (+28: 1 CTR, 2 CBC), `bool is_video` (+32).
+- `Sample` (36 bytes): iv\*, iv_length (16 when anything is protected; zero-pad 8-byte CENC IVs),
+  data\*, data_length, subsamples\*, count (`{clear_bytes, protected_bytes}`), output\*, output_offset,
+  output_length (`output_length - output_offset >= data_length`).
+- With `kNoSecureOutput`, a batch with `is_secure` set is refused (`kNotSupported`).
+
+Verified on the TV with the Angel One fragments (first encrypted fragment of each track; the first
+fragments are clear lead): one batch of 188 audio samples and one of 100 video samples (subsamples
+23 clear + 1472 protected) both returned `kSuccess`. Written back into the fragments on the build machine,
+ffmpeg decoded them with **0 errors** (187 audio frames, 100 video frames, picture correct) against 416/210
+errors for the still-encrypted fragments.
+
+This content's video key allowed decryption into normal memory. Services that require hardware-secure
+decoding for video (most HD/UHD content) are expected to refuse that; that is the secure-video-path question.
+
 ### Status codes are v16's, not the 2015 header's
 
 `kSuccess` 0; EME-style errors 1-5 (`kTypeError`, `kNotSupported`, `kInvalidState`, `kQuotaExceeded`,
@@ -66,11 +89,12 @@ The provisioning URL is the one in the TV's `/usr/lib/libwvcdm_shared.so.16.3.0.
 
 ## Not yet verified
 
-- `load` (20), `loadEmbeddedKeys` (22), the key-usage queries (25, 26) and everything after `close` (27):
-  `remove`, `forceRemove`, `decrypt`, ... `cdm.h` declares nothing past slot 27.
+- `load` (20), `loadEmbeddedKeys` (22), the key-usage queries (25, 26), `remove`/`forceRemove` (28, 29:
+  given a non-session they return `kSessionNotFound`, consistent with taking a session id), slots 30-32,
+  and everything after `decrypt` (33). `cdm.h` declares nothing past slot 33.
 - `IEventListener` slots 2-4 (`onRemoveComplete`, `onDeferredComplete`, `onDirectIndividualizationRequest`).
-- The v16 `InputBuffer`/`OutputBuffer` layout for `decrypt()`.
-- Secure video path: whether decrypted frames can reach our LG media pipeline (`HW_SECURE_*` content).
+- Secure video path: content whose video key demands hardware-secure decoding, and whether its frames can
+  reach our LG media pipeline.
 
 ## Gotchas
 

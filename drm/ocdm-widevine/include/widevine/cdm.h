@@ -175,15 +175,40 @@ public:
         std::string build_info;
     };
 
-    // Decrypt buffers: NOT VERIFIED for v16. This is the older published layout; v16 changed the
-    // sample description (patterns/subsamples). Do not call decrypt() until the layout is proven.
+    // ---- v16 batch decryption (VERIFIED: layout read from the library's decrypt code, then confirmed by
+    // decrypting real CENC audio and video on the TV and decoding the output with no errors) ----
     typedef enum { kClear = 0, kAesCtr = 1, kAesCbc = 2 } EncryptionScheme;
-    struct Pattern {
-        uint32_t encrypted_blocks;
-        uint32_t clear_blocks;
+
+    struct Subsample {               // 8 bytes
+        uint32_t clear_bytes;
+        uint32_t protected_bytes;
     };
-    struct InputBuffer;
-    struct OutputBuffer;
+
+    // One encrypted sample and where its clear output goes. 36 bytes.
+    struct Sample {
+        const uint8_t* iv;           // +0  16 bytes; an 8-byte CENC IV is zero-padded to 16
+        uint32_t iv_length;          // +4  must be 16 when any byte is protected
+        const uint8_t* data;         // +8
+        uint32_t data_length;        // +12
+        const Subsample* subsamples; // +16 a fully encrypted sample is one {0, data_length} entry
+        uint32_t subsamples_length;  // +20
+        uint8_t* output;             // +24
+        uint32_t output_offset;      // +28
+        uint32_t output_length;      // +32 output_length - output_offset must be >= data_length
+    };
+
+    // Samples sharing one key and scheme. 36 bytes.
+    struct DecryptionBatch {
+        const Sample* samples;       // +0
+        uint32_t samples_length;     // +4
+        const uint8_t* key_id;       // +8
+        uint32_t key_id_length;      // +12
+        uint32_t pattern_encrypted;  // +16 'cbcs'/'cens' pattern; must be 0/0 for AES-CTR ('cenc')
+        uint32_t pattern_clear;      // +20
+        bool is_secure;              // +24 must be false with kNoSecureOutput (else kNotSupported)
+        EncryptionScheme encryption_scheme; // +28
+        bool is_video;               // +32
+    };
 
     // ---- static entry points (exported symbols, VERIFIED by mangled name) ----
     static Status initialize(SecureOutputType secure_output_type, const ClientInfo& client_info, IStorage* storage,
@@ -226,12 +251,32 @@ public:
     virtual void reservedSlot25() = 0;                                                                          // 25
     virtual void reservedSlot26() = 0;                                                                          // 26
     virtual Status close(const std::string& session_id) = 0;                                                    // 27 VERIFIED
-    // Slots 28 and beyond (remove, forceRemove, decrypt, ...) are not declared yet: declaring them
-    // wrongly would silently call the wrong method. They are added as each one is verified on the TV.
+    virtual Status remove(const std::string& session_id) = 0;                                                   // 28 EXPECTED
+    virtual Status forceRemove(const std::string& session_id) = 0;                                              // 29 EXPECTED
+    // Slots 30-32: not identified; placeholders that keep decrypt() at slot 33. Never call them.
+    virtual void reservedSlot30() = 0;                                                                          // 30
+    virtual void reservedSlot31() = 0;                                                                          // 31
+    virtual void reservedSlot32() = 0;                                                                          // 32
+    // Decrypts every sample of |batch| into its output buffer, synchronously. VERIFIED.
+    virtual Status decrypt(const std::string& session_id, const DecryptionBatch& batch) = 0;                    // 33 VERIFIED
+    // Slots 34 and beyond are not declared: declaring them wrongly would silently call the wrong method.
 
 protected:
     Cdm() { }
 };
+
+#if defined(__arm__)
+// Offsets read from the library's decrypt code (32-bit ARM).
+static_assert(sizeof(Cdm::Subsample) == 8, "Subsample layout");
+static_assert(sizeof(Cdm::Sample) == 36 && __builtin_offsetof(Cdm::Sample, subsamples) == 16
+        && __builtin_offsetof(Cdm::Sample, output) == 24 && __builtin_offsetof(Cdm::Sample, output_length) == 32,
+    "Sample layout");
+static_assert(sizeof(Cdm::DecryptionBatch) == 36 && __builtin_offsetof(Cdm::DecryptionBatch, pattern_encrypted) == 16
+        && __builtin_offsetof(Cdm::DecryptionBatch, is_secure) == 24
+        && __builtin_offsetof(Cdm::DecryptionBatch, encryption_scheme) == 28
+        && __builtin_offsetof(Cdm::DecryptionBatch, is_video) == 32,
+    "DecryptionBatch layout");
+#endif
 
 } // namespace widevine
 
