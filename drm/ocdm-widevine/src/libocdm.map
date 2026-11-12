@@ -1,0 +1,7 @@
+/* Only the OpenCDM C API is exported; everything else stays private to libocdm. */
+{
+    global:
+        opencdm_*;
+    local:
+        *;
+};
