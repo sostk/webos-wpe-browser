@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstdio>
+#include <cstring>
 #include <ctime>
 #include <dirent.h>
 #include <fcntl.h>
@@ -47,6 +48,10 @@ Host::Host(std::string directory)
     while (directory_.size() > 1 && directory_.back() == '/')
         directory_.pop_back();
     make_dirs(directory_);
+    struct stat st;
+    usable_ = stat(directory_.c_str(), &st) == 0 && S_ISDIR(st.st_mode) && access(directory_.c_str(), R_OK | W_OK | X_OK) == 0;
+    if (!usable_)
+        fprintf(stderr, "ocdm-widevine: storage directory %s is not usable: %s\n", directory_.c_str(), strerror(errno));
     timer_thread_ = std::thread([this] { timer_loop(); });
 }
 

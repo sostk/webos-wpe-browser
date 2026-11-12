@@ -22,6 +22,9 @@ public:
     Host& operator=(const Host&) = delete;
 
     const std::string& directory() const { return directory_; }
+    // False when the directory could not be created or is not writable: the CDM would then fail every
+    // provisioning and license call with no clear cause, so callers check this first.
+    bool usable() const { return usable_; }
 
     // IStorage
     bool read(const std::string& name, std::string* data) override;
@@ -51,6 +54,7 @@ private:
     void timer_loop();
 
     std::string directory_;
+    bool usable_ = false;
     std::mutex storage_mutex_;
 
     std::mutex timer_mutex_;

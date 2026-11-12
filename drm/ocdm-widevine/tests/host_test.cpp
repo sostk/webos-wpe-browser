@@ -37,6 +37,7 @@ int main()
     {
         ocdm_widevine::Host host(dir);
 
+        CHECK(host.usable());
         struct stat st;
         CHECK(stat(dir.c_str(), &st) == 0 && S_ISDIR(st.st_mode));
         CHECK((st.st_mode & 0777) == 0700);
@@ -99,6 +100,18 @@ int main()
         host.setTimeout(100, &a, nullptr);
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
+
+    // A directory that cannot be created (parent not writable) is reported, not silently accepted.
+    {
+        std::string locked = root + "/locked";
+        mkdir(locked.c_str(), 0500);
+        if (geteuid() != 0) { // root ignores the permission bits
+            ocdm_widevine::Host blocked(locked + "/widevine");
+            CHECK(!blocked.usable());
+            CHECK(!blocked.write("cert.bin", "x"));
+        }
+        chmod(locked.c_str(), 0700);
+    }
 
     std::string cleanup = "rm -rf '" + root + "'";
     if (std::system(cleanup.c_str()) != 0)
