@@ -1,3 +1,5 @@
+include $(sort $(wildcard $(BR2_EXTERNAL_WEBOS_BROWSER_PATH)/package/*/*.mk))
+
 # Overrides for Buildroot packages. Recipes expand these variables lazily, so appending here works.
 # Use the WPEPlatform API (headless platform, SHM buffers) and skip the DRM/Wayland platforms,
 # which the browser does not use (it composites WebKit's buffers itself through the kit).
@@ -51,5 +53,14 @@ WPEWEBKIT_DEPENDENCIES += gst1-plugins-good gst1-plugins-bad
 # Package infrastructure already expanded configure prerequisites before external.mk
 # was included; add the order-only edge explicitly for incremental package targets.
 $(WPEWEBKIT_TARGET_CONFIGURE): | gst1-plugins-good gst1-plugins-bad
-WPEWEBKIT_CONF_OPTS += -DENABLE_MEDIA_SOURCE=ON -DENABLE_ENCRYPTED_MEDIA=ON -DENABLE_THUNDER=OFF -DUSE_EXTERNAL_HOLEPUNCH=OFF
+WPEWEBKIT_CONF_OPTS += -DENABLE_MEDIA_SOURCE=ON -DENABLE_ENCRYPTED_MEDIA=ON -DUSE_EXTERNAL_HOLEPUNCH=OFF
+# Widevine EME through WebKit's Thunder backend, served by libocdm (package/ocdm-widevine), which drives the
+# TV's own CDM in-process: no Thunder framework. Without it, EME has ClearKey only.
+ifeq ($(BR2_PACKAGE_OCDM_WIDEVINE),y)
+WPEWEBKIT_DEPENDENCIES += ocdm-widevine
+$(WPEWEBKIT_TARGET_CONFIGURE): | ocdm-widevine
+WPEWEBKIT_CONF_OPTS += -DENABLE_THUNDER=ON
+else
+WPEWEBKIT_CONF_OPTS += -DENABLE_THUNDER=OFF
+endif
 endif

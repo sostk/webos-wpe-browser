@@ -1,0 +1,12 @@
+config BR2_PACKAGE_OCDM_WIDEVINE
+	bool "ocdm-widevine"
+	depends on BR2_INSTALL_LIBSTDCPP
+	depends on BR2_TOOLCHAIN_HAS_THREADS
+	select BR2_PACKAGE_GSTREAMER1
+	help
+	  The OpenCDM C API used by WebKit's Thunder EME backend, implemented
+	  in-process on the webOS TV's own Widevine CE CDM, which it loads at
+	  run time (no vendor binary is built or shipped). Lets WPE WebKit play
+	  Widevine-protected media with ENABLE_THUNDER=ON and no Thunder daemon.
+
+	  drm/ocdm-widevine in this repository; docs/widevine-cdm-abi.md.

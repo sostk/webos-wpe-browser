@@ -1,1 +1,1 @@
-# no extra packages yet
+source "$BR2_EXTERNAL_WEBOS_BROWSER_PATH/package/ocdm-widevine/Config.in"
