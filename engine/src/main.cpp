@@ -1121,6 +1121,9 @@ int main(int, char **)
     // /iPhone|...|webOS|.../i showed its mobile page (2026-11-11). The rest is WPE's desktop Linux agent.
     webkit_settings_set_user_agent_with_application_details(g.settings, "WPEBrowser", "0.2");
     webkit_settings_set_enable_developer_extras(g.settings, FALSE);
+    // EME (navigator.requestMediaKeySystemAccess) is off by default on WPE. Widevine comes from libocdm, which
+    // drives the TV's own CDM (drm/ocdm-widevine); ClearKey is WebKit's own.
+    webkit_settings_set_enable_encrypted_media(g.settings, TRUE);
     // Experiments: WPE_BROWSER_DEBUG_SETTINGS="enable-javascript=false;enable-page-cache=0" sets WebKitSettings properties
     // (booleans, integers, strings), e.g. from the launch parameter {"wpebEnv": {"WPE_BROWSER_DEBUG_SETTINGS": "..."}}.
     if (const char *debug = getenv("WPE_BROWSER_DEBUG_SETTINGS")) {
