@@ -68,6 +68,18 @@ errors for the still-encrypted fragments.
 This content's video key allowed decryption into normal memory. Services that require hardware-secure
 decoding for video (most HD/UHD content) are expected to refuse that; that is the secure-video-path question.
 
+### libocdm on the TV (drm/ocdm-widevine)
+
+`tests/tv_selftest.cpp`, linked against the ARM `libocdm.so` and run as the jail user with the browser
+bundle's GStreamer: `opencdm_create_system` loaded the CDM; with an empty storage directory libocdm
+provisioned the device itself (the TV's libcurl, Google's endpoint) and the next run reused the stored
+certificate; `opencdm_construct_session` delivered the license request with the `0:Type:` prefix; after
+`opencdm_session_update` WebKit-style callbacks reported 5 keys then "keys updated", the keys were
+`Usable`, and `opencdm_get_system_session` found the session by key id. Every sample of the Angel One
+fragments, decrypted through `opencdm_gstreamer_session_decrypt_buffer` as GstBuffers carrying a CENC
+GstProtectionMeta (188 audio, 100 video with subsamples), came out byte-identical to the decryption that
+ffmpeg decoded with no errors. `ocdm_test` (fake CDM) also passes on the TV.
+
 ### Status codes are v16's, not the 2015 header's
 
 `kSuccess` 0; EME-style errors 1-5 (`kTypeError`, `kNotSupported`, `kInvalidState`, `kQuotaExceeded`,

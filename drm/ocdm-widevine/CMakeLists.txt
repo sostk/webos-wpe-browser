@@ -55,5 +55,10 @@ if (OCDM_WIDEVINE_TESTS)
         target_link_libraries(gst_adapter_test PRIVATE ocdm ${CMAKE_DL_LIBS} PkgConfig::GST)
         target_include_directories(gst_adapter_test PRIVATE include)
         add_test(NAME gst_adapter_test COMMAND gst_adapter_test $<TARGET_FILE:fake_cdm>)
+
+        # Runs on the TV only (real CDM, network); not registered with ctest.
+        add_executable(tv_selftest tests/tv_selftest.cpp)
+        target_link_libraries(tv_selftest PRIVATE ocdm PkgConfig::GST)
+        target_include_directories(tv_selftest PRIVATE include)
     endif ()
 endif ()
