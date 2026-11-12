@@ -32,10 +32,32 @@ pulse-access, se, kadaptor, crashd).
 | `createSession(kTemporary, &sid)` (slot 18) | `kSuccess`, `"ksid…"` |
 | `generateRequest(sid, kCenc, <Widevine PSSH>)` (slot 19) | `kSuccess`, `onMessage(kLicenseRequest)` with a 2128-byte SignedMessage |
 
+### License round trip (Shaka "Angel One" Widevine test content, Google's no-auth test proxy)
+
+Run through the repo's `cdm.h` and `Host`, as the jail user:
+
+| Step | Result |
+|---|---|
+| `generateRequest` | listener slot 0 (`onMessage`), type 0 (license request), 2155 bytes |
+| POST to `https://cwip-shaka-proxy.appspot.com/no_auth` | HTTP 200, 1657-byte license |
+| `update(sid, license)` (slot 21) | `kSuccess`; listener slot 1 (`onKeyStatusesChange`, has_new_usable_key = true) |
+| `getKeyStatuses` (slot 24) | 5 keys, all `kUsable`, including the audio and video KIDs of the content |
+| `getExpiration` (slot 23) | `kSuccess`, -1 (no expiry) |
+| `close` (slot 27) | `kSuccess`; afterwards `getKeyStatuses` returns `kSessionNotFound` |
+
+### Status codes are v16's, not the 2015 header's
+
+`kSuccess` 0; EME-style errors 1-5 (`kTypeError`, `kNotSupported`, `kInvalidState`, `kQuotaExceeded`,
+`kRangeError`); Widevine's own from 101: `kNeedsDeviceCertificate` 101 (seen: createSession before
+provisioning), `kSessionNotFound` 102 (seen), `kDecryptError` 103, `kNoKey` 104,
+`kKeyUsageBlockedByPolicy` 105; `kUnexpectedError` 99999 (seen: an empty provisioning reply).
+Earlier probe output that showed "1"/"2" was the EME errors, not "needs certificate".
+
 Also seen: slot 4 `getServiceCertificateRequest` returns `08 04`; slot 8 `getOemCryptoBuildInfo` returns
 `"oemcrypto build time : May 19 2022 …"`. Slots 12-17 behave consistently with
 `removeProvisioning, listStoredLicenses, listUsageRecords, deleteUsageRecord, deleteAllUsageRecords,
-getStatusForHdcpVersion`. Slots 0-2 are `onTimerExpired` and the destructor.
+getStatusForHdcpVersion`. Slots 0-2 are `onTimerExpired` and the destructor. Library log strings show
+`getRobustnessLevel` and `getResourceRatingTier` take an out-parameter and return a `Status`.
 
 Storage names the CDM uses: `cert.bin` (device certificate), `usgtable.bin` (usage table),
 `ksid<hex>.lic` (persisted licenses).
@@ -44,9 +66,9 @@ The provisioning URL is the one in the TV's `/usr/lib/libwvcdm_shared.so.16.3.0.
 
 ## Not yet verified
 
-- Slot order after 19 (`load`, `update`, `getKeyStatuses`, `close`, `remove`, `decrypt`, ...). `cdm.h`
-  declares up to slot 24 as EXPECTED and nothing past it.
-- `IEventListener` slot order (the probe captured `onMessage` through a catch-all vtable).
+- `load` (20), `loadEmbeddedKeys` (22), the key-usage queries (25, 26) and everything after `close` (27):
+  `remove`, `forceRemove`, `decrypt`, ... `cdm.h` declares nothing past slot 27.
+- `IEventListener` slots 2-4 (`onRemoveComplete`, `onDeferredComplete`, `onDirectIndividualizationRequest`).
 - The v16 `InputBuffer`/`OutputBuffer` layout for `decrypt()`.
 - Secure video path: whether decrypted frames can reach our LG media pipeline (`HW_SECURE_*` content).
 

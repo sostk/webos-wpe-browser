@@ -42,19 +42,21 @@ public:
         kIndividualizationRequest = 3,
     } MessageType;
 
-    // Only 0..2 are VERIFIED; treat any other non-zero value as a generic failure.
+    // v16 numbering (NOT the 2015 header's): EME-style errors are 1-5, Widevine's own are 101+.
+    // Treat any value not listed as a generic failure.
     typedef enum {
-        kSuccess = 0,                // VERIFIED
-        kNeedsDeviceCertificate = 1, // VERIFIED (session calls before provisioning)
-        kSessionNotFound = 2,        // VERIFIED
-        kDecryptError = 3,
-        kNoKey = 4,
-        kTypeError = 5,
-        kNotSupported = 6,
-        kInvalidState = 7,
-        kQuotaExceeded = 8,
-        kRangeError = 9,
-        kUnexpectedError = 99999,
+        kSuccess = 0,                   // VERIFIED
+        kTypeError = 1,
+        kNotSupported = 2,
+        kInvalidState = 3,
+        kQuotaExceeded = 4,
+        kRangeError = 5,
+        kNeedsDeviceCertificate = 101,  // VERIFIED (createSession before provisioning)
+        kSessionNotFound = 102,         // VERIFIED (generateRequest/getKeyStatuses on a missing session)
+        kDecryptError = 103,
+        kNoKey = 104,
+        kKeyUsageBlockedByPolicy = 105,
+        kUnexpectedError = 99999,       // VERIFIED (handleProvisioningResponse with an empty reply)
     } Status;
 
     typedef enum {
@@ -110,15 +112,14 @@ public:
 
     typedef std::map<std::string, KeyStatus> KeyStatusMap;
 
-    // Callbacks from the CDM. Method set VERIFIED from the v16 OpenCDM plugin; slot ORDER EXPECTED
-    // (the probe captured onMessage through a catch-all vtable, so its slot is not yet pinned).
+    // Callbacks from the CDM. Method set from the v16 OpenCDM plugin.
     class IEventListener {
     public:
-        virtual void onMessage(const std::string& session_id, MessageType message_type, const std::string& message) = 0;
-        virtual void onKeyStatusesChange(const std::string& session_id, bool has_new_usable_key) = 0;
-        virtual void onRemoveComplete(const std::string& session_id) = 0;
-        virtual void onDeferredComplete(const std::string& session_id, Status result) = 0;
-        virtual void onDirectIndividualizationRequest(const std::string& session_id, const std::string& request) = 0;
+        virtual void onMessage(const std::string& session_id, MessageType message_type, const std::string& message) = 0; // 0 VERIFIED
+        virtual void onKeyStatusesChange(const std::string& session_id, bool has_new_usable_key) = 0;                  // 1 VERIFIED
+        virtual void onRemoveComplete(const std::string& session_id) = 0;                                               // 2 EXPECTED
+        virtual void onDeferredComplete(const std::string& session_id, Status result) = 0;                              // 3 EXPECTED
+        virtual void onDirectIndividualizationRequest(const std::string& session_id, const std::string& request) = 0;  // 4 EXPECTED
 
     protected:
         IEventListener() { }
@@ -199,7 +200,7 @@ public:
     virtual Status getServiceCertificateRequest(std::string* message) = 0;                                      // 4  VERIFIED
     virtual Status parseAndLoadServiceCertificateResponse(ServiceRole role, const std::string& response,
         std::string* certificate) = 0;                                                                         // 5  EXPECTED
-    virtual RobustnessLevel getRobustnessLevel() = 0;                                                           // 6  EXPECTED
+    virtual Status getRobustnessLevel(RobustnessLevel* level) = 0;                                              // 6  EXPECTED
     virtual Status getResourceRatingTier(uint32_t* tier) = 0;                                                   // 7  EXPECTED
     virtual Status getOemCryptoBuildInfo(std::string* build_info) = 0;                                          // 8  VERIFIED
     virtual bool isProvisioned() = 0;                                                                           // 9  VERIFIED
@@ -215,14 +216,18 @@ public:
     virtual Status generateRequest(const std::string& session_id, InitDataType init_data_type,
         const std::string& init_data) = 0;                                                                     // 19 VERIFIED
     virtual Status load(const std::string& session_id) = 0;                                                     // 20 EXPECTED
-    virtual Status update(const std::string& session_id, const std::string& response) = 0;                      // 21 EXPECTED
+    virtual Status update(const std::string& session_id, const std::string& response) = 0;                      // 21 VERIFIED
     virtual Status loadEmbeddedKeys(const std::string& session_id, InitDataType init_data_type,
         const std::string& init_data) = 0;                                                                     // 22 EXPECTED
-    virtual Status getExpiration(const std::string& session_id, int64_t* expiration) = 0;                       // 23 EXPECTED
-    virtual Status getKeyStatuses(const std::string& session_id, KeyStatusMap* key_statuses) = 0;               // 24 EXPECTED
-    // Slots 25 and beyond (key usages, close, remove, decrypt, ...) are deliberately not declared yet:
-    // their order is unproven, and declaring them wrongly would silently call the wrong method.
-    // They are added here, with their slot numbers, as each one is verified on the TV.
+    virtual Status getExpiration(const std::string& session_id, int64_t* expiration) = 0;                       // 23 VERIFIED (-1 = none)
+    virtual Status getKeyStatuses(const std::string& session_id, KeyStatusMap* key_statuses) = 0;               // 24 VERIFIED
+    // Slots 25-26: two getKeyAllowedUsages overloads (EXPECTED). Not callable through this header: their
+    // flag struct is unknown, so they are placeholders that only keep close() at slot 27.
+    virtual void reservedSlot25() = 0;                                                                          // 25
+    virtual void reservedSlot26() = 0;                                                                          // 26
+    virtual Status close(const std::string& session_id) = 0;                                                    // 27 VERIFIED
+    // Slots 28 and beyond (remove, forceRemove, decrypt, ...) are not declared yet: declaring them
+    // wrongly would silently call the wrong method. They are added as each one is verified on the TV.
 
 protected:
     Cdm() { }
