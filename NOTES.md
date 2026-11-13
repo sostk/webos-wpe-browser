@@ -588,3 +588,13 @@
   putDirect via JIT ops and DOM prototype creation) = the 32-bit ARM JSC heap bug of 2026-11-11 (webkit.org/b/295780).
   Symbolize: copy /var/log/reports/librdx/RDXDErr2_WPEWebProcess_* to /tmp with simple names, ares-pull, offsets
   from the report's memory map, addr2line on br-out/build/wpewebkit-2.50.5/lib/libWPEWebKit-2.0.so.1.6.10.
+- **Root cause found (not heap corruption):** the faulting instruction is `ldr r2, [r8, #-4]` = the butterfly's
+  IndexingHeader::vectorLength, loaded at the top of allocateMoreOutOfLineStorage although the source reads it only
+  in the indexed-type cases of IndexingHeader::indexingPayloadSizeInBytes(); GCC hoisted it. Objects without
+  indexed properties have no header: their butterfly points just past the allocation. bmalloc chunks are 1 MB; a
+  16 KB MarkedBlock at a chunk's end puts the allocation's end on the boundary, and the load hits the next,
+  unmapped chunk (fault = boundary + 4 in all reports). Explains upstream's bisect to the MarkedBlock
+  footer→header change (a footer kept the bytes after the last cell mapped) and why clang builds rarely see it.
+- Fix: WebKit patch 0008 (IndexingHeaderInlines.h): the header pointer passes through an empty `asm volatile` in
+  the branches that need it (GCC, 32-bit only), so the load can't be hoisted. Checked in the disassembly: the
+  function now only computes r8-8 up front and loads [r2,#4] after the type checks.

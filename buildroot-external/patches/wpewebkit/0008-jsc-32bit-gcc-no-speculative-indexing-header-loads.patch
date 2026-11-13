@@ -1,0 +1,58 @@
+From: sostk
+Subject: [PATCH] JSC: no speculative IndexingHeader loads with GCC on 32-bit
+
+GCC (arm-webos-linux-gnueabi, -O2) hoists the IndexingHeader loads in
+IndexingHeader::preCapacity() and indexingPayloadSizeInBytes() above the
+indexing-type checks. For an object with no indexed properties the header lies
+past the end of its butterfly allocation; when that allocation ends a
+MarkedBlock at the end of a 1 MB bmalloc chunk the load faults on the next,
+unmapped chunk: SIGSEGV at <1 MB boundary> + 4 in
+JSObject::allocateMoreOutOfLineStorage (webkit.org/b/295780, which bisected to
+the MarkedBlock footer-to-header change: with a footer the bytes after the last
+cell were always mapped). The header pointer now goes through an empty volatile
+asm inside the branches that need it.
+
+---
+--- a/Source/JavaScriptCore/runtime/IndexingHeaderInlines.h
++++ b/Source/JavaScriptCore/runtime/IndexingHeaderInlines.h
+@@ -31,12 +31,26 @@
+ 
+ namespace JSC {
+ 
++// An object without indexed properties has no IndexingHeader: its butterfly points just past its allocation, and
++// the header (and ArrayStorage) would lie beyond it. GCC on 32-bit ARM hoists the header loads below above the
++// indexing-type checks, so they run for every object. When such an allocation ends a MarkedBlock at the end of a
++// 1 MB bmalloc chunk, the load faults on the next, unmapped chunk (SIGSEGV at boundary + 4 in
++// JSObject::allocateMoreOutOfLineStorage, webkit.org/b/295780). Passing the pointer through an empty volatile asm
++// in the branch that needs it makes the address exist only there, so the load can't be moved above the check.
++ALWAYS_INLINE IndexingHeader* indexingHeaderAfterTypeCheck(IndexingHeader* header)
++{
++#if COMPILER(GCC) && !COMPILER(CLANG) && CPU(ADDRESS32)
++    asm volatile("" : "+r"(header));
++#endif
++    return header;
++}
++
+ inline size_t IndexingHeader::preCapacity(Structure* structure)
+ {
+     if (!hasAnyArrayStorage(structure->indexingType())) [[likely]]
+         return 0;
+     
+-    return arrayStorage()->m_indexBias;
++    return indexingHeaderAfterTypeCheck(this)->arrayStorage()->m_indexBias;
+ }
+ 
+ inline size_t IndexingHeader::indexingPayloadSizeInBytes(Structure* structure)
+@@ -46,10 +60,10 @@
+     case ALL_INT32_INDEXING_TYPES:
+     case ALL_DOUBLE_INDEXING_TYPES:
+     case ALL_CONTIGUOUS_INDEXING_TYPES:
+-        return vectorLength() * sizeof(EncodedJSValue);
++        return indexingHeaderAfterTypeCheck(this)->vectorLength() * sizeof(EncodedJSValue);
+         
+     case ALL_ARRAY_STORAGE_INDEXING_TYPES:
+-        return ArrayStorage::sizeFor(arrayStorage()->vectorLength());
++        return ArrayStorage::sizeFor(indexingHeaderAfterTypeCheck(this)->arrayStorage()->vectorLength());
+         
+     default:
+         ASSERT(!hasIndexedProperties(structure->indexingType()));
