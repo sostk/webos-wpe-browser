@@ -555,3 +555,22 @@
   kit's verified audio settings (needAudio, audioSync, 1 MB audio buffer, no low-delay); separate audio/video queues.
 - TV, dash.js BBB: one Load "H264 + AAC", resources VDEC + ADEC, audioSinkType main_sound, audio and video fed.
   Volume/mute while on LG's pipeline: setVolume/setAudioMute JSON keys are guesses (LG's browser never sets them).
+
+## 2026-11-13 Widevine playback on the TV (user: "Tv is on")
+- Built and installed the ipk with WebKit ENABLE_THUNDER=ON + libocdm (engine-stage-jit, check-package passes).
+- **First run: every key system failed** (NotSupportedError, ClearKey too, even `[{}]`): requestMediaKeySystemAccess
+  asks the UI process with a WebKitMediaKeySystemPermissionRequest, and WebKit's default permission-request handler
+  denies it. Fixed: the engine allows media-key-system requests (`on_permission_request`, logged per tab); other
+  requests still go to the default (denied).
+- Test kit: `tools/eme-test/` (page served from the TV's loopback by a static `minihttpd`; results come back as
+  /log beacons). Angel One (Widevine, Google's no-auth proxy) with Shaka 4.11.7:
+  - requestMediaKeySystemAccess + createMediaKeys OK for com.widevine.alpha with robustness "", SW_SECURE_CRYPTO,
+    SW_SECURE_DECODE; HW_SECURE_ALL → NotSupported. **ClearKey now NotSupported** (no permission request reaches the
+    UI, so the ClearKey factory isn't offered with Thunder on; not investigated).
+  - **H.264/AAC (cenc) with ABR: played the whole 60 s to `ended`**, 5 keys usable, license 2170 → 1657 bytes,
+    1502 frames, 2 dropped, rendition switches 576p/240p/144p kept playing.
+  - **VP9/Opus (webm) with ABR: played to `ended`**, 1496 frames, 0 dropped, switched 240p → 576p.
+  - Stalls: switching codec mid-stream (MP4/H.264 → WebM/VP9, selectVariantTrack) froze video after ~8 s (time ran
+    on to the buffered end, then stopped). Real sites rarely do this.
+  - videoWidth/videoHeight stay at the first rendition's size after ABR switches (hardware sink doesn't report
+    new caps?). Picture quality on screen not yet checked.
