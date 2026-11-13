@@ -574,3 +574,17 @@
     on to the buffered end, then stopped). Real sites rarely do this.
   - videoWidth/videoHeight stay at the first rendition's size after ABR switches (hardware sink doesn't report
     new caps?). Picture quality on screen not yet checked.
+
+## 2026-11-13 NetTV (webtv.nettv.com.np) live cricket with Widevine
+- `WPE_BROWSER_DEBUG_CONSOLE=1` (launch param {"wpebEnv": {...}}): the page's console, uncaught errors, EME/MSE
+  calls, media element events, canPlayType/isTypeSupported answers and manifest/licence requests go to engine.log
+  as "tab N page: ...". Used because the remote inspector would need a port open to the LAN.
+- Failure: Video.js "No compatible source" (code 4). NetTV's Safari test is AppleWebKit && !/Chrome|CriOS|Edg|OPR|
+  Firefox|FxiOS/; it then sends X-Client-Browser: Safari, gets an fps.ezdrm.com (FairPlay) licence for HLS.
+  Fix: site quirk, a Chrome token in navigator.userAgent on *.nettv.com.np only (HTTP header unchanged).
+- With it: DASH (live-ottint.nettv.com.np/npl/live_match3/index.mpd), Widevine licence from widevine-dash.ezdrm.com
+  200, keys usable, played ~40 s of the live match (t 59 → 97).
+- Then the web process crashed (5 reports 18:09–18:21, all JSC::JSObject::allocateMoreOutOfLineStorage, from
+  putDirect via JIT ops and DOM prototype creation) = the 32-bit ARM JSC heap bug of 2026-11-11 (webkit.org/b/295780).
+  Symbolize: copy /var/log/reports/librdx/RDXDErr2_WPEWebProcess_* to /tmp with simple names, ares-pull, offsets
+  from the report's memory map, addr2line on br-out/build/wpewebkit-2.50.5/lib/libWPEWebKit-2.0.so.1.6.10.

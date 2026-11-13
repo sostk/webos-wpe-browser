@@ -631,9 +631,142 @@ void add_media_limits(WebKitWebView *web_view)
     webkit_user_script_unref(script);
 }
 
+// WPE_BROWSER_DEBUG_CONSOLE=1: the page's console, uncaught errors, and its media/DRM calls go to the engine log, so
+// a site that doesn't play can be diagnosed over ares-shell (the remote inspector would need a port open to the
+// LAN). Page world, top frame and iframes; debug only, since the page can see window.webkit.messageHandlers.
+constexpr const char *kConsoleScript = R"JS((function () {
+  const h = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.wpebConsole;
+  if (!h) return;
+  const where = window === top ? '' : '[frame ' + location.host + '] ';
+  const str = (v) => { try { return typeof v === 'string' ? v : v instanceof Error ? v.name + ': ' + v.message : JSON.stringify(v); } catch (e) { return String(v); } };
+  const send = (kind, args) => { try { h.postMessage(where + kind + ' ' + Array.from(args, str).join(' ').slice(0, 800)); } catch (e) {} };
+  for (const level of ['log', 'info', 'warn', 'error', 'debug']) {
+    const original = console[level];
+    console[level] = function () { send(level, arguments); return original.apply(this, arguments); };
+  }
+  addEventListener('error', (e) => {
+    if (e.target && e.target !== window && e.target.tagName) {
+      const t = e.target; send('resource-error', [t.tagName, t.src || t.href || '', t.error ? 'code=' + t.error.code + ' ' + t.error.message : '']);
+    } else send('uncaught', [e.message, (e.filename || '') + ':' + e.lineno]);
+  }, true);
+  addEventListener('unhandledrejection', (e) => send('unhandled-rejection', [e.reason]));
+  const n = navigator;
+  if (n.requestMediaKeySystemAccess) {
+    const original = n.requestMediaKeySystemAccess.bind(n);
+    n.requestMediaKeySystemAccess = function (ks, cfg) {
+      send('eme', ['requestMediaKeySystemAccess', ks, cfg]);
+      return original(ks, cfg).then((a) => { send('eme', [ks, 'granted']); return a; }, (e) => { send('eme', [ks, 'rejected', e]); throw e; });
+    };
+  } else send('eme', ['navigator.requestMediaKeySystemAccess missing']);
+  if (window.MediaKeySession) {
+    const P = MediaKeySession.prototype;
+    for (const m of ['generateRequest', 'update', 'load']) {
+      const original = P[m];
+      if (!original) continue;
+      P[m] = function () {
+        if (!this.__wpeb) { this.__wpeb = 1; this.addEventListener('keystatuseschange', () => { const s = []; this.keyStatuses.forEach((v) => s.push(v)); send('eme', ['key statuses', s.join(',')]); }); }
+        send('eme', [m, arguments[0], arguments[1] && arguments[1].byteLength !== undefined ? arguments[1].byteLength + ' bytes' : '']);
+        return original.apply(this, arguments).catch((e) => { send('eme', [m, 'failed', e]); throw e; });
+      };
+    }
+  }
+  if (window.MediaSource) {
+    const original = MediaSource.prototype.addSourceBuffer;
+    MediaSource.prototype.addSourceBuffer = function (type) {
+      try { const sb = original.call(this, type); send('mse', ['addSourceBuffer', type]); return sb; } catch (e) { send('mse', ['addSourceBuffer', type, 'failed', e]); throw e; }
+    };
+  }
+  const asked = new Set();
+  const ask = (what, t, r) => { const k = what + t + r; if (asked.has(k)) return; asked.add(k); send('type', [what, t, '->', r]); };
+  if (window.HTMLMediaElement) {
+    const cpt = HTMLMediaElement.prototype.canPlayType;
+    HTMLMediaElement.prototype.canPlayType = function (t) { const r = cpt.call(this, t); ask('canPlayType', t, JSON.stringify(r)); return r; };
+  }
+  for (const name of ['MediaSource', 'ManagedMediaSource', 'WebKitMediaSource']) {
+    const MS = window[name];
+    if (!MS || typeof MS.isTypeSupported !== 'function') continue;
+    const its = MS.isTypeSupported.bind(MS);
+    MS.isTypeSupported = function (t) { const r = its(t); ask(name + '.isTypeSupported', t, r); return r; };
+  }
+  if (window.HTMLMediaElement) {
+    for (const ev of ['loadedmetadata', 'playing', 'waiting', 'stalled', 'encrypted', 'waitingforkey', 'error', 'abort', 'emptied']) {
+      addEventListener(ev, (e) => {
+        const v = e.target; if (!(v instanceof HTMLMediaElement)) return;
+        send('media', [ev, (v.currentSrc || v.src || '').slice(0, 120), 't=' + v.currentTime.toFixed(1), 'rs=' + v.readyState,
+          v.error ? 'code=' + v.error.code + ' ' + v.error.message : '', e.initDataType || '']);
+      }, true);
+    }
+  }
+  const interesting = (u) => /\.(mpd|m3u8)|licen|widevine|drm|pallycon|token|stream|play/i.test(u);
+  if (window.fetch) {
+    const original = window.fetch;
+    window.fetch = function (input, init) {
+      const u = String(input && input.url || input);
+      const p = original.apply(this, arguments);
+      if (interesting(u)) p.then((r) => {
+        send('fetch', [(init && init.method) || 'GET', u.slice(0, 200), r.status]);
+        if (/json|mpegurl|dash/.test(r.headers.get('content-type') || '')) r.clone().text().then((b) => send('fetch-body', [u.slice(0, 80), b.slice(0, 1500)]), () => {});
+      }, (e) => send('fetch', [u.slice(0, 200), 'failed', e]));
+      return p;
+    };
+  }
+  const open = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function (method, url) {
+    const u = String(url);
+    if (interesting(u)) this.addEventListener('loadend', () => send('xhr', [method, u.slice(0, 200), this.status]));
+    return open.apply(this, arguments);
+  };
+})();)JS";
+
+void on_console_message(WebKitUserContentManager *, JSCValue *value, gpointer data)
+{
+    gchar *text = jsc_value_to_string(value);
+    log_msg("tab %u page: %s", GPOINTER_TO_UINT(data), text);
+    g_free(text);
+}
+
+void add_console_reporter(WebKitWebView *web_view, uint32_t id)
+{
+    static const bool enabled = getenv("WPE_BROWSER_DEBUG_CONSOLE") != nullptr;
+    WebKitUserContentManager *ucm = webkit_web_view_get_user_content_manager(web_view);
+    if (!enabled || !ucm || !webkit_user_content_manager_register_script_message_handler(ucm, "wpebConsole", nullptr))
+        return;
+    g_signal_connect(ucm, "script-message-received::wpebConsole", G_CALLBACK(on_console_message), GUINT_TO_POINTER(id));
+    WebKitUserScript *script = webkit_user_script_new(kConsoleScript, WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, nullptr, nullptr);
+    webkit_user_content_manager_add_script(ucm, script);
+    webkit_user_script_unref(script);
+}
+
+// Site quirks: sites that take any AppleWebKit agent without "Chrome" for Safari and then serve FairPlay, which only
+// Apple's Safari has. NetTV (webtv.nettv.com.np) tests AppleWebKit && !/Chrome|CriOS|Edg|OPR|Firefox|FxiOS/, sends
+// X-Client-Browser: Safari and gets an fps.ezdrm.com license for HLS; Video.js then finds "no compatible source"
+// (TV, 2026-11-13). Other browsers get Widevine, which we have (libocdm). A Chrome token in navigator.userAgent, on
+// these sites only, takes that path. The HTTP User-Agent header is unchanged.
+constexpr const char *kChromeAgentScript = R"JS((function () {
+  const ua = navigator.userAgent;
+  if (/Chrome\//.test(ua)) return;
+  const spoofed = ua.replace(/ Version\/[\d.]+/, '').replace(/ Safari\//, ' Chrome/120.0.0.0 Safari/');
+  Object.defineProperty(Navigator.prototype, 'userAgent', { get: () => spoofed, configurable: true });
+})();)JS";
+const char *const kChromeAgentSites[] = {"https://nettv.com.np/*", "https://*.nettv.com.np/*", nullptr};
+
+void add_site_quirks(WebKitWebView *web_view)
+{
+    WebKitUserContentManager *ucm = webkit_web_view_get_user_content_manager(web_view);
+    if (!ucm)
+        return;
+    WebKitUserScript *script = webkit_user_script_new(kChromeAgentScript, WEBKIT_USER_CONTENT_INJECT_ALL_FRAMES,
+        WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, kChromeAgentSites, nullptr);
+    webkit_user_content_manager_add_script(ucm, script);
+    webkit_user_script_unref(script);
+}
+
 void add_scroll_reporter(WebKitWebView *web_view, uint32_t id)
 {
+    add_site_quirks(web_view);
     add_media_limits(web_view);
+    add_console_reporter(web_view, id); // after the limits, so it wraps them and logs what pages are told
     WebKitUserContentManager *ucm = webkit_web_view_get_user_content_manager(web_view);
     if (!ucm || !webkit_user_content_manager_register_script_message_handler(ucm, "wpebScroll", kScrollWorld))
         return;
