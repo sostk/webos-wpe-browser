@@ -36,6 +36,8 @@ struct EngineCallbacks {
     std::function<void(TabId, WpeErrorKind, uint32_t code, const std::string &)> error;
     std::function<void(uint32_t what, bool ok)> data_cleared;  // answer to clear_data()
     std::function<void(TabId, bool at_top)> scroll;  // the page reached / left its top (shows the toolbar)
+    std::function<void(TabId)> edge_up;
+    std::function<void(TabId, const std::string &url)> icon;  // the page's icon URL (WPE_ENGINE_ICON)              // Up found nothing above at the page's top (WPE_ENGINE_EDGE)
     std::function<void(TabId, bool on)> fullscreen;  // the page entered / left fullscreen
     std::function<void(TabId, const WpePresent &)> present;  // how the page reaches the screen (direct mode)
     std::function<void(TabId, TabId opener)> tab_created;      // a page opened a window (the engine's tab id)

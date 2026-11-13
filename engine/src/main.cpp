@@ -499,6 +499,47 @@ constexpr const char *kScrollScript = R"JS((function () {
     }
     addEventListener('pageshow', recheck);
     recheck();
+    // Up with nothing above: spatial navigation moved no focus, the page did not scroll and did not take the key
+    // (defaultPrevented: web apps with their own remote handling). Typing in a field never counts.
+    addEventListener('keydown', function (ev) {
+        if (ev.key !== 'ArrowUp' || ev.repeat) return;
+        var a = document.activeElement;
+        if (a && (a.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName))) return;
+        var y = window.scrollY;
+        setTimeout(function () {
+            if (!ev.defaultPrevented && document.activeElement === a && window.scrollY === y && pageTop())
+                window.webkit.messageHandlers.wpebEdge.postMessage(1);
+        }, 120);
+    }, {capture: true});
+    // The page's icon for the UI's tabs, tiles and bookmarks: apple-touch-icon (large, made for home screens), else
+    // the largest icon link in a format the UI decodes (PNG, SVG, WebP, JPEG, GIF; not ICO). Sent after load and
+    // again when the head changes (single-page apps).
+    var lastIcon = null;
+    function sendIcon() {
+        var best = null, bestScore = -1;
+        var links = document.querySelectorAll('link[rel]');
+        for (var i = 0; i < links.length; i++) {
+            var l = links[i], rel = (l.getAttribute('rel') || '').toLowerCase(), href = l.href || '';
+            if (!href || href.indexOf('data:') === 0) continue;
+            var touch = rel.indexOf('apple-touch-icon') >= 0, icon = /(^|\s)icon(\s|$)/.test(rel);
+            if (!touch && !icon) continue;
+            var type = (l.getAttribute('type') || '').toLowerCase(), path = href.split(/[?#]/)[0].toLowerCase();
+            if (/\.ico$/.test(path) || type.indexOf('icon') >= 0) continue;
+            if (!touch && !/\.(png|svg|webp|jpe?g|gif)$/.test(path) && !/png|svg|webp|jpeg|gif/.test(type)) continue;
+            var size = 0, m = /(\d+)x\d+/.exec(l.getAttribute('sizes') || '');
+            if (m) size = parseInt(m[1], 10);
+            if (/\.svg$/.test(path) || type.indexOf('svg') >= 0) size = 256;
+            var score = (touch ? 1000 : 0) + Math.min(size || 32, 512);
+            if (score > bestScore) { best = href; bestScore = score; }
+        }
+        best = best || '';
+        if (best === lastIcon) return;
+        lastIcon = best;
+        window.webkit.messageHandlers.wpebIcon.postMessage(best);
+    }
+    addEventListener('load', function () { sendIcon(); setTimeout(sendIcon, 2000); });
+    addEventListener('pageshow', function () { lastIcon = null; sendIcon(); });
+    if (document.head) new MutationObserver(function () { setTimeout(sendIcon, 300); }).observe(document.head, {childList: true});
 })();)JS";
 
 // Page-load timing (Navigation Timing, after the load event), one log line per page: where the time goes (network:
@@ -550,6 +591,19 @@ void on_scroll_message(WebKitUserContentManager *, JSCValue *value, gpointer dat
     if (getenv("WPE_BROWSER_DEBUG_SCROLL"))
         log_msg("tab %u scroll: %s", id, flag.value ? "top" : "scrolled");
     send_msg(WPE_ENGINE_SCROLL, id, &flag, sizeof(flag));
+}
+
+void on_icon_message(WebKitUserContentManager *, JSCValue *value, gpointer data)
+{
+    gchar *url = jsc_value_to_string(value);
+    send_text(WPE_ENGINE_ICON, GPOINTER_TO_UINT(data), url ? url : "");
+    g_free(url);
+}
+
+void on_edge_message(WebKitUserContentManager *, JSCValue *value, gpointer data)
+{
+    WpeFlag flag = {static_cast<uint32_t>(jsc_value_to_int32(value))};
+    send_msg(WPE_ENGINE_EDGE, GPOINTER_TO_UINT(data), &flag, sizeof(flag));
 }
 
 // Media limits. Video is decoded on the CPU (GStreamer libav/libvpx); the TV's 4 A55 cores keep up with H.264 at 720p30.
@@ -771,6 +825,10 @@ void add_scroll_reporter(WebKitWebView *web_view, uint32_t id)
     if (!ucm || !webkit_user_content_manager_register_script_message_handler(ucm, "wpebScroll", kScrollWorld))
         return;
     g_signal_connect(ucm, "script-message-received::wpebScroll", G_CALLBACK(on_scroll_message), GUINT_TO_POINTER(id));
+    if (webkit_user_content_manager_register_script_message_handler(ucm, "wpebIcon", kScrollWorld))
+        g_signal_connect(ucm, "script-message-received::wpebIcon", G_CALLBACK(on_icon_message), GUINT_TO_POINTER(id));
+    if (webkit_user_content_manager_register_script_message_handler(ucm, "wpebEdge", kScrollWorld))
+        g_signal_connect(ucm, "script-message-received::wpebEdge", G_CALLBACK(on_edge_message), GUINT_TO_POINTER(id));
     WebKitUserScript *script = webkit_user_script_new_for_world(kScrollScript, WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
         WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_END, kScrollWorld, nullptr, nullptr);
     webkit_user_content_manager_add_script(ucm, script);

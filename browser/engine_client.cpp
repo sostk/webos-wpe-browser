@@ -422,6 +422,9 @@ void EngineClient::handle(const uint8_t *buf, size_t n, int fd) {
     case WPE_ENGINE_TITLE:
         if (cb_.title) cb_.title(h.tab, text());
         break;
+    case WPE_ENGINE_ICON:
+        if (cb_.icon) cb_.icon(h.tab, text());
+        break;
     case WPE_ENGINE_PROGRESS:
         if (len >= sizeof(WpeProgress) && cb_.progress) {
             WpeProgress pr;
@@ -465,6 +468,13 @@ void EngineClient::handle(const uint8_t *buf, size_t n, int fd) {
             WpeFlag f;
             std::memcpy(&f, p, sizeof(f));
             cb_.scroll(h.tab, f.value != 0);
+        }
+        break;
+    case WPE_ENGINE_EDGE:
+        if (len >= sizeof(WpeFlag) && cb_.edge_up) {
+            WpeFlag f;
+            std::memcpy(&f, p, sizeof(f));
+            if (f.value == 1) cb_.edge_up(h.tab);
         }
         break;
     case WPE_ENGINE_IME:

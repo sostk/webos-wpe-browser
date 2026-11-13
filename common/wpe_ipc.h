@@ -24,7 +24,7 @@
 
 #include <stdint.h>
 
-#define WPE_IPC_VERSION 9u
+#define WPE_IPC_VERSION 10u
 #define WPE_IPC_ENGINE_FD 3
 #define WPE_IPC_FRAME_SLOTS 3u
 #define WPE_IPC_MAX_TEXT 2048u   /* bytes including the terminating NUL */
@@ -81,6 +81,10 @@ typedef enum {
     WPE_ENGINE_TAB_CLOSE,     /* no payload: the page asked to close its window (window.close()) */
     WPE_ENGINE_FULLSCREEN,    /* WpeFlag: the page entered (1) or left (0) fullscreen (Fullscreen API, a video's
                                  fullscreen button); the UI hides its chrome meanwhile */
+    WPE_ENGINE_EDGE,          /* WpeFlag: Up (1) reached the page's top edge: spatial navigation found nothing above,
+                                 the page did not scroll and did not handle the key itself (the UI shows its toolbar) */
+    WPE_ENGINE_ICON,          /* WpeText: the page's best icon URL (apple-touch-icon, else a PNG/SVG/WebP icon link;
+                                 empty if it declares none). The UI downloads it itself (WPE has no favicon API). */
 } WpeMsgType;
 
 /* Tabs the engine opens itself (popups) get ids from here, so they never collide with the UI's. */
