@@ -17,5 +17,7 @@ ares-shell -d tv -r 'kill $(pidof minihttpd); rm -rf /tmp/emetest'
 Query options: `quick` skips the requestMediaKeySystemAccess probes; `codec=avc1|vp09|hev1` picks the codec;
 `mpd=` and `lic=` choose the stream and Widevine licence server; `minh=` keeps only renditions at least that tall;
 `acodec=` prefers that audio codec; `start=` starts at that time (s);
+`seekat=A,B` seeks to B s once playback reaches A s;
+`maxh=H` caps renditions at that height, and `lift=T` removes the cap at T s (an ABR step up; `liftmin=H` then also keeps only renditions at least H tall);
 `noabr` turns adaptive bitrate off. Content: Shaka's Angel One (Widevine, 60 s, H.264/AAC and VP9/Opus) with
 Google's no-auth test license proxy. Shaka Player is loaded from jsDelivr.
