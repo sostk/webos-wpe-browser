@@ -6,8 +6,9 @@ const T0=performance.now();
 function log(m){m=((performance.now()-T0)/1000).toFixed(1)+'s '+m;const d=document.createElement('div');d.textContent=m;document.getElementById('log').appendChild(d);
   try{new Image().src='/log?'+encodeURIComponent(m);}catch(e){}}
 window.onerror=(m,s,l)=>log('JSERR '+m+' @'+l);
-const MPD='https://storage.googleapis.com/shaka-demo-assets/angel-one-widevine/dash.mpd';
-const LIC='https://cwip-shaka-proxy.appspot.com/no_auth';
+const Q=new URLSearchParams(location.search);
+const MPD=Q.get('mpd')||'https://storage.googleapis.com/shaka-demo-assets/angel-one-widevine/dash.mpd';
+const LIC=Q.get('lic')||'https://cwip-shaka-proxy.appspot.com/no_auth';
 const KS='com.widevine.alpha';
 async function probe(){
   log('UA '+navigator.userAgent+' secure='+window.isSecureContext+' rMKSA='+typeof navigator.requestMediaKeySystemAccess);
@@ -36,12 +37,12 @@ async function play(){
   shaka.polyfill.installAll();
   log('shaka '+shaka.Player.version+' supported='+shaka.Player.isBrowserSupported());
   const v=document.getElementById('v'),p=new shaka.Player();await p.attach(v);
-  const codec=(location.search.match(/codec=(\w+)/)||[])[1]||'avc1';p.configure({drm:{servers:{[KS]:LIC}},abr:{enabled:!location.search.includes('noabr')},preferredVideoCodecs:[codec],preferredAudioCodecs:[codec==='avc1'?'mp4a':'opus']});log('preferred codec '+codec);
+  const codec=(location.search.match(/codec=(\w+)/)||[])[1]||'avc1';const minh=parseInt(Q.get('minh')||'0');if(minh)p.configure({restrictions:{minHeight:minh}});p.configure({drm:{servers:{[KS]:LIC}},abr:{enabled:!location.search.includes('noabr')},preferredVideoCodecs:[codec],preferredAudioCodecs:[Q.get('acodec')||(codec==='avc1'?'mp4a':'opus')]});log('preferred codec '+codec);
   p.addEventListener('error',e=>log('SHAKA ERROR code='+e.detail.code+' cat='+e.detail.category+' data='+JSON.stringify(e.detail.data).slice(0,300)));
   p.getNetworkingEngine().registerRequestFilter((t,r)=>{if(t===shaka.net.NetworkingEngine.RequestType.LICENSE)log('license request '+r.body.byteLength+' bytes');});
   p.getNetworkingEngine().registerResponseFilter((t,r)=>{if(t===shaka.net.NetworkingEngine.RequestType.LICENSE)log('license response '+r.data.byteLength+' bytes');});
   ['encrypted','waitingforkey','loadedmetadata','playing','waiting','error','ended'].forEach(n=>v.addEventListener(n,ev=>log('video '+n+(n==='encrypted'?' '+ev.initDataType:'')+(n==='error'&&v.error?' code='+v.error.code+' '+v.error.message:''))));
-  try{await p.load(MPD);log('load ok; drm='+p.drmInfo()?.keySystem);}catch(e){log('load FAIL code='+e.code+' '+JSON.stringify(e.data).slice(0,300));return;}
+  const st=parseFloat((location.search.match(/start=([\d.]+)/)||[])[1]);try{await p.load(MPD,isNaN(st)?undefined:st);log('load ok; drm='+p.drmInfo()?.keySystem);}catch(e){log('load FAIL code='+e.code+' '+JSON.stringify(e.data).slice(0,300));return;}
   const act=p.getVariantTracks().find(t=>t.active);if(act)log('active track '+act.width+'x'+act.height+' '+act.videoCodec+' '+act.audioCodec);
   v.play().catch(e=>log('play() reject '+e.name+' '+e.message));
   let last=-1,n=0;const iv=setInterval(()=>{const q=v.getVideoPlaybackQuality?v.getVideoPlaybackQuality():{};
