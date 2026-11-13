@@ -666,6 +666,19 @@ void on_close(WebKitWebView *view, gpointer)
         send_msg(WPE_ENGINE_TAB_CLOSE, id, nullptr, 0);
 }
 
+// EME: navigator.requestMediaKeySystemAccess asks the UI process first, and WebKit's default handler denies it, so
+// every key system (ClearKey too) failed with NotSupportedError (TV, 2026-11-13). Allowed for every page, as desktop
+// browsers do for Widevine. Other requests go to the default handler (denied).
+gboolean on_permission_request(WebKitWebView *view, WebKitPermissionRequest *request, gpointer)
+{
+    if (!WEBKIT_IS_MEDIA_KEY_SYSTEM_PERMISSION_REQUEST(request))
+        return FALSE;
+    log_msg("tab %u: media key system %s allowed", tab_of_web_view(view),
+        webkit_media_key_system_permission_get_name(WEBKIT_MEDIA_KEY_SYSTEM_PERMISSION_REQUEST(request)));
+    webkit_permission_request_allow(request);
+    return TRUE;
+}
+
 // window.open and target=_blank: a real new window, as a new tab. Sign-in popups (Google, Apple, ...) need it: they
 // talk to window.opener and close themselves. WebKit loads the request into the view returned here.
 WebKitWebView *on_create(WebKitWebView *view, WebKitNavigationAction *, gpointer)
@@ -782,6 +795,7 @@ void tab_open(uint32_t id, const std::string &uri, WebKitWebView *opener)
     g_signal_connect(web_view, "web-process-terminated", G_CALLBACK(on_web_process_terminated), nullptr);
     g_signal_connect(web_view, "create", G_CALLBACK(on_create), nullptr);
     g_signal_connect(web_view, "close", G_CALLBACK(on_close), nullptr);
+    g_signal_connect(web_view, "permission-request", G_CALLBACK(on_permission_request), nullptr);
     g_signal_connect(web_view, "enter-fullscreen", G_CALLBACK(on_fullscreen_changed), GUINT_TO_POINTER(1));
     g_signal_connect(web_view, "leave-fullscreen", G_CALLBACK(on_fullscreen_changed), GUINT_TO_POINTER(0));
     g_signal_connect(webkit_web_view_get_back_forward_list(web_view), "changed", G_CALLBACK(on_history_changed), web_view);
