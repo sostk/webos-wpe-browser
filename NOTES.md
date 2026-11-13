@@ -598,3 +598,9 @@
 - Fix: WebKit patch 0008 (IndexingHeaderInlines.h): the header pointer passes through an empty `asm volatile` in
   the branches that need it (GCC, 32-bit only), so the load can't be hoisted. Checked in the disassembly: the
   function now only computes r8-8 up front and loads [r2,#4] after the type checks.
+- 2026-11-13 **TV verification of 0.2.0** (87 MB ipk, patch 0008 + LG-Chromium media changes): Angel One Widevine
+  plays; a mid-play seek (15 s -> 40 s) does flush -> 1, Seek(40000 ms) -> 1, plays again 1.6 s later; at the end
+  pushEOS -> 1 and LG reports ENDOFSTREAM (857 frames). Tears of Steel H.264 3840x1714 (Widevine): 700 frames,
+  0 dropped. **NetTV: the user watched live TV for an hour without a web-process crash** (before patch 0008 it
+  crashed within minutes): the JSC fix holds. Not yet seen: the envelope reload on an FHD->UHD step (Shaka
+  would not step in the test), HDR setHdrInfo, hardware Opus.
