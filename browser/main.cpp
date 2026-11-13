@@ -65,7 +65,7 @@ constexpr const char *kVersion = "0.3.0";
 // GPU: CPU rendering at about 1280 px wide keeps scrolling usable, and CSS px at that size read well from a sofa.
 constexpr float kRenderScale = 2.0f / 3.0f;
 constexpr double kChromeSlideMs = 160;     // toolbar slide in/out
-constexpr double kChromePeekMs = 2500;   // after Back the toolbar stays over the page this long
+constexpr double kChromePeekMs = 2500;   // after a load or Back the panel stays over the page this long
 constexpr float kChromeRevealEdge = 6.0f;  // logical px at the top of the screen that bring the toolbar back
 constexpr int kMaxRestarts = 3;
 constexpr double kHoldOkMs = 550;  // OK held this long opens quick actions
@@ -75,7 +75,9 @@ constexpr size_t kMaxLiveTabs = 4;
 constexpr size_t kMaxTabs = 12;
 
 const std::vector<browser::wren::HomeData::Item> kShortcuts = {
-    {"YouTube", "https://www.youtube.com/"},   {"Wikipedia", "https://www.wikipedia.org/"},
+    // YouTube's TV app: interactive in about 1.6 s and 177 MB on the TV, against 10-15 s and ~600 MB for the
+    // desktop site (TV, 2026-11-14), and made for the remote.
+    {"YouTube", "https://www.youtube.com/tv"},   {"Wikipedia", "https://www.wikipedia.org/"},
     {"DuckDuckGo", "https://duckduckgo.com/"}, {"Google", "https://www.google.com/"},
     {"Reddit", "https://www.reddit.com/"},     {"GitHub", "https://github.com/"},
     {"BBC News", "https://www.bbc.com/news"},  {"Weather", "https://wttr.in/"},
@@ -414,7 +416,9 @@ class App : public wnk::app::Delegate {
         if (t->fullscreen) return false;
         // With a hardware video the page goes above the UI while the chrome is hidden (DirectOwner::set_page_z), so
         // being at the top no longer keeps the chrome: it would hide the page's video controls.
-        return (t->at_top && !(raise_page_ && media_.video_active())) || ui.now_ms() < peek_until_ms_;
+        // It peeks for kChromePeekMs when a page loads and after Back; it no longer stays while the page is at its
+        // top: web apps that never scroll (YouTube's TV app) would keep it over their own header and video.
+        return ui.now_ms() < peek_until_ms_;
     }
 
     void peek_chrome() { peek_until_ms_ = ctx_->ui().now_ms() + kChromePeekMs; }
@@ -998,6 +1002,7 @@ class App : public wnk::app::Delegate {
             if (t == nullptr) return;
             if (e == WPE_LOAD_FINISHED) profile_.add_visit(t->title, t->url);
             const bool loading = e == WPE_LOAD_STARTED || e == WPE_LOAD_COMMITTED;
+            if (id == active_ && (e == WPE_LOAD_COMMITTED || e == WPE_LOAD_FINISHED)) peek_chrome();  // where we are
             if (loading != t->loading) {
                 t->loading = loading;
                 if (loading) t->progress = 0;

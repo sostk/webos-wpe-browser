@@ -604,3 +604,19 @@
   0 dropped. **NetTV: the user watched live TV for an hour without a web-process crash** (before patch 0008 it
   crashed within minutes): the JSC fix holds. Not yet seen: the envelope reload on an FHD->UHD step (Shaka
   would not step in the test), HDR setHdrInfo, hardware Opus.
+- 2026-11-14 **YouTube investigation (TV).** www.youtube.com is the desktop app ("Kevlar": Polymer/Lit web components,
+  `<ytd-app>`, client WEB) with a ~10 MB JS bundle; our UA (Safari on Linux) gets the ES5 build (10.8 MB +
+  custom-elements-es5-adapter) where Chrome/Mac Safari get the 2021 build (9.7 MB). On the C1: interactive after
+  10.4-14.7 s (network ~1.5 s, the rest is JS parse/compile), web process ~600 MB and one core busy, TV down to ~260 MB
+  available with 450 MB in swap. YouTube's TV app (youtube.com/tv, "Kabuki", leanback) is served to us too: 1.1 MB
+  base JS, interactive 1.6 s, fcp 3.2 s, 177 MB, idle after load. The Home tile now opens youtube.com/tv.
+- **Video never started** on YouTube: its audio is Opus in WebM and WebKit's MSE append pipeline needs `opusparse`
+  (gst-plugins-bad "opus", was off): no audio data, readyState stuck at HAVE_METADATA. Enabled
+  BR2_PACKAGE_GST1_PLUGINS_BAD_PLUGIN_OPUS: desktop site plays VP9 480p30 on LG's pipeline (Opus in software).
+  The same bug as the WebM Opus/Vorbis demux failure of 2026-11-13.
+- **TV app video stayed black:** the media server held LG's Load for the audio side's answer (up to 1 s) but only
+  checked that timeout when poll() went idle; the TV app streams without pause, so it never loaded. Now checked on
+  every unit too. TV app: VP9 1080p60 on LG's pipeline, 60 fps, web process ~316 MB / 44% CPU.
+- The glass panel no longer stays while a page is at its top (web apps that never scroll kept it over their
+  header and video); it peeks for 2.5 s after a load and after Back, and comes back with Up at the top edge.
+- LG's screen capture (executeOneShot DISPLAY) leaves out the hardware video plane (black); VIDEO is permission-denied.
