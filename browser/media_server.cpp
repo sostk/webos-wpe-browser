@@ -313,6 +313,9 @@ void MediaServer::serve(int fd, uint64_t id) {
         if (!read_all(fd, &h, sizeof(h)) || h.size > WPEB_MEDIA_MAX_PAYLOAD) break;
         payload.resize(h.size);
         if (h.size && !read_all(fd, payload.data(), h.size)) break;
+        if (h.type == WPEB_MEDIA_LOAD || h.type == WPEB_MEDIA_UNLOAD || h.type == WPEB_MEDIA_FLUSH)
+            WNK_LOGI(kCat, "stream %llu: %s", static_cast<unsigned long long>(id),
+                     h.type == WPEB_MEDIA_LOAD ? "load" : h.type == WPEB_MEDIA_UNLOAD ? "unload" : "flush");
         if (h.type == WPEB_MEDIA_UNLOAD) {
             drop_queued();
             set_ready(false);
@@ -321,6 +324,9 @@ void MediaServer::serve(int fd, uint64_t id) {
             continue;
         }
         if (h.type == WPEB_MEDIA_VIDEO || h.type == WPEB_MEDIA_AUDIO) {
+            // A held Load also times out while units keep arriving: poll() never goes idle when a page streams
+            // without pause (YouTube's TV app), and the Load waited forever (TV, 2026-11-14).
+            if (load_pending) maybe_load();
             const bool audio = h.type == WPEB_MEDIA_AUDIO;
             if (audio && audio_state != AudioState::Hardware) continue;
             Unit u;
