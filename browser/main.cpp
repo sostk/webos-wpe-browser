@@ -1,17 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// WPE Browser: a WebKit (WPE) web browser for LG webOS TVs, with tabs, bookmarks, history and settings in
-// the style of desktop Chromium.
+// Wren: a WebKit (WPE) web browser for LG webOS TVs, with tabs, bookmarks, history and settings, in a glass,
+// D-pad-first TV interface (wren_ui.hpp).
 //
-// This process is the UI: the kit's shell, a tab strip, a toolbar with an omnibox, the bookmarks bar, and
-// either the native New Tab page or the PageView; Settings, History and Bookmarks are native pages pushed on
-// top (screens.cpp). WebKit runs in engine/wpe-engine (built with a glibc 2.28 toolchain), which keeps one
-// WebKit view per open tab and renders the active one into shared memory; see engine_client.hpp and
-// common/wpe_ipc.h. Settings, bookmarks, history and the session live in profile.cpp.
+// This process is the UI: the kit's shell, the Home page (New Tab) or the PageView, and over a page a glass panel
+// with the tab row and the navigation row; overlays for all tabs, the side panel (bookmarks, history, zoom) and
+// quick actions; Settings, History and Bookmarks are native pages pushed on top (screens.cpp). WebKit runs in
+// engine/wpe-engine (built with a glibc 2.28 toolchain), which keeps one WebKit view per open tab; see
+// engine_client.hpp and common/wpe_ipc.h. Settings, bookmarks, history and the session live in profile.cpp.
 //
-// Remote: in a page, the D-pad moves between links (WebKit spatial navigation) and OK follows them. Back goes
-// back in history, or to the omnibox when there is none. Colour keys: Red = omnibox, Green = reload,
-// Yellow = next tab, Blue = new tab. CH+/CH- = page up/down. The Magic Remote pointer is a mouse in pages.
+// Remote (any LG remote, colour buttons not needed): in a page the D-pad moves between links (WebKit spatial
+// navigation) and OK follows them; Up at the page's top edge shows the panel, where Left/Right + OK switch tabs.
+// Back goes back in history, or to the panel when there is none. Hold OK = quick actions. CH+/CH- = next/previous
+// tab. Colour keys, when the remote has them: Red = all tabs, Green = bookmarks, Yellow = quick actions (zoom),
+// Blue = new tab. The Magic Remote pointer is a mouse in pages and its wheel scrolls.
 #include "chrome.hpp"
+#include "wren_ui.hpp"
 #include "direct_owner.hpp"
 #include "engine_client.hpp"
 #include "media_server.hpp"
@@ -37,6 +40,7 @@
 #include <cstdlib>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <sys/stat.h>
@@ -56,7 +60,7 @@ using browser::TabId;
 namespace pal = browser::palette;
 
 constexpr const char *kCat = "browser";
-constexpr const char *kVersion = "0.2.0";
+constexpr const char *kVersion = "0.3.0";
 // Pages are rendered at this fraction of the view's size in 1920x1080 logical units and scaled up by the
 // GPU: CPU rendering at about 1280 px wide keeps scrolling usable, and CSS px at that size read well from a sofa.
 constexpr float kRenderScale = 2.0f / 3.0f;
@@ -64,12 +68,13 @@ constexpr double kChromeSlideMs = 160;     // toolbar slide in/out
 constexpr double kChromePeekMs = 2500;   // after Back the toolbar stays over the page this long
 constexpr float kChromeRevealEdge = 6.0f;  // logical px at the top of the screen that bring the toolbar back
 constexpr int kMaxRestarts = 3;
+constexpr double kHoldOkMs = 550;  // OK held this long opens quick actions
 // Background tabs beyond this many keep only their URL and title (Chromium's tab discarding); they reload
 // when shown again. Each live tab costs WebKit memory, and a TV has little to spare.
 constexpr size_t kMaxLiveTabs = 4;
 constexpr size_t kMaxTabs = 12;
 
-const std::vector<browser::NewTabPage::Shortcut> kShortcuts = {
+const std::vector<browser::wren::HomeData::Item> kShortcuts = {
     {"YouTube", "https://www.youtube.com/"},   {"Wikipedia", "https://www.wikipedia.org/"},
     {"DuckDuckGo", "https://duckduckgo.com/"}, {"Google", "https://www.google.com/"},
     {"Reddit", "https://www.reddit.com/"},     {"GitHub", "https://github.com/"},
@@ -124,25 +129,38 @@ struct Tab {
 
 class App;
 
-// The whole window: tab strip, toolbar, bookmarks bar, progress line, content (New Tab page or PageView).
+// The whole window: the content (Home page or PageView), the glass panel over a page (tab row, navigation row),
+// a hint pill, and the overlays.
 class BrowserScreen : public wnk::ui::Screen {
  public:
     BrowserScreen(App &app, browser::EngineClient &engine);
-    // Back in the chrome returns to the content instead of starting the shell's double-Back exit.
+    // Back closes an overlay, or in the chrome returns to the content, instead of the shell's double-Back exit.
     bool on_back(wnk::ui::Ui &ui) override;
 
     App &app_;
-    browser::TabStrip *strip_ = nullptr;
-    browser::IconButton *back_ = nullptr, *forward_ = nullptr, *reload_ = nullptr, *menu_ = nullptr;
+    browser::wren::TabRow *tabrow_ = nullptr;
+    browser::IconButton *back_ = nullptr, *forward_ = nullptr, *reload_ = nullptr, *star_ = nullptr, *menu_ = nullptr;
     browser::Omnibox *omnibox_ = nullptr;
-    browser::BookmarksBar *bookmarks_ = nullptr;
-    browser::ProgressLine *progress_ = nullptr;
-    wnk::ui::Column *chrome_ = nullptr;             // tabs, toolbar, bookmarks: drawn over the page
-    wnk::ui::Row *toolbar_ = nullptr;
+    browser::wren::ChromePanel *panel_ = nullptr;
+    wnk::ui::Column *chrome_ = nullptr;             // the panel (and messages): drawn over the page
+    wnk::ui::Row *toolbar_ = nullptr;               // the navigation row
     browser::ProgressLine *thin_progress_ = nullptr;  // load progress while the chrome is hidden
     browser::PageView *page_ = nullptr;
-    browser::NewTabPage *ntp_ = nullptr;
+    browser::wren::HomePage *home_ = nullptr;
+    browser::wren::HintPill *hints_ = nullptr;      // over a page while the panel has focus
+    wnk::ui::View *content_ = nullptr;              // the page or the Home page
+    browser::wren::TabOverview *overview_ = nullptr;
+    browser::wren::SidePanel *side_ = nullptr;
+    browser::wren::QuickActions *quick_ = nullptr;
     wnk::ui::Label *message_ = nullptr;
+
+    bool overlay_open() const { return open_overlay() != nullptr; }
+    browser::wren::Overlay *open_overlay() const {
+        if (quick_->visible()) return quick_;
+        if (side_->visible()) return side_;
+        if (overview_->visible()) return overview_;
+        return nullptr;
+    }
 };
 
 class App : public wnk::app::Delegate {
@@ -223,6 +241,7 @@ class App : public wnk::app::Delegate {
         if (t->live && t->crashed) reload_crashed(*t);
         screen_->page_->show_tab(t->live ? id : 0);
         screen_->page_->ime(ctx_->ui(), false);
+        if (changed && t->url.empty()) screen_->home_->search().field().set_text("");  // a fresh Home page
         refresh_chrome();
         if (changed) focus_content();
     }
@@ -302,23 +321,84 @@ class App : public wnk::app::Delegate {
         refresh_chrome();
     }
 
-    void show_menu() {
-        auto &ui = ctx_->ui();
-        std::vector<browser::MenuItem> items = {
-            {"add", "New tab", "Blue", [this](wnk::ui::Ui &) { new_tab(); }},
-            {"history", "History", "", [this](wnk::ui::Ui &u) { push_page(u, browser::make_history_screen(profile_, hooks())); }},
-            {"bookmarks", "Bookmarks", "", [this](wnk::ui::Ui &u) { push_page(u, browser::make_bookmarks_screen(profile_, hooks())); }},
-            {"delete", "Clear browsing data", "", [this](wnk::ui::Ui &u) { push_page(u, browser::make_clear_data_screen(hooks())); }},
-            {"settings", "Settings", "", [this](wnk::ui::Ui &u) { push_page(u, browser::make_settings_screen(profile_, hooks())); }},
-            {"close", "Close tab", "", [this](wnk::ui::Ui &) { close_tab(active_); }},
-            {"exit", "Exit", "", [this](wnk::ui::Ui &) { ctx_->quit("menu exit"); }},
-        };
-        std::string footer = std::string("WPE Browser ") + kVersion;
-        if (!engine_version_.empty()) footer += "  ·  WebKit " + engine_version_;
-        browser::show_menu(ui, std::move(items), footer);
+    // The menu button and Green: the side panel (bookmarks, history, zoom, settings, exit).
+    void show_menu(browser::wren::SidePanel::Section section = browser::wren::SidePanel::Section::Saved) {
+        close_overlays();
+        cover(true);
+        screen_->side_->show(ctx_->ui(), section, profile_.bookmarks(), profile_.history());
     }
 
+    // Red and "All tabs": every tab as a card.
+    void show_tab_overview() {
+        close_overlays();
+        cover(true);
+        screen_->overview_->set_visible(true);
+        rebuild_overview();
+    }
+
+    // Hold OK and Yellow: the common actions and page zoom.
+    void show_quick_actions(bool focus_zoom = false) {
+        close_overlays();
+        const Tab *t = tab(active_);
+        const std::string url = t != nullptr ? t->url : std::string();
+        cover(true);
+        screen_->quick_->show(ctx_->ui(), t != nullptr ? t->title : std::string(), url,
+                              !url.empty() && profile_.is_bookmarked(url), focus_zoom);
+    }
+
+    // What lies under an overlay takes no focus while it is open: the Magic Remote pointer's hover focus would
+    // otherwise land on the page (or Home's tiles) under the overlay's scrim and take the remote with it.
+    void cover(bool on) {
+        screen_->content_->set_enabled(!on);
+        screen_->chrome_->set_enabled(!on);
+    }
+
+    void close_overlays() {
+        auto &ui = ctx_->ui();
+        for (browser::wren::Overlay *o : {static_cast<browser::wren::Overlay *>(screen_->overview_),
+                                          static_cast<browser::wren::Overlay *>(screen_->side_),
+                                          static_cast<browser::wren::Overlay *>(screen_->quick_)})
+            if (o->visible()) o->set_visible(false);
+        cover(false);
+        (void)ui;
+    }
+
+    void rebuild_overview() {
+        if (screen_->overview_->visible()) screen_->overview_->rebuild(ctx_->ui(), tab_infos(), active_);
+    }
+
+    void zoom_step(int delta) {
+        auto &z = profile_.settings.zoom;
+        z = std::clamp(z + delta, 0, static_cast<int>(browser::kZoomLevels.size()) - 1);
+        profile_.settings_changed();
+        apply_settings();
+    }
+    std::string zoom_text() const {
+        return std::to_string(browser::kZoomLevels[static_cast<size_t>(profile_.settings.zoom)] / 10) + "%";
+    }
+
+    // Up at the page's top edge (and Back with no history): the panel, on the shown tab's chip.
+    void focus_tabs(wnk::ui::Ui &ui) {
+        screen_->chrome_->set_visible(true);
+        if (auto *chip = screen_->tabrow_->chip(active_))
+            ui.focus(chip);
+        else
+            ui.focus(&omnibox_field());
+    }
+
+    void quit() { ctx_->quit("menu exit"); }
+
     void show_bookmarks_page(wnk::ui::Ui &ui) { push_page(ui, browser::make_bookmarks_screen(profile_, hooks())); }
+    void show_history_page(wnk::ui::Ui &ui) { push_page(ui, browser::make_history_screen(profile_, hooks())); }
+    void show_settings_page(wnk::ui::Ui &ui) { push_page(ui, browser::make_settings_screen(profile_, hooks())); }
+    void close_active_tab() { close_tab(active_); }
+    // "Close all": every tab goes, and a New Tab page is left (a TV browser never closes its window).
+    void close_all_tabs() {
+        close_overlays();
+        std::vector<TabId> ids;
+        for (const Tab &t : tabs_) ids.push_back(t.id);
+        for (TabId id : ids) close_tab(id);
+    }
 
     // The chrome is shown unless the page itself has focus (Red, or Back with no history, moves focus to it; so
     // does the pointer at the top edge). While the page has focus the chrome still peeks over it when the page is
@@ -326,6 +406,8 @@ class App : public wnk::app::Delegate {
     // kChromeSlideMs and is then hidden, so its buttons can't take focus.
     bool chrome_wanted(wnk::ui::Ui &ui) {
         const Tab *t = tab(active_);
+        if (screen_->overlay_open()) return false;  // overlays cover the page; the panel waits behind
+        if (t != nullptr && t->url.empty()) return false;  // Home has its own header
         const bool page_mode = ui.focused() == screen_->page_ && t != nullptr && t->live && !t->url.empty() &&
                                !screen_->message_->visible() && ui.top_dialog() == nullptr && nav_->depth() == 1;
         if (!page_mode) return true;
@@ -341,13 +423,9 @@ class App : public wnk::app::Delegate {
         auto *chrome = screen_->chrome_;
         // The column itself spans the screen (a plain View places it with the full height); the chrome ends at the
         // bottom of its last visible row.
-        float bottom = screen_->progress_->frame().y + screen_->progress_->frame().h;
-        if (screen_->message_->visible()) bottom = std::max(bottom, screen_->message_->frame().y + screen_->message_->frame().h);
+        const float bottom = screen_->panel_->frame().bottom();
         const float h = std::max(0.0f, bottom - chrome->frame().y);
         chrome_h_ = h;
-        // The New Tab page starts below the chrome; a web page lies under it.
-        const float pad = h > 0 ? h : 0;
-        if (screen_->ntp_->padding().top != pad) screen_->ntp_->set_padding({0, pad, 0, 0});
         const bool want = chrome_wanted(ui);
         const double now = ui.now_ms();
         const double dt = last_chrome_ms_ > 0 ? now - last_chrome_ms_ : 0;
@@ -357,11 +435,23 @@ class App : public wnk::app::Delegate {
         if (want && !chrome->visible()) chrome->set_visible(true);
         chrome->set_translation({0, -(1.0f - chrome_shown_) * h});
         if (!want && chrome_shown_ <= 0.0f && chrome->visible()) chrome->set_visible(false);
-        screen_->thin_progress_->set_visible(!chrome->visible());
+        const Tab *t = tab(active_);
+        screen_->thin_progress_->set_visible(!chrome->visible() && t != nullptr && !t->url.empty());
+        // The hint pill while the panel has focus (not while it only peeks over the focused page).
+        const bool hints = chrome->visible() && chrome_shown_ >= 1.0f && ui.focused() != nullptr &&
+                           screen_->chrome_->is_ancestor_of(ui.focused());
+        if (hints != screen_->hints_->visible()) screen_->hints_->set_visible(hints);
+        screen_->home_->show_hints(!screen_->overlay_open());
     }
 
-    // Hidden views can't take focus: show the chrome first (it slides in from its current position).
+    // Hidden views can't take focus: show the chrome first (it slides in from its current position). On the Home
+    // page the address is its search field.
     void focus_omnibox(wnk::ui::Ui &ui) {
+        const Tab *t = tab(active_);
+        if (t != nullptr && t->url.empty()) {
+            ui.focus(&screen_->home_->search().field());
+            return;
+        }
         screen_->chrome_->set_visible(true);
         ui.focus(&omnibox_field());
     }
@@ -375,13 +465,13 @@ class App : public wnk::app::Delegate {
 
     bool content_focused() {
         auto *f = ctx_->ui().focused();
-        return f == screen_->page_ || (f != nullptr && screen_->ntp_->is_ancestor_of(f));
+        return f == screen_->page_ || (f != nullptr && screen_->home_->is_ancestor_of(f));
     }
 
     void focus_content() {
         const Tab *t = tab(active_);
         if (t != nullptr && t->url.empty())
-            ctx_->ui().focus(&screen_->ntp_->search().field());
+            ctx_->ui().focus(&screen_->home_->search().field());
         else
             ctx_->ui().focus(screen_->page_);
     }
@@ -394,6 +484,10 @@ class App : public wnk::app::Delegate {
         data_dir_ = data_dir(ctx);
         profile_.load(data_dir_ + "/profile");
         auto &ui = ctx.ui();
+        browser::wren::fonts().regular = ui.theme().regular;
+        browser::wren::fonts().semibold = ui.theme().bold;
+        browser::wren::load_extra_fonts(ctx.renderer(), ctx.launch().app_dir);
+        browser::wren::icon_lookup() = [this](const std::string &url) { return profile_.icon_for(url); };
         nav_ = &ui.root().add<wnk::ui::Navigator>();
         auto screen = std::make_unique<BrowserScreen>(*this, engine_);
         screen_ = screen.get();
@@ -410,6 +504,12 @@ class App : public wnk::app::Delegate {
     void on_relaunch(wnk::app::Context &, const std::string &params_json) override { open_launch_target(params_json); }
 
     void open_launch_target(const std::string &params_json) {
+        // {"wpebShow": "quick" | "side" | "zoom" | "tabs" | "panel" | "home"}: opens that overlay (or the tab panel over the page) a
+        // moment after start, for screenshots and tests without a remote.
+        if (const std::string show = launch_param(params_json, "wpebShow"); !show.empty()) {
+            pending_show_ = show;
+            pending_show_at_ms_ = ctx_->ui().now_ms() + 4000;
+        }
         std::string url = launch_param(params_json, "target");
         if (url.empty()) url = launch_param(params_json, "url");
         if (url.empty()) return;
@@ -462,8 +562,25 @@ class App : public wnk::app::Delegate {
             }
         }
         if (Tab *t = tab(active_)) {
-            screen_->progress_->set(t->loading, t->progress);
+            screen_->panel_->set_progress(t->loading, t->progress);
             screen_->thin_progress_->set(t->loading, t->progress);
+        }
+        if (!pending_show_.empty() && ctx.ui().now_ms() >= pending_show_at_ms_) {
+            const std::string show = std::exchange(pending_show_, std::string());
+            if (show == "quick") show_quick_actions();
+            if (show == "side") show_menu();
+            if (show == "tabs") show_tab_overview();
+            if (show == "panel") focus_tabs(ctx.ui());
+            if (show == "home") {
+                close_overlays();
+                new_tab();
+            }
+            if (show == "zoom") show_menu(browser::wren::SidePanel::Section::Zoom);
+        }
+        keep_overlay_focus(ctx.ui());
+        if (ok_down_ && !ok_long_ && ctx.ui().now_ms() - ok_down_ms_ >= kHoldOkMs) {
+            ok_long_ = true;
+            show_quick_actions();
         }
         update_chrome(ctx.ui());
         if (restart_pending_ && ctx_->ui().now_ms() >= restart_at_ms_) {
@@ -478,31 +595,76 @@ class App : public wnk::app::Delegate {
         auto &ui = ctx.ui();
         using A = wnk::input::Action;
         const A action = keymap_.lookup(e.scancode, e.keycode);
-        // Colour keys work on the browser screen, except while typing or in a dialog.
-        if (nav_->depth() == 1 && ui.text_input_view() == nullptr && ui.top_dialog() == nullptr && e.down && !e.repeat) {
+        const bool browsing = nav_->depth() == 1 && ui.text_input_view() == nullptr && ui.top_dialog() == nullptr;
+        // An open overlay owns the remote: Back closes it, and every other key goes to its widgets (focus is put back
+        // inside first if it slipped out, e.g. to the page under it).
+        if (browsing && screen_->overlay_open()) {
+            browser::wren::Overlay *o = screen_->open_overlay();
+            if (action == A::Back) {
+                if (e.down && !e.repeat) o->close(ui);
+                return true;
+            }
+            keep_overlay_focus(ui);
+            if (action == A::ChannelUp || action == A::ChannelDown) {
+                if (e.down && !e.repeat && o == screen_->overview_) step_tab(action == A::ChannelUp ? -1 : +1);
+                return true;
+            }
+            return false;  // the kit routes it to the focused overlay widget
+        }
+        // Hold OK: quick actions. OK is held back until it is released (a short press is then delivered as usual) or
+        // has been held kHoldOkMs (on_frame opens the actions; the release is swallowed).
+        if (action == A::Confirm) {
+            const bool eligible = browsing && !screen_->overlay_open() &&
+                                  !(ui.focused() == screen_->page_ && screen_->page_->editing());
+            if (e.down && !e.repeat && eligible) {
+                ok_down_ = true;
+                ok_long_ = false;
+                ok_down_ms_ = ui.now_ms();
+                ok_key_ = e;
+                return true;
+            }
+            if (ok_down_) {
+                if (e.down) return true;  // auto-repeat while held
+                ok_down_ = false;
+                if (!ok_long_) deliver_ok(ui, e);
+                return true;
+            }
+            return false;
+        }
+        if (browsing && e.down && !e.repeat) {
             switch (action) {
-            case A::Red: focus_omnibox(ui); return true;
-            case A::Green: reload_or_stop(); return true;
-            case A::Yellow: next_tab(); return true;
-            case A::Blue: new_tab(); return true;
+            case A::Red:
+            case A::Green:
+            case A::Yellow:
+            case A::Blue:
+                if (!browser::wren::colour_keys_seen()) {
+                    browser::wren::colour_keys_seen() = true;
+                    screen_->home_->refresh_hints();
+                }
+                if (action == A::Red) show_tab_overview();
+                if (action == A::Green) show_menu();
+                if (action == A::Yellow) show_quick_actions(true);
+                if (action == A::Blue) new_tab();
+                return true;
+            case A::ChannelUp:
+            case A::ChannelDown:
+                if (screen_->overlay_open() && !screen_->overview_->visible()) return true;
+                step_tab(action == A::ChannelUp ? -1 : +1);
+                return true;
             default: break;
             }
         }
-        // The page lies under the chrome, so spatial navigation never finds it "below": Down from the toolbar
-        // or the bookmarks bar goes back to the page (or the New Tab page), which hides the chrome again.
-        if (action == A::Down && e.down && nav_->depth() == 1 && ui.text_input_view() == nullptr &&
-            ui.top_dialog() == nullptr && ui.focused() != nullptr &&
-            (screen_->toolbar_->is_ancestor_of(ui.focused()) || screen_->bookmarks_->is_ancestor_of(ui.focused()))) {
-            const bool bookmarks_below = screen_->bookmarks_->visible() && screen_->toolbar_->is_ancestor_of(ui.focused()) &&
-                                         screen_->bookmarks_->has_items();
-            if (!bookmarks_below) {
-                focus_content();
-                return true;
-            }
+        if (browsing && (action == A::ChannelUp || action == A::ChannelDown || action == A::Red || action == A::Green ||
+                         action == A::Yellow || action == A::Blue))
+            return true;  // handled on press
+        // The page lies under the chrome, so spatial navigation never finds it "below": Down from the navigation row
+        // goes back to the page, which hides the chrome again.
+        if (action == A::Down && e.down && browsing && ui.focused() != nullptr && screen_->toolbar_->is_ancestor_of(ui.focused())) {
+            focus_content();
+            return true;
         }
         const Tab *t = tab(active_);
-        if (ui.focused() != screen_->page_ || screen_->page_->editing() || t == nullptr || !t->live ||
-            !engine_.running())
+        if (ui.focused() != screen_->page_ || screen_->page_->editing() || t == nullptr || !t->live || !engine_.running())
             return false;
         switch (action) {
         case A::Back:
@@ -513,19 +675,12 @@ class App : public wnk::app::Delegate {
                     engine_.go_back(t->id);
                     peek_chrome();  // show where we are (the address) while the page stays focused
                 } else
-                    focus_omnibox(ui);
+                    focus_tabs(ui);
             }
             return true;
         case A::Exit:
         case A::Home:
             return false;  // the shell and the TV handle these
-        case A::Red:
-        case A::Green:
-        case A::Yellow:
-        case A::Blue:
-            return true;  // handled above on press
-        case A::ChannelUp: engine_.key(e.down, 0xff55, 104 + 8, 0); return true;    // Page_Up
-        case A::ChannelDown: engine_.key(e.down, 0xff56, 109 + 8, 0); return true;  // Page_Down
         default: break;
         }
         const browser::WebKey k = browser::web_key_from_sdl(e.keycode);
@@ -534,10 +689,56 @@ class App : public wnk::app::Delegate {
         return true;
     }
 
+    // A short OK press, held back by on_key: to the page as Return, else to the focused widget.
+    void deliver_ok(wnk::ui::Ui &ui, const wnk::input::KeyEvent &release) {
+        const Tab *t = tab(active_);
+        if (ui.focused() == screen_->page_ && t != nullptr && t->live && engine_.running()) {
+            const browser::WebKey k = browser::web_key_from_sdl(ok_key_.keycode);
+            if (k.keyval != 0) {
+                engine_.key(true, k.keyval, k.keycode, 0);
+                engine_.key(false, k.keyval, k.keycode, 0);
+            }
+            return;
+        }
+        wnk::input::ActionEvent a;
+        a.action = wnk::input::Action::Confirm;
+        a.phase = wnk::input::Phase::Press;
+        a.source = ok_key_;
+        ui.handle(a);
+        a.phase = wnk::input::Phase::Release;
+        a.held_ms = release.time_ms - ok_key_.time_ms;
+        a.source = release;
+        ui.handle(a);
+    }
+
+    // Focus belongs inside an open overlay. Its widgets were hidden until the overlay opened, and the kit may not take
+    // a focus request for them in that frame; the page under it must never keep the remote.
+    void keep_overlay_focus(wnk::ui::Ui &ui) {
+        browser::wren::Overlay *o = screen_->open_overlay();
+        if (o == nullptr) return;
+        wnk::ui::View *f = ui.focused();
+        if (f != nullptr && o->is_ancestor_of(f)) return;
+        if (o == screen_->quick_ || o == screen_->side_ || o == screen_->overview_) ui.focus_within(o);
+    }
+
+    // CH+ / CH-: the previous / next tab.
+    void step_tab(int delta) {
+        if (tabs_.size() < 2) return;
+        auto it = find(active_);
+        const long i = it == tabs_.end() ? 0 : static_cast<long>(it - tabs_.begin());
+        const long n = static_cast<long>(tabs_.size());
+        activate(tabs_[static_cast<size_t>(((i + delta) % n + n) % n)].id);
+        if (!tabs_.empty()) ctx_->ui().toast(tab(active_)->title.empty() ? "New tab" : tab(active_)->title, 1200);
+    }
+
     bool on_pointer(wnk::app::Context &ctx, const wnk::input::PointerEvent &p) override {
         using T = wnk::input::PointerEvent::Type;
         const Tab *t = tab(active_);
         if (!engine_.running() || t == nullptr || !t->live || !screen_->page_->visible() || nav_->depth() != 1) return false;
+        if (screen_->overlay_open() || ok_down_) {
+            leave_page();
+            return ok_down_ && (p.type == T::Press || p.type == T::Release);  // OK's own click, held back with the key
+        }
         if (p.type == T::Hidden || p.type == T::Left) {
             leave_page();
             return false;
@@ -654,7 +855,6 @@ class App : public wnk::app::Delegate {
     }
 
     void apply_settings() {
-        screen_->bookmarks_->set_visible(profile_.settings.show_bookmarks_bar);
         engine_.set_zoom(static_cast<uint32_t>(browser::kZoomLevels[static_cast<size_t>(profile_.settings.zoom)]));
         // Pages lay out at 2/3 of the screen (kRenderScale); 1/kRenderScale renders them at full resolution.
         // Direct presentation always does: the page surface is shown 1:1, not scaled to the page area.
@@ -662,11 +862,24 @@ class App : public wnk::app::Delegate {
         engine_.set_scale(full ? static_cast<uint32_t>(1000.0f / kRenderScale + 0.5f) : 1000u);
     }
 
-    void refresh_bookmarks() {
-        std::vector<browser::BookmarksBar::Item> items;
-        for (const auto &b : profile_.bookmarks()) items.push_back({b.title, b.url});
-        screen_->bookmarks_->rebuild(ctx_->ui(), items);
-        screen_->bookmarks_->set_visible(profile_.settings.show_bookmarks_bar);
+    void refresh_bookmarks() {}  // bookmarks show in the side panel, filled when it opens
+
+    std::vector<browser::TabInfo> tab_infos() const {
+        std::vector<browser::TabInfo> infos;
+        for (const Tab &t : tabs_) infos.push_back({t.id, t.title, t.url, t.loading});
+        return infos;
+    }
+
+    // The Home page's "Continue browsing": the latest distinct pages from history.
+    std::vector<browser::wren::HomeData::Item> recents() const {
+        std::vector<browser::wren::HomeData::Item> out;
+        for (const auto &h : profile_.history()) {
+            if (h.url.empty()) continue;
+            if (std::any_of(out.begin(), out.end(), [&](const auto &o) { return o.url == h.url; })) continue;
+            out.push_back({h.title, h.url});
+            if (out.size() == 4) break;
+        }
+        return out;
     }
 
     void restore_or_new_tab() {
@@ -720,24 +933,38 @@ class App : public wnk::app::Delegate {
     }
 
     void refresh_chrome() {
-        std::vector<browser::TabInfo> infos;
-        for (const Tab &t : tabs_) infos.push_back({t.id, t.title, t.url, t.loading});
+        const std::vector<browser::TabInfo> infos = tab_infos();
         auto &ui = ctx_->ui();
-        const bool strip_focused = ui.focused() != nullptr && screen_->strip_->is_ancestor_of(ui.focused());
-        screen_->strip_->rebuild(ui, infos, active_);
-        if (strip_focused) {
-            if (auto *tv = screen_->strip_->tab_view(active_)) ui.focus(tv);
+        const bool row_focused = ui.focused() != nullptr && screen_->tabrow_->is_ancestor_of(ui.focused());
+        screen_->tabrow_->rebuild(ui, infos, active_);
+        if (row_focused) {
+            if (auto *chip = screen_->tabrow_->chip(active_)) ui.focus(chip);
         }
+        const bool home_focused = ui.focused() != nullptr && screen_->home_->is_ancestor_of(ui.focused()) &&
+                                  ui.focused() != &screen_->home_->search().field();
+        screen_->home_->set_tabs(infos, active_);
         const Tab *t = tab(active_);
         const bool page = t != nullptr && !t->url.empty();
-        screen_->ntp_->set_visible(!page);
+        if (!page) screen_->home_->set_recents(recents());
+        if (home_focused && !page) ui.focus(&screen_->home_->search().field());
+        screen_->home_->set_visible(!page);
         screen_->page_->set_visible(page);
         screen_->back_->set_active(t != nullptr && t->can_back);
         screen_->forward_->set_active(t != nullptr && t->can_forward);
         screen_->reload_->set_icon(t != nullptr && t->loading ? "close" : "reload");
         screen_->reload_->set_active(page);
-        screen_->omnibox_->set_star(page, page && profile_.is_bookmarked(t->url));
+        const bool marked = page && profile_.is_bookmarked(t->url);
+        screen_->star_->set_icon(marked ? "star-on" : "star");
+        screen_->star_->accessible_label = marked ? "Remove bookmark" : "Bookmark this page";
+        screen_->star_->set_active(page);
         if (ui.focused() != &omnibox_field()) screen_->omnibox_->show_url(t != nullptr ? t->url : std::string());
+        if (browser::wren::colour_keys_seen())
+            screen_->hints_->set_hints({{"◀ ▶", {}, "Switch tab"}, {"OK", {}, "Open"}, {"▼", {}, "Page"},
+                                        {"", browser::wren::kYellow, "Zoom"}});
+        else
+            screen_->hints_->set_hints({{"◀ ▶", {}, "Switch tab"}, {"OK", {}, "Open"}, {"▼", {}, "Page"},
+                                        {"Hold OK", {}, "More"}});
+        rebuild_overview();
         save_session();  // cheap: written at most every 2 s by Profile::flush
     }
 
@@ -789,6 +1016,18 @@ class App : public wnk::app::Delegate {
         };
         cb.scroll = [this](TabId id, bool at_top) {
             if (Tab *t = tab(id)) t->at_top = at_top;
+        };
+        cb.icon = [this](TabId id, const std::string &url) {
+            Tab *t = tab(id);
+            if (t == nullptr || t->url.empty()) return;
+            WNK_LOGI(kCat, "tab %u icon %s", id, url.empty() ? "(none declared)" : url.c_str());
+            profile_.set_icon(t->url, url);
+            refresh_chrome();
+        };
+        cb.edge_up = [this](TabId id) {
+            auto &ui = ctx_->ui();
+            if (id == active_ && ui.focused() == screen_->page_ && !screen_->overlay_open() && nav_->depth() == 1)
+                focus_tabs(ui);
         };
         cb.history = [this](TabId id, bool back, bool forward) {
             if (Tab *t = tab(id)) {
@@ -993,67 +1232,125 @@ class App : public wnk::app::Delegate {
     bool raise_page_ = false;
     std::vector<std::pair<TabId, double>> pending_closes_;  // window.close(): destroyed a little later  // hardware video for pages (direct presentation only)
     bool direct_failed_ = false;           // stays in SHM mode for the rest of this run
+    bool ok_down_ = false, ok_long_ = false;  // OK held back by on_key (Hold OK)
+    std::string pending_show_;  // launch parameter wpebShow
+    double pending_show_at_ms_ = 0;
+    double ok_down_ms_ = 0;
+    wnk::input::KeyEvent ok_key_{};
     bool direct_fallback_pending_ = false;
 };
 
 BrowserScreen::BrowserScreen(App &app, browser::EngineClient &engine) : Screen("browser"), app_(app) {
     name = "browser";
     // The page fills the screen (with direct presentation the TV shows the page surface at full window size
-    // anyway); the chrome lies over its top and slides away while the page has focus (App::update_chrome).
+    // anyway); the glass panel lies over its top and slides away while the page has focus (App::update_chrome).
     auto &stack = add<wnk::ui::View>();
     stack.set_width(wnk::ui::Dim::fill()).set_height(wnk::ui::Dim::fill());
     auto &content = stack.add<wnk::ui::View>();
     content.set_width(wnk::ui::Dim::fill()).set_height(wnk::ui::Dim::fill());
+    content_ = &content;
     page_ = &content.add<browser::PageView>(engine);
     page_->set_width(wnk::ui::Dim::fill()).set_height(wnk::ui::Dim::fill());
     page_->set_focus_ring(false);
-    ntp_ = &content.add<browser::NewTabPage>(
-        kShortcuts, [&app](wnk::ui::Ui &, const std::string &url) { app.navigate(url); });
-    ntp_->set_width(wnk::ui::Dim::fill()).set_height(wnk::ui::Dim::fill());
+
+    browser::wren::TabHandlers tabs{
+        [&app](uint32_t id) { app.close_overlays(); app.activate(id); },
+        [&app](uint32_t id) { app.close_tab(id); },
+        [&app]() { app.close_overlays(); app.new_tab(); },
+        [&app]() { app.show_tab_overview(); },
+        [&app]() { app.close_all_tabs(); },
+    };
+    browser::wren::HomeData home;
+    home.shortcuts = kShortcuts;
+    home_ = &content.add<browser::wren::HomePage>(
+        home, tabs, [&app](wnk::ui::Ui &, const std::string &url) { app.navigate(url); },
+        [&app](wnk::ui::Ui &) { app.show_menu(); });
+    home_->set_width(wnk::ui::Dim::fill()).set_height(wnk::ui::Dim::fill());
+
     thin_progress_ = &stack.add<browser::ProgressLine>();
     thin_progress_->set_width(wnk::ui::Dim::fill());
     thin_progress_->set_visible(false);
 
-    auto &col = stack.add<wnk::ui::Column>(0);
+    auto &col = stack.add<wnk::ui::Column>(12);
     col.set_width(wnk::ui::Dim::fill());
+    col.set_padding({60, 27, 60, 0});
     chrome_ = &col;
-
-    strip_ = &col.add<browser::TabStrip>(browser::TabStrip::Handlers{
-        [&app](uint32_t id) { app.activate(id); },
-        [&app](uint32_t id) { app.close_tab(id); },
-        [&app]() { app.new_tab(); },
-    });
-
-    auto &bar = col.add<wnk::ui::Row>(8);
+    panel_ = &col.add<browser::wren::ChromePanel>();
+    tabrow_ = &panel_->add<browser::wren::TabRow>(tabs);
+    auto &line = panel_->add<wnk::ui::View>();
+    line.set_width(wnk::ui::Dim::fill()).set_height(wnk::ui::Dim::fixed(1.5f));
+    line.set_padding({12, 0, 12, 0});
+    line.set_background(wnk::render::kWhite.with_alpha(0.08f));
+    auto &bar = panel_->add<wnk::ui::Row>(6);
     toolbar_ = &bar;
-    bar.set_padding({16, 10, 16, 10});
     bar.set_width(wnk::ui::Dim::fill());
-    bar.set_background(pal::kToolbar);
-    back_ = &bar.add<browser::IconButton>("back", "Back", [&app](wnk::ui::Ui &) { app.go_back(); });
-    forward_ = &bar.add<browser::IconButton>("forward", "Forward", [&app](wnk::ui::Ui &) { app.go_forward(); });
-    reload_ = &bar.add<browser::IconButton>("reload", "Reload", [&app](wnk::ui::Ui &) { app.reload_or_stop(); });
-    bar.add<browser::IconButton>("home", "Home", [&app](wnk::ui::Ui &) { app.go_home(); });
+    back_ = &bar.add<browser::IconButton>("back", "Back", [&app](wnk::ui::Ui &) { app.go_back(); }, 72);
+    forward_ = &bar.add<browser::IconButton>("forward", "Forward", [&app](wnk::ui::Ui &) { app.go_forward(); }, 72);
+    reload_ = &bar.add<browser::IconButton>("reload", "Reload", [&app](wnk::ui::Ui &) { app.reload_or_stop(); }, 72);
     omnibox_ = &bar.add<browser::Omnibox>([&app](wnk::ui::Ui &, const std::string &text) { app.navigate(text); },
-                                          "Search or type a URL", 64, pal::kOmnibox, pal::kOmniboxFocused,
-                                          [&app](wnk::ui::Ui &) { app.toggle_bookmark(); });
+                                          "Search or type a URL", 72);
     omnibox_->set_width(wnk::ui::Dim::fill());
     omnibox_->set_align(wnk::ui::Align::Start, wnk::ui::Align::Center);
-    menu_ = &bar.add<browser::IconButton>("menu", "Menu", [&app](wnk::ui::Ui &) { app.show_menu(); });
+    star_ = &bar.add<browser::IconButton>("star", "Bookmark this page", [&app](wnk::ui::Ui &) { app.toggle_bookmark(); }, 72);
+    menu_ = &bar.add<browser::IconButton>("menu", "Menu", [&app](wnk::ui::Ui &) { app.show_menu(); }, 72);
 
-    bookmarks_ = &col.add<browser::BookmarksBar>(
-        [&app](wnk::ui::Ui &, const std::string &url) { app.navigate(url); },
-        [&app](wnk::ui::Ui &ui) { app.show_bookmarks_page(ui); });
 
-    progress_ = &col.add<browser::ProgressLine>();
-
-    message_ = &col.add<wnk::ui::Label>("");
-    message_->set_padding(wnk::ui::Insets::all(32));
-    message_->set_width(wnk::ui::Dim::fill());
-    message_->set_background(pal::kFrame);
+    // Engine trouble: a glass-dark box above the hint pill (also on the Home page, which has no panel).
+    auto &message_box = stack.add<wnk::ui::View>();
+    message_box.set_width(wnk::ui::Dim::fill()).set_height(wnk::ui::Dim::fill());
+    message_box.set_padding({240, 0, 240, 135});
+    message_ = &message_box.add<wnk::ui::Label>("");
+    message_->set_padding(wnk::ui::Insets::xy(39, 27));
+    message_->set_max_lines(3);
+    message_->set_background(wnk::render::Color::hex(0x0C1018E6), 30);
+    message_->set_align(wnk::ui::Align::Center, wnk::ui::Align::End);
     message_->set_visible(false);
+
+    auto &hint_box = stack.add<wnk::ui::View>();
+    hint_box.set_width(wnk::ui::Dim::fill()).set_height(wnk::ui::Dim::fill());
+    hint_box.set_padding({0, 0, 0, 39});
+    hints_ = &hint_box.add<browser::wren::HintPill>(browser::wren::Glass::Dark);
+    hints_->set_align(wnk::ui::Align::Center, wnk::ui::Align::End);
+    hints_->set_visible(false);
+
+    overview_ = &stack.add<browser::wren::TabOverview>(tabs);
+    browser::wren::PanelHandlers ph;
+    ph.open = [&app](wnk::ui::Ui &, const std::string &url) { app.close_overlays(); app.navigate(url); };
+    ph.history_page = [&app](wnk::ui::Ui &ui) { app.close_overlays(); app.show_history_page(ui); };
+    ph.bookmarks_page = [&app](wnk::ui::Ui &ui) { app.close_overlays(); app.show_bookmarks_page(ui); };
+    ph.settings = [&app](wnk::ui::Ui &ui) { app.close_overlays(); app.show_settings_page(ui); };
+    ph.exit = [&app](wnk::ui::Ui &) { app.quit(); };
+    ph.zoom = [&app](int d) { app.zoom_step(d); };
+    ph.zoom_text = [&app]() { return app.zoom_text(); };
+    side_ = &stack.add<browser::wren::SidePanel>(ph);
+    browser::wren::QuickHandlers qh;
+    qh.new_tab = [&app](wnk::ui::Ui &) { app.new_tab(); };
+    qh.bookmark = [&app](wnk::ui::Ui &) { app.toggle_bookmark(); };
+    qh.tabs = [&app](wnk::ui::Ui &) { app.show_tab_overview(); };
+    qh.reload = [&app](wnk::ui::Ui &) { app.reload_or_stop(); };
+    qh.close_tab = [&app](wnk::ui::Ui &) { app.close_active_tab(); };
+    qh.history = [&app](wnk::ui::Ui &ui) { app.show_history_page(ui); };
+    qh.home = [&app](wnk::ui::Ui &) { app.go_home(); };
+    qh.settings = [&app](wnk::ui::Ui &ui) { app.show_settings_page(ui); };
+    qh.zoom = [&app](int d) { app.zoom_step(d); };
+    qh.zoom_text = [&app]() { return app.zoom_text(); };
+    quick_ = &stack.add<browser::wren::QuickActions>(qh);
+    for (browser::wren::Overlay *o : {static_cast<browser::wren::Overlay *>(overview_), static_cast<browser::wren::Overlay *>(side_),
+                                      static_cast<browser::wren::Overlay *>(quick_)})
+        o->on_close = [&app](wnk::ui::Ui &) {
+            app.cover(false);
+            app.focus_content();
+        };
 }
 
-bool BrowserScreen::on_back(wnk::ui::Ui &) {
+bool BrowserScreen::on_back(wnk::ui::Ui &ui) {
+    for (browser::wren::Overlay *o : {static_cast<browser::wren::Overlay *>(quick_), static_cast<browser::wren::Overlay *>(side_),
+                                      static_cast<browser::wren::Overlay *>(overview_)}) {
+        if (o->visible()) {
+            o->close(ui);
+            return true;
+        }
+    }
     if (app_.content_focused()) return false;  // the shell's double-Back exit
     app_.focus_content();
     return true;
@@ -1064,10 +1361,17 @@ bool BrowserScreen::on_back(wnk::ui::Ui &) {
 int main(int argc, char **argv) {
     wnk::app::AppConfig config;
     config.fallback_app_id = "org.sostk.wpebrowser";
-    config.title = "WPE Browser";
+    config.title = "Wren";
+    config.font_regular = "fonts/Manrope-Regular.ttf";
+    config.font_bold = "fonts/Manrope-SemiBold.ttf";
     config.script_env_prefix = "APP_WPEBROWSER";
     config.double_back_exit = true;
-    // Chromium dark: kit widgets (TextField, forms, dialogs, toasts) pick these up.
+    // HTTP(S) for site icons (the kit's image service: libcurl, a disk cache, PNG/JPEG/GIF/WebP/SVG decoding). Pages
+    // themselves load in the engine.
+    config.http = true;
+    config.http_cache_bytes = 8u << 20;
+    config.image_memory_bytes = 16u << 20;
+    // Wren's ink and glass: kit widgets (TextField, forms, dialogs, toasts) pick these up.
     config.theme.background = pal::kFrame;
     config.theme.surface = pal::kToolbar;
     // Form rows (Settings) sit on cards: same colour at rest, a lighter hover when focused.
@@ -1076,10 +1380,11 @@ int main(int argc, char **argv) {
     config.theme.text = pal::kText;
     config.theme.text_muted = pal::kMuted;
     config.theme.accent = pal::kAccent;
-    config.theme.focus_ring = pal::kAccent;
+    config.theme.focus_ring = wnk::render::kWhite.with_alpha(0.92f);
     config.theme.placeholder = pal::kHover;
     config.theme.ring_width = 3;
     config.theme.ring_gap = 3;
+    config.theme.radius = 24;
     config.theme.text_size = 28;
     return wnk::app::run(argc, argv, config, [] { return std::make_unique<App>(); });
 }

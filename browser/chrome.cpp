@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "chrome.hpp"
+#include "wren_ui.hpp"
 
 #include "wnk/ui/ui.hpp"
 
@@ -23,58 +24,15 @@ constexpr Color kMonogramColors[] = {
     Color::hex(0x8AB4F8FF), Color::hex(0xF28B82FF), Color::hex(0xFDD663FF), Color::hex(0x81C995FF),
     Color::hex(0xFF8BCBFF), Color::hex(0xC58AF9FF), Color::hex(0x78D9ECFF), Color::hex(0xFCAD70FF),
 };
-constexpr Color kMonogramText = Color::hex(0x202124FF);
-
 bool is_confirm(const wnk::input::ActionEvent &e) {
     return e.action == wnk::input::Action::Confirm && e.phase == wnk::input::Phase::Press;
 }
 
-void draw_centered(wnk::render::Renderer &r, const TextStyle &s, const Rect &box, const std::string &text) {
-    const float w = r.measure_text(s, text);
-    r.draw_text(s, {box.cx() - w * 0.5f, box.y + (box.h - r.line_height(s)) * 0.5f + r.ascent(s)}, text);
-}
-
-void draw_monogram(Ui &ui, const Rect &circle, const Monogram &m, float text_size) {
-    auto &r = ui.renderer();
-    r.fill_rect(circle, ui.fade(m.color), circle.w * 0.5f);
-    draw_centered(r, TextStyle{ui.theme().bold, text_size, ui.fade(kMonogramText)}, circle, m.letter);
-}
-
-// One shortcut on the New Tab page.
-class ShortcutTile : public wnk::ui::View {
- public:
-    ShortcutTile(NewTabPage::Shortcut s, std::function<void(Ui &, const std::string &)> open)
-        : s_(std::move(s)), open_(std::move(open)) {
-        set_focusable(true);
-        set_size(200, 176);
-        set_focus_ring(true, 16);
-        accessible_label = s_.title;
-    }
-
- protected:
-    bool on_action(Ui &ui, const wnk::input::ActionEvent &e) override {
-        if (!is_confirm(e)) return false;
-        open_(ui, s_.url);
-        return true;
-    }
-    void draw(Ui &ui) override {
-        auto &r = ui.renderer();
-        const Rect f = frame();
-        if (ui.is_focused(this)) r.fill_rect(f, ui.fade(palette::kTabHover), 16);
-        const float d = 88;
-        draw_monogram(ui, {f.cx() - d * 0.5f, f.y + 20, d, d}, monogram_for(s_.url, s_.title), 40);
-        const TextStyle s{ui.theme().regular, 22, ui.fade(palette::kText)};
-        draw_centered(r, s, {f.x + 8, f.y + 20 + d + 12, f.w - 16, 36}, ellipsize(r, s, s_.title, f.w - 16));
-    }
-
- private:
-    NewTabPage::Shortcut s_;
-    std::function<void(Ui &, const std::string &)> open_;
-};
-
 }  // namespace
 
 void set_icon_dir(std::string dir) { g_icon_dir = std::move(dir); }
+
+const std::string &icon_dir_url() { return g_icon_dir; }
 
 std::string icon_url(const std::string &name, bool dim) { return g_icon_dir + name + (dim ? "-dim" : "") + ".svg"; }
 
@@ -126,7 +84,7 @@ IconButton::IconButton(std::string icon, std::string label, wnk::ui::ClickHandle
     : icon_(std::move(icon)), on_click_(std::move(on_click)), size_(size) {
     set_focusable(true);
     set_size(size, size);
-    set_focus_ring(true, size * 0.5f);
+    set_focus_ring(false);  // wren::draw_focus instead
     accessible_label = std::move(label);
     image_ = &add<wnk::ui::ImageView>(icon_url(icon_));
     image_->set_fit(wnk::ui::ImageFit::Contain);
@@ -147,7 +105,7 @@ void IconButton::set_active(bool active) {
 Size IconButton::measure_content(Ui &, Size) { return {size_, size_}; }
 
 void IconButton::layout_content(Ui &ui, const Rect &content) {
-    const float s = std::round(size_ * 0.56f);
+    const float s = std::round(size_ * 0.46f);
     image_->layout(ui, {content.cx() - s * 0.5f, content.cy() - s * 0.5f, s, s});
 }
 
@@ -158,89 +116,9 @@ bool IconButton::on_action(Ui &ui, const wnk::input::ActionEvent &e) {
 }
 
 void IconButton::draw(Ui &ui) {
-    if (ui.is_focused(this) && active_) ui.renderer().fill_rect(frame(), ui.fade(palette::kHover), size_ * 0.5f);
-}
-
-// ---- TabView ---------------------------------------------------------------------------------------------
-
-TabView::TabView(TabInfo info, bool active, std::function<void(uint32_t)> on_activate, std::function<void(uint32_t)> on_close)
-    : info_(std::move(info)), active_(active), on_activate_(std::move(on_activate)) {
-    set_focusable(true);
-    set_focus_ring(true, 12);
-    accessible_label = info_.title;
-    const uint32_t id = info_.id;
-    close_ = &add<IconButton>("close", "Close tab", [on_close, id](Ui &) { on_close(id); }, 36);
-}
-
-void TabView::layout_content(Ui &ui, const Rect &content) {
-    close_->layout(ui, {content.right() - 36 - 10, content.cy() - 18, 36, 36});
-}
-
-bool TabView::on_action(Ui &, const wnk::input::ActionEvent &e) {
-    if (!is_confirm(e)) return false;
-    on_activate_(info_.id);
-    return true;
-}
-
-void TabView::draw(Ui &ui) {
-    auto &r = ui.renderer();
-    const Rect f = frame();
-    const bool hot = ui.is_focused(this) || ui.is_focused(close_);
-    if (active_) {
-        // Joined to the toolbar below: rounded top, the bottom runs under the toolbar's background.
-        r.fill_rect({f.x, f.y, f.w, f.h + 16}, ui.fade(palette::kToolbar), 12);
-    } else if (hot) {
-        r.fill_rect({f.x + 4, f.y + 4, f.w - 8, f.h - 8}, ui.fade(palette::kTabHover), 12);
-    } else {
-        r.fill_rect({f.right() - 1, f.y + 14, 1, f.h - 28}, ui.fade(palette::kSeparator));
-    }
-    const float d = 32;
-    const Rect circle{f.x + 16, f.cy() - d * 0.5f, d, d};
-    if (info_.url.empty())
-        r.fill_rect(circle, ui.fade(palette::kHover), d * 0.5f);  // New Tab: a plain disc, no site letter
-    else
-        draw_monogram(ui, circle, monogram_for(info_.url, info_.title), 18);
-    if (info_.loading) {
-        const float a = 0.55f + 0.45f * std::sin(static_cast<float>(ui.now_ms()) / 180.0f);
-        r.stroke_rect({circle.x - 4, circle.y - 4, circle.w + 8, circle.h + 8}, ui.fade(palette::kAccent.with_alpha(a)), 3,
-                      (d + 8) * 0.5f);
-    }
-    const TextStyle s{ui.theme().regular, 22, ui.fade(active_ ? palette::kText : palette::kMuted)};
-    const float x = circle.right() + 12;
-    const float w = f.right() - 36 - 18 - x;
-    const std::string title = info_.title.empty() ? (info_.url.empty() ? "New Tab" : host_of(info_.url)) : info_.title;
-    r.draw_text(s, {x, f.y + (f.h - r.line_height(s)) * 0.5f + r.ascent(s)}, ellipsize(r, s, title, w));
-}
-
-// ---- TabStrip --------------------------------------------------------------------------------------------
-
-TabStrip::TabStrip(Handlers h) : Row(0), h_(std::move(h)) {
-    name = "tabstrip";
-    set_padding({16, 10, 16, 0});
-    set_width(wnk::ui::Dim::fill());
-    set_height(wnk::ui::Dim::fixed(66));
-    set_background(palette::kFrame);
-}
-
-void TabStrip::rebuild(Ui &, const std::vector<TabInfo> &tabs, uint32_t active) {
-    clear_children();
-    // Chromium: tabs share the width up to a comfortable maximum, then shrink.
-    const float available = 1920 - 32 - 72;
-    const float w = std::clamp(available / std::max<size_t>(tabs.size(), 1), 160.0f, 360.0f);
-    for (const TabInfo &t : tabs) {
-        auto &tv = add<TabView>(t, t.id == active, h_.activate, h_.close);
-        tv.set_width(wnk::ui::Dim::fixed(w)).set_height(wnk::ui::Dim::fixed(56));
-        tv.set_align(wnk::ui::Align::Start, wnk::ui::Align::End);
-    }
-    auto &plus = add<IconButton>("add", "New tab", [this](Ui &) { h_.new_tab(); }, 48);
-    plus.set_align(wnk::ui::Align::Start, wnk::ui::Align::Center);
-}
-
-TabView *TabStrip::tab_view(uint32_t id) {
-    for (auto &c : children()) {
-        if (auto *tv = dynamic_cast<TabView *>(c.get()); tv != nullptr && tv->tab_id() == id) return tv;
-    }
-    return nullptr;
+    if (!ui.is_focused(this) || !active_) return;
+    ui.renderer().fill_rect(frame(), ui.fade(palette::kGlassFocused), size_ * 0.5f);
+    wren::draw_focus(ui, frame(), size_ * 0.5f);
 }
 
 // ---- Omnibox ---------------------------------------------------------------------------------------------
@@ -298,85 +176,8 @@ void Omnibox::draw(Ui &ui) {
     const Rect f = frame();
     const bool focused = ui.is_focused(field_) || field_->editing();
     r.fill_rect(f, ui.fade(focused ? focused_ : rest_), f.h * 0.5f);
-    if (focused) r.stroke_rect(f, ui.fade(palette::kAccent), field_->editing() ? 3 : 2, f.h * 0.5f);
-}
-
-// ---- Chip / BookmarksBar ---------------------------------------------------------------------------------
-
-Chip::Chip(std::string label, std::string url, std::string icon, wnk::ui::ClickHandler on_click)
-    : label_(std::move(label)), url_(std::move(url)), on_click_(std::move(on_click)) {
-    set_focusable(true);
-    set_focus_ring(true, 18);
-    set_height(wnk::ui::Dim::fixed(40));
-    accessible_label = label_;
-    if (!icon.empty()) {
-        icon_ = &add<wnk::ui::ImageView>(icon_url(icon));
-        icon_->set_fit(wnk::ui::ImageFit::Contain);
-    }
-}
-
-Size Chip::measure_content(Ui &ui, Size) {
-    auto &r = ui.renderer();
-    const TextStyle s{ui.theme().regular, 21, palette::kText};
-    const float text = std::min(r.measure_text(s, label_), 220.0f);
-    return {12 + 24 + 10 + text + 14, 40};
-}
-
-void Chip::layout_content(Ui &ui, const Rect &c) {
-    if (icon_ != nullptr) icon_->layout(ui, {c.x + 12, c.cy() - 12, 24, 24});
-}
-
-bool Chip::on_action(Ui &ui, const wnk::input::ActionEvent &e) {
-    if (!is_confirm(e)) return false;
-    if (on_click_) on_click_(ui);
-    return true;
-}
-
-void Chip::draw(Ui &ui) {
-    auto &r = ui.renderer();
-    const Rect f = frame();
-    if (ui.is_focused(this)) r.fill_rect(f, ui.fade(palette::kHover), f.h * 0.5f);
-    if (icon_ == nullptr) {
-        const Monogram m = monogram_for(url_, label_);
-        draw_monogram(ui, {f.x + 12, f.cy() - 12, 24, 24}, m, 14);
-    }
-    const TextStyle s{ui.theme().regular, 21, ui.fade(palette::kText)};
-    const float x = f.x + 12 + 24 + 10;
-    r.draw_text(s, {x, f.y + (f.h - r.line_height(s)) * 0.5f + r.ascent(s)}, ellipsize(r, s, label_, f.right() - 14 - x));
-}
-
-BookmarksBar::BookmarksBar(std::function<void(Ui &, const std::string &)> open, wnk::ui::ClickHandler manage)
-    : Row(6), open_(std::move(open)), manage_(std::move(manage)) {
-    name = "bookmarksbar";
-    set_padding({16, 4, 16, 8});
-    set_width(wnk::ui::Dim::fill());
-    set_background(palette::kToolbar);
-}
-
-void BookmarksBar::rebuild(Ui &ui, const std::vector<Item> &items) {
-    clear_children();
-    has_items_ = !items.empty();
-    if (items.empty()) {
-        auto &hint = add<wnk::ui::Label>("For quick access, bookmark pages with the star in the address bar.", wnk::ui::TextRole::Small);
-        hint.set_muted(true);
-        hint.set_padding({12, 8, 0, 8});
-        return;
-    }
-    // As many chips as fit in one row (Chromium moves the rest behind ">>"); "All bookmarks" always shows.
-    auto &r = ui.renderer();
-    const TextStyle s{ui.theme().regular, 21, palette::kText};
-    const float limit = 1920 - 32 - 260;
-    float used = 0;
-    for (const Item &it : items) {
-        const float w = 12 + 24 + 10 + std::min(r.measure_text(s, it.title), 220.0f) + 14 + 6;
-        if (used + w > limit) break;
-        used += w;
-        const std::string url = it.url;
-        add<Chip>(it.title, it.url, "", [this, url](Ui &u) { open_(u, url); });
-    }
-    auto &spacer = add<wnk::ui::View>();
-    spacer.set_width(wnk::ui::Dim::fill());
-    add<Chip>("All bookmarks", "", "bookmarks", manage_);
+    r.stroke_rect(f, ui.fade(wnk::render::kWhite.with_alpha(focused ? 0.22f : 0.14f)), 1.5f, f.h * 0.5f);
+    if (focused) wren::draw_focus(ui, f, f.h * 0.5f);
 }
 
 // ---- ProgressLine ----------------------------------------------------------------------------------------
@@ -395,34 +196,9 @@ void ProgressLine::set(bool loading, float value) {
 void ProgressLine::draw(Ui &ui) {
     auto &r = ui.renderer();
     const Rect f = frame();
-    r.fill_rect(f, ui.fade(palette::kToolbar));
     if (!loading_) return;
     shown_ += (target_ - shown_) * 0.25f;
     r.fill_rect({f.x, f.y, f.w * std::clamp(shown_, 0.0f, 1.0f), f.h}, ui.fade(palette::kAccent));
 }
-
-// ---- NewTabPage ------------------------------------------------------------------------------------------
-
-NewTabPage::NewTabPage(std::vector<Shortcut> shortcuts, std::function<void(Ui &, const std::string &)> open) {
-    name = "ntp";
-    heading_ = &add<wnk::ui::Label>("Search the web", wnk::ui::TextRole::Title);
-    heading_->set_text_align(wnk::ui::Align::Center);
-    search_ = &add<Omnibox>(open, "Search DuckDuckGo or type a URL", 72, palette::kNtpSearch, palette::kNtpSearchFocused);
-    search_->field().name = "ntp-search";
-    tiles_ = &add<wnk::ui::Grid>(4, 24);
-    for (auto &s : shortcuts) tiles_->add<ShortcutTile>(s, open);
-}
-
-void NewTabPage::layout_content(Ui &ui, const Rect &c) {
-    const float y0 = c.y + c.h * 0.16f;
-    const Size hs = heading_->measure(ui, {c.w, 120});
-    heading_->layout(ui, {c.cx() - hs.w * 0.5f, y0, hs.w, hs.h});
-    const float sw = std::min(960.0f, c.w - 160);
-    search_->layout(ui, {c.cx() - sw * 0.5f, y0 + hs.h + 40, sw, 72});
-    const Size ts = tiles_->measure(ui, {sw, c.h});
-    tiles_->layout(ui, {c.cx() - ts.w * 0.5f, y0 + hs.h + 40 + 72 + 64, ts.w, ts.h});
-}
-
-void NewTabPage::draw(Ui &ui) { ui.renderer().fill_rect(frame(), ui.fade(palette::kNtpBackground)); }
 
 }  // namespace browser

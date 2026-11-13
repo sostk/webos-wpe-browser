@@ -28,7 +28,7 @@ else ()
     message(STATUS "wpebrowser: no staged engine; the package will show 'engine not found'")
 endif ()
 
-add_executable(wpebrowser main.cpp chrome.cpp screens.cpp profile.cpp storage.cpp private_loader.cpp engine_client.cpp page_view.cpp keys.cpp direct_owner.cpp media_server.cpp lg_media_player.cpp)
+add_executable(wpebrowser main.cpp chrome.cpp screens.cpp profile.cpp storage.cpp private_loader.cpp engine_client.cpp page_view.cpp keys.cpp direct_owner.cpp media_server.cpp lg_media_player.cpp wren_ui.cpp)
 target_include_directories(wpebrowser PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../common")
 target_link_libraries(wpebrowser PRIVATE wnk_app wnk_media_ndl ${CMAKE_DL_LIBS})
 if (WNK_WEBOS)
@@ -38,23 +38,25 @@ if (WNK_WEBOS)
 endif ()  # dlopen: libwpeb-owner.so (direct_owner.cpp)
 target_include_directories(wpebrowser SYSTEM PRIVATE "${WNK_KIT_DIR}/third_party")  # nlohmann/json.hpp
 
-# Fonts (Atkinson Hyperlegible, OFL) live in fonts/ next to the executable, on the host and in the ipk.
+# Fonts live in fonts/ next to the executable, on the host and in the ipk: the kit's Atkinson Hyperlegible and Wren's
+# Manrope (both OFL; Manrope from Google Fonts, static weights 300/400/600/700).
 add_custom_command(TARGET wpebrowser POST_BUILD
         COMMAND "${CMAKE_COMMAND}" -E copy_directory "${WNK_FONT_DIR}" "$<TARGET_FILE_DIR:wpebrowser>/fonts"
+        COMMAND "${CMAKE_COMMAND}" -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/fonts" "$<TARGET_FILE_DIR:wpebrowser>/fonts"
         COMMAND "${CMAKE_COMMAND}" -E copy_directory "${CMAKE_CURRENT_SOURCE_DIR}/icons" "$<TARGET_FILE_DIR:wpebrowser>/icons"
         VERBATIM)
 
 wnk_add_webos_package(
         TARGET wpebrowser
         APPID org.sostk.wpebrowser
-        TITLE "WPE Browser"
-        VERSION 0.2.0
+        TITLE "Wren"
+        VERSION 0.3.0
         VENDOR "sostk"
         ICON "${CMAKE_CURRENT_SOURCE_DIR}/icon.png"
         LARGE_ICON "${CMAKE_CURRENT_SOURCE_DIR}/largeIcon.png"
-        ICON_COLOR "#1f2937"
+        ICON_COLOR "#0b1020"
         EXPECTED_NEEDED "${CMAKE_CURRENT_SOURCE_DIR}/expected-needed.txt"
-        EXTRA_DIRS "${WNK_FONT_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/icons"
+        EXTRA_DIRS "${WNK_FONT_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/fonts" "${CMAKE_CURRENT_SOURCE_DIR}/icons"
         GLIBC_RUNTIMES ${WPEB_ENGINE_EXTRA_DIR}
         # Direct GPU presentation (engine/lib/libWPEBackend-webos.so, libwpeb-owner.so) must use the TV's own
         # Wayland client and wayland-egl, the ones its Mali EGL is built against.

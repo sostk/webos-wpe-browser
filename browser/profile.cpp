@@ -102,6 +102,10 @@ void Profile::load(const std::string &dir) {
         }
         session_active_ = static_cast<size_t>(std::max<int64_t>(0, num(j, "active")));
     }
+    if (auto j = parse(read_file(path(kIcons))); j.is_object()) {
+        for (const auto &[host, url] : j.items())
+            if (url.is_string()) icons_[host] = url.get<std::string>();
+    }
     WNK_LOGI(kCat, "profile %s: %zu bookmarks, %zu history entries, %zu session tabs", dir_.c_str(), bookmarks_.size(),
              history_.size(), session_.size());
 }
@@ -111,6 +115,7 @@ std::string Profile::path(unsigned part) const {
     case kSettings: return dir_ + "/settings.json";
     case kBookmarks: return dir_ + "/bookmarks.json";
     case kHistory: return dir_ + "/history.json";
+    case kIcons: return dir_ + "/icons.json";
     default: return dir_ + "/session.json";
     }
 }
@@ -132,6 +137,10 @@ std::string Profile::serialize(unsigned part) const {
     case kHistory:
         j = nlohmann::json::array();
         for (const auto &h : history_) j.push_back({{"title", h.title}, {"url", h.url}, {"time", h.time}});
+        break;
+    case kIcons:
+        j = nlohmann::json::object();
+        for (const auto &[host, url] : icons_) j[host] = url;
         break;
     default:
         j = {{"active", session_active_}, {"tabs", nlohmann::json::array()}};
@@ -219,12 +228,40 @@ void Profile::set_session(std::vector<SessionTab> tabs, size_t active) {
     dirty_ |= kSession;
 }
 
+namespace {
+std::string icon_host(const std::string &url) {
+    size_t start = url.find("://");
+    start = start == std::string::npos ? 0 : start + 3;
+    const size_t end = url.find_first_of("/?#:", start);
+    std::string host = url.substr(start, end == std::string::npos ? std::string::npos : end - start);
+    if (host.rfind("www.", 0) == 0) host = host.substr(4);
+    return host;
+}
+}  // namespace
+
+const std::string &Profile::icon_for(const std::string &url) const {
+    static const std::string none;
+    const auto it = icons_.find(icon_host(url));
+    return it == icons_.end() ? none : it->second;
+}
+
+void Profile::set_icon(const std::string &page_url, const std::string &icon_url) {
+    const std::string host = icon_host(page_url);
+    if (host.empty() || page_url.rfind("http", 0) != 0) return;
+    auto it = icons_.find(host);
+    if (icon_url.empty()) return;  // a page without an icon link keeps what the site's other pages declared
+    if (it != icons_.end() && it->second == icon_url) return;
+    if (icons_.size() >= 500 && it == icons_.end()) icons_.erase(icons_.begin());
+    icons_[host] = icon_url;
+    dirty_ |= kIcons;
+}
+
 void Profile::flush(wnk::async::WorkerPool &pool, double now_ms) {
     if (dirty_ == 0 || dir_.empty() || now_ms - last_flush_ms_ < kFlushIntervalMs) return;
     last_flush_ms_ = now_ms;
     // Serialise here (main thread owns the data), write on a worker.
     std::vector<std::pair<std::string, std::string>> files;
-    for (unsigned part : {kSettings, kBookmarks, kHistory, kSession}) {
+    for (unsigned part : {kSettings, kBookmarks, kHistory, kSession, kIcons}) {
         if (dirty_ & part) files.emplace_back(path(part), serialize(part));
     }
     dirty_ = 0;
@@ -237,7 +274,7 @@ void Profile::flush(wnk::async::WorkerPool &pool, double now_ms) {
 
 void Profile::flush_now() {
     if (dir_.empty()) return;
-    for (unsigned part : {kSettings, kBookmarks, kHistory, kSession}) {
+    for (unsigned part : {kSettings, kBookmarks, kHistory, kSession, kIcons}) {
         if ((dirty_ & part) && !write_atomic(path(part), serialize(part)))
             WNK_LOGW(kCat, "could not save %s", path(part).c_str());
     }

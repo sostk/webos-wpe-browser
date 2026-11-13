@@ -45,7 +45,7 @@ class PageScreen : public wnk::ui::Screen {
 
         auto &line = col.add<wnk::ui::View>();
         line.set_width(wnk::ui::Dim::fill()).set_height(wnk::ui::Dim::fixed(1));
-        line.set_background(palette::kSeparator);
+        line.set_background(palette::kHover);
 
         scroll_ = &col.add<wnk::ui::ScrollView>();
         scroll_->set_width(wnk::ui::Dim::fill()).set_height(wnk::ui::Dim::fill());
@@ -98,7 +98,7 @@ class ListRow : public wnk::ui::View {
     void draw(Ui &ui) override {
         auto &r = ui.renderer();
         const Rect f = frame();
-        if (ui.is_focused(this) || ui.is_focused(remove_)) r.fill_rect(f, ui.fade(palette::kTabHover), 10);
+        if (ui.is_focused(this) || ui.is_focused(remove_)) r.fill_rect(f, ui.fade(palette::kHover), 10);
         float x = f.x + 20;
         if (!time_.empty()) {
             const TextStyle ts{ui.theme().regular, 22, ui.fade(palette::kMuted)};
@@ -137,10 +137,6 @@ class SettingsScreen : public PageScreen {
         };
 
         auto &look = section("Appearance");
-        look.add<wnk::ui::Toggle>("Show bookmarks bar", s.show_bookmarks_bar, [&s, changed](Ui &ui, bool on) {
-            s.show_bookmarks_bar = on;
-            changed(ui);
-        });
         std::vector<std::string> zooms;
         for (int z : kZoomLevels) zooms.push_back(std::to_string(z / 10) + " %");
         auto &zoom = look.add<wnk::ui::Choice>("Page zoom", zooms, s.zoom, [&s, changed](Ui &ui, int i) {
@@ -180,8 +176,8 @@ class SettingsScreen : public PageScreen {
         privacy.add<wnk::ui::ValueRow>("Bookmarks").set_value(std::to_string(p.bookmarks().size()))
             .set_on_click([h](Ui &ui) { h.show_bookmarks(ui); });
 
-        auto &about = section("About WPE Browser");
-        about.add<wnk::ui::ValueRow>("Version").set_value("0.2.0");
+        auto &about = section("About Wren");
+        about.add<wnk::ui::ValueRow>("Version").set_value("0.3.0");
         const std::string engine = h.engine_version ? h.engine_version() : std::string();
         about.add<wnk::ui::ValueRow>("Engine").set_value(engine.empty() ? "WPE WebKit (not running)" : "WPE WebKit " + engine);
         about.add<wnk::ui::ValueRow>("Licence").set_value("GPL-3.0-or-later");

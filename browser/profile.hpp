@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <ctime>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -73,11 +74,16 @@ class Profile {
 
     void set_session(std::vector<SessionTab> tabs, size_t active);
 
+    // Site icons (WPE has no favicon store): the icon URL a page declared, per host ("www." dropped). Kept for tiles,
+    // bookmarks and history after the page is gone.
+    const std::string &icon_for(const std::string &url) const;
+    void set_icon(const std::string &page_url, const std::string &icon_url);
+
     void flush(wnk::async::WorkerPool &pool, double now_ms);
     void flush_now();
 
  private:
-    enum : unsigned { kSettings = 1, kBookmarks = 2, kHistory = 4, kSession = 8 };
+    enum : unsigned { kSettings = 1, kBookmarks = 2, kHistory = 4, kSession = 8, kIcons = 16 };
     std::string serialize(unsigned part) const;
     std::string path(unsigned part) const;
 
@@ -86,6 +92,7 @@ class Profile {
     std::vector<HistoryEntry> history_;
     std::vector<SessionTab> session_;
     size_t session_active_ = 0;
+    std::map<std::string, std::string> icons_;  // host -> icon URL
     unsigned dirty_ = 0;
     double last_flush_ms_ = 0;
 };
