@@ -69,9 +69,13 @@ bool EngineClient::start(const EngineLaunch &l, std::string &error) {
     // Hard-float engine (JIT): its executables use the bundled loader through a link in the runtime folder.
     bool private_loader = false;
     if (!prepare_private_loader(exe, l.engine_dir + "/lib", l.runtime_dir, private_loader, error)) return false;
-    // The TV's Mali libraries are softfp and can't load into a hard-float process: llvmpipe only.
-    const bool gpu = l.gpu && !private_loader;
+    // The TV's Mali libraries are softfp and can't load into a hard-float process: llvmpipe only. The softfp engine
+    // ships without Mesa (tools/stage-engine.sh, STAGE_MESA=1 adds it): software rendering then has nothing to draw
+    // with, and the GPU is used anyway.
+    const bool have_mesa = ::access((l.engine_dir + "/lib/mesa/libEGL.so.1").c_str(), R_OK) == 0;
+    const bool gpu = private_loader ? false : (l.gpu || !have_mesa);
     if (l.gpu && !gpu) WNK_LOGW(kCat, "GPU mode needs the softfp engine; using software rendering");
+    if (!l.gpu && gpu) WNK_LOGW(kCat, "software rendering needs Mesa, which this engine does not bundle; using the GPU");
 
     int sv[2];
     if (::socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv) != 0) {

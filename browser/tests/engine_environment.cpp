@@ -54,6 +54,9 @@ int main(int argc, char** argv) {
         std::filesystem::create_symlink(std::filesystem::read_symlink("/proc/self/exe"), base / "wpe-engine");
         std::filesystem::create_directories(base / "etc/ssl/certs");
         std::ofstream(base / "etc/ssl/certs/ca-certificates.crt") << "test fixture\n";
+        // Software rendering is only chosen when the engine bundles Mesa (else the GPU is used anyway).
+        std::filesystem::create_directories(base / "lib/mesa");
+        std::ofstream(base / "lib/mesa/libEGL.so.1") << "test fixture\n";
         const auto capture = base / "environment";
         setenv("WPE_TEST_CAPTURE", capture.c_str(), 1);
         for (auto name : names) setenv(name, "/firmware-or-parent-must-not-leak", 1);

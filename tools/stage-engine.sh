@@ -7,8 +7,10 @@
 # Layout of the staged folder (paths the UI app sets up in engine_client.cpp):
 #   wpe-engine                         the engine (RUNPATH $ORIGIN/lib)
 #   libexec/WPEWebProcess, WPENetworkProcess
-#   lib/*.so*                          every library the above need, except the TV's glibc, plus Mesa
-#                                      (libEGL/libGLESv2/libgallium: software GL for WPEWebProcess only)
+#   lib/*.so*                          every library the above need, except the TV's glibc
+#   lib/mesa/                          Mesa (libEGL/libGLESv2/libgallium/libLLVM: software GL for WPEWebProcess), only
+#                                      for the hard-float engine or with STAGE_MESA=1: the softfp engine draws with the
+#                                      TV's GPU (the default since 2026-11-11) and Mesa is 75 MB (30 MB of the ipk)
 #   lib/gio/modules/libgiognutls.so    TLS for libsoup
 #   lib/libWPEBackend-webos.so         direct GPU presentation, when build/webos-backend has it (softfp);
 #   lib/libwpeb-owner.so               its window-owner half, dlopen()ed by the UI
@@ -69,6 +71,7 @@ SEEDS="$OUT/wpe-engine $OUT/libexec/WPEWebProcess $OUT/libexec/WPENetworkProcess
 # web process picks up the TV's own libEGL.so.1 / libGLESv2.so.2 (Mali) from the default search path.
 MESA_SEEDS=''
 MEDIA_SEEDS=''
+STAGE_MESA=${STAGE_MESA:-$([ "$HF" = yes ] && echo 1 || echo 0)}
 if [ -f "$TARGET/usr/lib/libgstreamer-1.0.so.0" ]; then
     echo "== stage private GStreamer plugins and scanner"
     mkdir -p "$OUT/lib/gstreamer-1.0" "$OUT/etc/pulse"
@@ -77,6 +80,12 @@ if [ -f "$TARGET/usr/lib/libgstreamer-1.0.so.0" ]; then
         # Older/incremental target trees may retain this unused desktop sink.
         # The UI owns Wayland, and the engine must not load a bundled Wayland ABI.
         case "$(basename "$plugin")" in libgstwaylandsink.so) continue ;; esac
+        # Not used by WebKit or the browser: NVIDIA decoders, RTSP, AVI, DSD audio, debugging and tracing elements,
+        # pipelines split across processes. (debugutilsbad stays: WebKit uses its fakevideosink; subenc too: webvttenc.)
+        case "$(basename "$plugin")" in
+            libgstnvcodec.so | libgstrtsp.so | libgstavi.so | libgstdsd.so | libgstbasedebug.so | libgstcoretracers.so | \
+            libgstipcpipeline.so) continue ;;
+        esac
         cp -L "$plugin" "$OUT/lib/gstreamer-1.0/"
         MEDIA_SEEDS="$MEDIA_SEEDS $OUT/lib/gstreamer-1.0/$(basename "$plugin")"
     done
@@ -98,14 +107,16 @@ if [ -f "$TARGET/usr/lib/libgstreamer-1.0.so.0" ]; then
     MEDIA_SEEDS="$MEDIA_SEEDS $OUT/libexec/gst-plugin-scanner"
     # PulseAudio client uses the existing sound server. Never autospawn a daemon.
     printf 'autospawn = no\n' > "$OUT/etc/pulse/client.conf"
+    # Debugging tools, only with STAGE_GST_TOOLS=1.
     for tool in gst-inspect-1.0 gst-launch-1.0; do
-        if [ -x "$TARGET/usr/bin/$tool" ]; then
+        if [ "${STAGE_GST_TOOLS:-0}" = 1 ] && [ -x "$TARGET/usr/bin/$tool" ]; then
             cp "$TARGET/usr/bin/$tool" "$OUT/libexec/"
             MEDIA_SEEDS="$MEDIA_SEEDS $OUT/libexec/$tool"
         fi
     done
 fi
 for so in libEGL.so.1 libGLESv2.so.2; do
+    [ "$STAGE_MESA" = 1 ] || break
     f=$(ls "$TARGET"/usr/lib/$so 2>/dev/null || true)
     [ -n "$f" ] || { echo "missing $so in target (Mesa?)" >&2; exit 1; }
     MESA_SEEDS="$MESA_SEEDS $f"
@@ -142,10 +153,15 @@ collect() {
 
 echo "== collect libraries"
 collect "$SEEDS $MEDIA_SEEDS" "$OUT/lib"
-mkdir -p "$OUT/lib/mesa"
-for f in $MESA_SEEDS; do cp -L "$f" "$OUT/lib/mesa/$(basename "$f")"; done
-# Mesa's own closure (libgallium, libLLVM, ...), minus what the engine already shares from lib/.
-collect "$(for f in $MESA_SEEDS; do printf '%s ' "$OUT/lib/mesa/$(basename "$f")"; done)" "$OUT/lib/mesa"
+rm -rf "$OUT/lib/mesa"
+if [ "$STAGE_MESA" = 1 ]; then
+    mkdir -p "$OUT/lib/mesa"
+    for f in $MESA_SEEDS; do cp -L "$f" "$OUT/lib/mesa/$(basename "$f")"; done
+    # Mesa's own closure (libgallium, libLLVM, ...), minus what the engine already shares from lib/.
+    collect "$(for f in $MESA_SEEDS; do printf '%s ' "$OUT/lib/mesa/$(basename "$f")"; done)" "$OUT/lib/mesa"
+else
+    echo "== no Mesa (GPU rendering only; STAGE_MESA=1 bundles it)"
+fi
 if [ "$HF" = yes ]; then
     echo "== private glibc (hard-float)"
     cp -L "$TARGET/lib/ld-linux-armhf.so.3" "$OUT/lib/"
