@@ -14,7 +14,7 @@
 
 #include <stdint.h>
 
-#define WPEB_MEDIA_IPC_VERSION 3u
+#define WPEB_MEDIA_IPC_VERSION 4u
 #define WPEB_MEDIA_MAX_PAYLOAD (16u * 1024u * 1024u)
 
 enum WpebMediaType {
@@ -30,19 +30,26 @@ enum WpebMediaType {
      * holds the LG Load for it (up to a second) unless TRACKS said there is no audio. */
     WPEB_MEDIA_AUDIO_FORMAT = 8, /* payload: WpebMediaAudio */
     WPEB_MEDIA_AUDIO_NONE = 9,   /* the audio stays in software (another codec, muted, or no video window) */
-    WPEB_MEDIA_AUDIO = 10,       /* pts_us: media time; payload: one AAC frame with its ADTS header */
+    WPEB_MEDIA_AUDIO = 10,       /* pts_us: media time; payload: one AAC frame with its ADTS header, or one Opus packet */
     WPEB_MEDIA_TRACKS = 11,      /* payload: uint32_t has_audio (from the stream collection, when known) */
     WPEB_MEDIA_VOLUME = 12,      /* payload: WpebMediaVolume */
+    /* The end of one stream (payload: uint32_t audio). Queued behind its units; once the video and the hardware
+     * audio have both ended, the UI tells LG's pipeline (pushEOS, as Chromium on webOS does). A FLUSH or LOAD
+     * starts over. */
+    WPEB_MEDIA_EOS = 13,
 };
 
 enum WpebMediaAudioCodec {
     WPEB_MEDIA_AAC = 1,
+    WPEB_MEDIA_OPUS = 2, /* experimental (WPEB_HW_OPUS=1): LG's opusInfo, as Chromium on webOS declares it */
 };
 
+/* Followed by header_size bytes of codec header (Opus: the OpusHead, RFC 7845 5.1). */
 typedef struct WpebMediaAudio {
     uint32_t codec;
     uint32_t rate;
     uint32_t channels;
+    uint32_t header_size;
 } WpebMediaAudio;
 
 typedef struct WpebMediaVolume {
@@ -63,6 +70,19 @@ typedef struct WpebMediaHeader {
     int64_t pts_us;
 } WpebMediaHeader;
 
+/* HDR description of the video (from the caps), for LG's setHdrInfo. Codes are ISO/IEC 23091-2 (H.273):
+ * transfer 16 = PQ, 18 = HLG; anything else is SDR and nothing is declared. Mastering display values in SEI units
+ * (CTA-861.3, as GStreamer keeps them): chromaticity in 1/50000, luminance in 1/10000 cd/m2, primaries R, G, B. */
+typedef struct WpebMediaHdr {
+    uint32_t transfer, primaries, matrix, full_range;
+    uint32_t has_mastering;
+    uint32_t display_primaries[3][2];
+    uint32_t white_point[2];
+    uint32_t max_luminance, min_luminance;
+    uint32_t has_light_level;
+    uint32_t max_cll, max_fall;
+} WpebMediaHdr;
+
 typedef struct WpebMediaLoad {
     uint32_t codec;
     uint32_t width;
@@ -72,6 +92,7 @@ typedef struct WpebMediaLoad {
      * the video plays through Starfish bound to it (option.windowId) and the page stays above its own video.
      * Empty: no window (the UI falls back to NDL, whose video sits below the UI window). */
     char window_id[128];
+    WpebMediaHdr hdr;
 } WpebMediaLoad;
 
 typedef struct WpebMediaArea {

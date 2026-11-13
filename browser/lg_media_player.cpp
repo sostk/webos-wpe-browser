@@ -2,6 +2,7 @@
 #include "lg_media_player.hpp"
 
 #include "wnk/log.hpp"
+#include "wpe_media_ipc.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -27,6 +28,28 @@ const char *codec_name(LgMediaPlayer::Codec c) {
     case LgMediaPlayer::Codec::Av1: return "AV1";
     }
     return "H264";
+}
+
+std::string hex(const std::vector<uint8_t> &bytes) {
+    static const char kDigits[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(bytes.size() * 2);
+    for (uint8_t b : bytes) out += kDigits[b >> 4], out += kDigits[b & 15];
+    return out;
+}
+
+std::string base64(const std::vector<uint8_t> &bytes) {
+    static const char kAlphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    for (size_t i = 0; i < bytes.size(); i += 3) {
+        const uint32_t n = static_cast<uint32_t>(bytes[i]) << 16 | (i + 1 < bytes.size() ? bytes[i + 1] << 8 : 0) |
+                           (i + 2 < bytes.size() ? bytes[i + 2] : 0);
+        out += kAlphabet[n >> 18 & 63];
+        out += kAlphabet[n >> 12 & 63];
+        out += i + 1 < bytes.size() ? kAlphabet[n >> 6 & 63] : '=';
+        out += i + 2 < bytes.size() ? kAlphabet[n & 63] : '=';
+    }
+    return out;
 }
 
 void event_callback(int type, int64_t num, const char *str, void *data) {
@@ -61,24 +84,38 @@ bool LgMediaPlayer::load(const std::string &app_id, const std::string &window_id
     int max_w = 3840, max_h = 2160;
     int32_t dw = 0, dh = 0, dfps = 0;
     if (smp::util::getMaxVideoResolution(codec_name(codec), &dw, &dh, &dfps) && dw > 0 && dh > 0) max_w = dw, max_h = dh;
-    // H.264 that fits FHD is declared as FHD (larger declarations are refused by some firmware).
+    // H.264 that fits FHD is declared as FHD (larger declarations are refused by some firmware); H.264 at its rate
+    // class, other codecs at 60 (the kit's verified values). The web process sends a new Load when a later
+    // rendition outside this envelope comes (engine/gst/wpebmediasink.c, the same rule).
     if (codec == Codec::H264 && width > 0 && width <= 1920 && height <= 1088) max_w = 1920, max_h = 1080;
-    const int max_fps = fps > 30.5 ? 60 : 30;
+    const int max_fps = codec != Codec::H264 || fps > 30.5 ? 60 : 30;
     // With audio, as the kit's StarfishBackend loads it (verified on this TV): the pipeline syncs the video to the
     // audio (audioSync), with a larger audio buffer and without low-delay mode.
     const bool with_audio = audio != nullptr;
-    char payload[2048];
+    const bool opus = with_audio && audio->codec == Audio::Codec::Opus;
+    // Opus as Chromium on webOS declares it (opusInfo: channels, sampleRate, streamHeader); the encoding of the
+    // header is not known (WPEB_HW_OPUS_HEADER=base64 tries the other one).
+    std::string audio_info;
+    if (opus) {
+        const char *encoding = std::getenv("WPEB_HW_OPUS_HEADER");
+        const bool b64 = encoding != nullptr && std::strcmp(encoding, "base64") == 0;
+        audio_info = ",\"opusInfo\":{\"channels\":" + std::to_string(audio->channels) +
+                     ",\"sampleRate\":" + std::to_string(audio->rate) + ",\"streamHeader\":\"" +
+                     (b64 ? base64(audio->header) : hex(audio->header)) + "\"}";
+    }
+    char payload[4096];
     std::snprintf(payload, sizeof payload,
                   "{\"args\":[{\"mediaTransportType\":\"BUFFERSTREAM\",\"option\":{\"appId\":\"%s\",\"windowId\":\"%s\","
                   "\"externalStreamingInfo\":{\"contents\":{\"codec\":{\"video\":\"%s\"%s},\"esInfo\":{\"pauseAtDecodeTime\":false,"
-                  "\"ptsToDecode\":0,\"seperatedPTS\":true},\"format\":\"RAW\",\"provider\":\"wpebrowser\"},"
+                  "\"ptsToDecode\":0,\"seperatedPTS\":true},\"format\":\"RAW\",\"provider\":\"wpebrowser\"%s},"
                   "\"streamQualityInfo\":true,\"streamQualityInfoNonFlushable\":true,\"audioSync\":%s,\"restartStreaming\":false,"
                   "\"bufferingCtrInfo\":{\"bufferMaxLevel\":0,\"bufferMinLevel\":0,\"preBufferByte\":0,\"qBufferLevelAudio\":0,"
                   "\"qBufferLevelVideo\":0,\"srcBufferLevelAudio\":{\"minimum\":1,\"maximum\":%d},"
                   "\"srcBufferLevelVideo\":{\"minimum\":1,\"maximum\":8388608}}},\"needAudio\":%s,\"queryPosition\":false,"
                   "\"lowDelayMode\":%s,\"transmission\":{\"contentsType\":\"LIVE\"},\"adaptiveStreaming\":{\"audioOnly\":false,"
                   "\"adaptiveResolution\":true,\"maxWidth\":%d,\"maxHeight\":%d,\"maxFrameRate\":%d}}}]}",
-                  app_id.c_str(), window_id.c_str(), codec_name(codec), with_audio ? ",\"audio\":\"AAC\"" : "",
+                  app_id.c_str(), window_id.c_str(), codec_name(codec),
+                  !with_audio ? "" : opus ? ",\"audio\":\"OPUS\"" : ",\"audio\":\"AAC\"", audio_info.c_str(),
                   with_audio ? "true" : "false", with_audio ? 1048576 : 32768, with_audio ? "true" : "false",
                   with_audio ? "false" : "true", max_w, max_h, max_fps);
     api_ = new_api();
@@ -100,8 +137,9 @@ bool LgMediaPlayer::load(const std::string &app_id, const std::string &window_id
         return false;
     }
     WNK_LOGI(kCat, "Load %s %dx%d @ %.2f (envelope %dx%d@%d)%s, window %s, media id %s", codec_name(codec), width, height,
-             fps, max_w, max_h, max_fps, with_audio ? " + AAC" : "", window_id.c_str(),
+             fps, max_w, max_h, max_fps, !with_audio ? "" : opus ? " + Opus" : " + AAC", window_id.c_str(),
              api_->getMediaID() ? api_->getMediaID() : "?");
+    if (opus) WNK_LOGI(kCat, "opusInfo%s", audio_info.c_str() + std::strlen(",\"opusInfo\""));
     return true;
 #else
     (void)app_id, (void)window_id, (void)codec, (void)width, (void)height, (void)fps, (void)audio;
@@ -163,7 +201,66 @@ LgMediaPlayer::Feed LgMediaPlayer::feed(bool audio, const uint8_t *data, size_t 
 #endif
 }
 
-void LgMediaPlayer::flush() { seek_pending_ = true; }
+void LgMediaPlayer::flush() {
+#if defined(WNK_SDL_WEBOS)
+    if (api_ != nullptr && (fed_ > 0 || audio_fed_ > 0)) {
+        const bool ok = api_->flush();
+        WNK_LOGI(kCat, "flush -> %d", ok ? 1 : 0);
+    }
+#endif
+    seek_pending_ = true;
+}
+
+void LgMediaPlayer::end_of_stream() {
+#if defined(WNK_SDL_WEBOS)
+    if (api_ == nullptr) return;
+    const bool ok = api_->pushEOS();
+    WNK_LOGI(kCat, "pushEOS after %lld units + %lld audio (last video pts %.3f s) -> %d", static_cast<long long>(fed_),
+             static_cast<long long>(audio_fed_), last_pts_us_ / 1e6, ok ? 1 : 0);
+#endif
+}
+
+void LgMediaPlayer::set_hdr(const WpebMediaHdr &c) {
+#if defined(WNK_SDL_WEBOS)
+    // The kit's StarfishBackend::build_hdr_payload (verified on this TV): SEI units, primaries in G, B, R order.
+    const char *type = c.transfer == 16 ? "HDR10" : c.transfer == 18 ? "HLG" : nullptr;
+    if (api_ == nullptr || type == nullptr) return;
+    std::string sei;
+    const auto add = [&sei](const std::string &key, long long v) {
+        sei += (sei.empty() ? "\"" : ",\"") + key + "\":" + std::to_string(v);
+    };
+    if (c.has_mastering) {
+        static constexpr int kOrder[3] = {1, 2, 0};  // G, B, R from R, G, B
+        for (int i = 0; i < 3; ++i) {
+            add("displayPrimariesX" + std::to_string(i), c.display_primaries[kOrder[i]][0]);
+            add("displayPrimariesY" + std::to_string(i), c.display_primaries[kOrder[i]][1]);
+        }
+        add("whitePointX", c.white_point[0]);
+        add("whitePointY", c.white_point[1]);
+        add("minDisplayMasteringLuminance", c.min_luminance);
+        add("maxDisplayMasteringLuminance", c.max_luminance);
+    }
+    if (c.has_light_level) {
+        add("maxContentLightLevel", c.max_cll);
+        add("maxPicAverageLightLevel", c.max_fall);
+    }
+    // Without any of it the call is skipped: some TVs crash on an HDR message with no SEI (Kodi), and the decoder
+    // still sees whatever the bitstream carries.
+    if (sei.empty()) {
+        WNK_LOGI(kCat, "%s without mastering or light-level values: no setHdrInfo", type);
+        return;
+    }
+    const std::string payload = std::string("{\"hdrType\":\"") + type + "\",\"sei\":{" + sei +
+                                "},\"vui\":{\"transferCharacteristics\":" + std::to_string(c.transfer) +
+                                ",\"colorPrimaries\":" + std::to_string(c.primaries) + ",\"matrixCoeffs\":" +
+                                std::to_string(c.matrix) + ",\"videoFullRangeFlag\":" + (c.full_range ? "true" : "false") +
+                                "}}";
+    const bool ok = api_->setHdrInfo(payload.c_str());
+    WNK_LOGI(kCat, "setHdrInfo %s -> %d", payload.c_str(), ok ? 1 : 0);
+#else
+    (void)c;
+#endif
+}
 
 void LgMediaPlayer::set_volume(unsigned permille, bool muted) {
 #if defined(WNK_SDL_WEBOS)
@@ -215,6 +312,9 @@ void LgMediaPlayer::on_event(int type, int64_t num, const char *str) {
         return;
     case PF_EVENT_TYPE_FRAMEREADY:
         if (frames_ == 0) WNK_LOGI(kCat, "first frame presented (pts %.3f s)", num / 1e9);
+        return;
+    case PF_EVENT_TYPE_STR_STATE_UPDATE__ENDOFSTREAM:
+        WNK_LOGI(kCat, "end of stream reached (%lld frames presented)", static_cast<long long>(frames_.load()));
         return;
     case PF_EVENT_TYPE_STR_STATE_UPDATE__LOADCOMPLETED:
         load_completed_ = true;

@@ -9,8 +9,10 @@
 #include <atomic>
 #include <cstdint>
 #include <string>
+#include <vector>
 
 class StarfishMediaAPIs;
+struct WpebMediaHdr;
 
 namespace browser {
 
@@ -26,18 +28,27 @@ public:
 
     static bool available();  // false in host builds
 
-    // The playback's audio, when it goes to the same pipeline (AAC with ADTS headers): LG then syncs the video to it.
+    // The playback's audio, when it goes to the same pipeline: LG then syncs the video to it. AAC frames carry ADTS
+    // headers; Opus (experimental) comes as packets, with its OpusHead declared at Load (opusInfo).
     struct Audio {
+        enum class Codec { Aac, Opus } codec = Codec::Aac;
         int rate = 0, channels = 0;
+        std::vector<uint8_t> header;
     };
     bool load(const std::string &app_id, const std::string &window_id, Codec codec, int width, int height, double fps,
               const Audio *audio, std::string *error);
     // One access unit (Annex B for H.264/HEVC) or AAC frame, presentation time in microseconds of media time.
     Feed feed(bool audio, const uint8_t *data, size_t size, int64_t pts_us);
     bool has_audio() const { return has_audio_; }
+    // HDR10/HLG metadata from the container (setHdrInfo after Load): without it LG's panel stays in SDR for VP9/AV1
+    // PQ (the kit's A/B on this TV). Nothing is declared for SDR or without mastering/light-level values.
+    void set_hdr(const WpebMediaHdr &hdr);
+    // The end of the stream (pushEOS): LG's pipeline plays out what it has and reports ENDOFSTREAM.
+    void end_of_stream();
     // The element's volume and mute (best effort: LG's browser does not set them on this pipeline at all).
     void set_volume(unsigned permille, bool muted);
-    // A seek: the next access unit fed starts the new position (LG's Seek at its time).
+    // A seek: LG's pipeline drops what it holds (flush), and the next access unit fed starts the new position (LG's
+    // Seek at its time), as Chromium on webOS does.
     void flush();
     void pause(bool paused);
     void unload();

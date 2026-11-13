@@ -13,12 +13,16 @@
  *     pipeline clock's pace (a sync sink), which feeds LG's decoder (NDL). The picture is on the video plane.
  *   rialtomseaudiosink: a bin that decides on its first caps. AAC of a playback whose video is on the sink above
  *     (and not muted) goes to the same LG pipeline as the video, over the video sink's connection: LG's pipeline
- *     then keeps them in sync, as Chromium on webOS does (MediaPlatformAPIWebOSTV feeds both). Everything else
- *     (page sounds, Opus, muted autoplay) is decoded here and played by PulseAudio: LG's pipeline is one per app.
+ *     then keeps them in sync, as Chromium on webOS does (MediaPlatformAPIWebOSTV feeds both). With WPEB_HW_OPUS=1,
+ *     Opus does too (experimental: LG's opusInfo is declared as Chromium's strings name it, its exact form is not
+ *     verified). Everything else (page sounds, muted autoplay) is decoded here and played by PulseAudio: LG's
+ *     pipeline is one per app.
  */
 #include "wpe_media_ipc.h"
 
 #include <gst/audio/streamvolume.h>
+#include <gst/pbutils/codec-utils.h>
+#include <gst/video/video.h>
 #include <gst/base/gstbasesink.h>
 #include <gst/gst.h>
 
@@ -81,7 +85,55 @@ struct _WpebVideoSink {
     GByteArray *scratch;
     gint64 load_time;     /* monotonic µs of the last LOAD (g_caps_lock): the audio sink must decide soon after */
     gboolean tracks_sent;
+    WpebMediaLoad load;   /* the last LOAD sent (its window, HDR and the envelope the UI declared from it) */
 };
+
+/* The envelope the UI declares to LG for a LOAD (browser/lg_media_player.cpp, the same rule): H.264 that fits FHD
+ * as 1920x1080 (larger declarations are refused by some firmware), else the decoder's maximum; H.264 at its rate
+ * class (30 or 60), other codecs at 60. */
+static gboolean envelope_fhd(uint32_t codec, uint32_t width, uint32_t height)
+{
+    return codec == WPEB_MEDIA_H264 && width > 0 && width <= 1920 && height <= 1088;
+}
+
+static gboolean envelope_60(uint32_t codec, uint32_t fps_milli)
+{
+    return codec != WPEB_MEDIA_H264 || fps_milli > 30500;
+}
+
+/* Colorimetry and HDR metadata from the caps (demuxers put the container's there). */
+static void hdr_from_caps(GstCaps *caps, WpebMediaHdr *hdr)
+{
+    GstStructure *s = gst_caps_get_structure(caps, 0);
+    const char *c = gst_structure_get_string(s, "colorimetry");
+    GstVideoColorimetry cm;
+    memset(hdr, 0, sizeof(*hdr));
+    hdr->transfer = hdr->primaries = hdr->matrix = 2; /* unspecified */
+    if (!c || !gst_video_colorimetry_from_string(&cm, c))
+        return;
+    hdr->transfer = (uint32_t)gst_video_transfer_function_to_iso(cm.transfer);
+    hdr->primaries = (uint32_t)gst_video_color_primaries_to_iso(cm.primaries);
+    hdr->matrix = (uint32_t)gst_video_color_matrix_to_iso(cm.matrix);
+    hdr->full_range = cm.range == GST_VIDEO_COLOR_RANGE_0_255;
+    GstVideoMasteringDisplayInfo mdi;
+    if (gst_video_mastering_display_info_from_caps(&mdi, caps)) {
+        hdr->has_mastering = 1;
+        for (int i = 0; i < 3; ++i) {
+            hdr->display_primaries[i][0] = mdi.display_primaries[i].x;
+            hdr->display_primaries[i][1] = mdi.display_primaries[i].y;
+        }
+        hdr->white_point[0] = mdi.white_point.x;
+        hdr->white_point[1] = mdi.white_point.y;
+        hdr->max_luminance = mdi.max_display_mastering_luminance;
+        hdr->min_luminance = mdi.min_display_mastering_luminance;
+    }
+    GstVideoContentLightLevel cll;
+    if (gst_video_content_light_level_from_caps(&cll, caps)) {
+        hdr->has_light_level = 1;
+        hdr->max_cll = cll.max_content_light_level;
+        hdr->max_fall = cll.max_frame_average_light_level;
+    }
+}
 
 /* Video caps arriving (an audio sink waiting to know whether this playback has video on the LG pipeline). */
 static GMutex g_caps_lock;
@@ -251,6 +303,7 @@ static gboolean wpeb_video_sink_start(GstBaseSink *sink)
     g_mutex_lock(&self->lock);
     self->fd = fd;
     self->codec = 0;
+    memset(&self->load, 0, sizeof(self->load));
     self->sent = 0;
     self->area_sent = FALSE;
     uint32_t version = WPEB_MEDIA_IPC_VERSION;
@@ -320,13 +373,29 @@ static gboolean wpeb_video_sink_set_caps(GstBaseSink *sink, GstCaps *caps)
         }
     }
     /* Adaptive streams change resolution within the stream: the decoder follows the bitstream. Only a codec
-     * change needs a new decoder (and a black picture). */
+     * change needs a new decoder (and a black picture), or a rendition the declared envelope does not cover (an
+     * ABR step from FHD H.264 to UHD, or from 30 to 60 fps): LG's pipeline was allocated for the first one. */
     self->video_width = width;
     self->video_height = height;
-    if (load.codec == self->codec)
-        return TRUE;
+    if (load.codec == self->codec) {
+        const WpebMediaLoad *was = &self->load;
+        gboolean grow = (envelope_fhd(was->codec, was->width, was->height) && !envelope_fhd(load.codec, load.width, load.height))
+            || (!envelope_60(was->codec, was->fps_milli) && envelope_60(load.codec, load.fps_milli));
+        if (!grow)
+            return TRUE;
+        GST_INFO_OBJECT(self, "%ux%u @ %.2f is outside the envelope of %ux%u @ %.2f: reloading LG's pipeline", load.width,
+                        load.height, load.fps_milli / 1000.0, was->width, was->height, was->fps_milli / 1000.0);
+        memcpy(load.window_id, was->window_id, sizeof(load.window_id));
+        hdr_from_caps(caps, &load.hdr);
+        self->load = load;
+        return send_msg(self, WPEB_MEDIA_LOAD, 0, &load, sizeof(load));
+    }
     self->codec = load.codec;
     self->tracks_sent = FALSE;
+    hdr_from_caps(caps, &load.hdr);
+    if (load.hdr.transfer == 16 || load.hdr.transfer == 18)
+        GST_INFO_OBJECT(self, "HDR (transfer %u)%s%s", load.hdr.transfer, load.hdr.has_mastering ? ", mastering display" : "",
+                        load.hdr.has_light_level ? ", light level" : "");
     video_window_init();
     if (video_window.open && !self->have_window && !g_getenv("WPE_BROWSER_DEBUG_NO_VIDEO_WINDOW"))
         self->have_window = video_window.open(load.window_id, sizeof(load.window_id), 1000) != 0;
@@ -339,6 +408,7 @@ static gboolean wpeb_video_sink_set_caps(GstBaseSink *sink, GstCaps *caps)
             video_window.place(width, height, self->area.x, self->area.y, self->area.width, self->area.height);
         g_mutex_unlock(&self->lock);
     }
+    self->load = load;
     gboolean sent = send_msg(self, WPEB_MEDIA_LOAD, 0, &load, sizeof(load));
     g_mutex_lock(&g_caps_lock);
     self->load_time = g_get_monotonic_time();
@@ -428,8 +498,12 @@ static GstFlowReturn wpeb_video_sink_render(GstBaseSink *sink, GstBuffer *buffer
 static gboolean wpeb_video_sink_event(GstBaseSink *sink, GstEvent *event)
 {
     WpebVideoSink *self = WPEB_VIDEO_SINK(sink);
-    if (GST_EVENT_TYPE(event) == GST_EVENT_FLUSH_STOP)
+    if (GST_EVENT_TYPE(event) == GST_EVENT_FLUSH_STOP) {
         send_msg(self, WPEB_MEDIA_FLUSH, 0, NULL, 0);
+    } else if (GST_EVENT_TYPE(event) == GST_EVENT_EOS) {
+        uint32_t audio = 0;
+        send_msg(self, WPEB_MEDIA_EOS, 0, &audio, sizeof(audio));
+    }
     return GST_BASE_SINK_CLASS(wpeb_video_sink_parent_class)->event(sink, event);
 }
 
@@ -570,6 +644,7 @@ G_DECLARE_FINAL_TYPE(WpebAudioHw, wpeb_audio_hw, WPEB, AUDIO_HW, GstBaseSink)
 struct _WpebAudioHw {
     GstBaseSink parent;
     WpebVideoSink *video; /* whose connection carries the audio */
+    uint32_t codec;       /* WPEB_MEDIA_AAC or WPEB_MEDIA_OPUS */
     gboolean adts;        /* the stream already has ADTS headers */
     guint8 profile, freq_index, channel_config;
     GByteArray *frame;
@@ -580,12 +655,58 @@ struct _WpebAudioHw {
 G_DEFINE_TYPE(WpebAudioHw, wpeb_audio_hw, GST_TYPE_BASE_SINK)
 
 static GstStaticPadTemplate audio_hw_template = GST_STATIC_PAD_TEMPLATE("sink", GST_PAD_SINK, GST_PAD_ALWAYS,
-    GST_STATIC_CAPS("audio/mpeg, mpegversion = (int) { 2, 4 }, stream-format = (string) { raw, adts }"));
+    GST_STATIC_CAPS("audio/mpeg, mpegversion = (int) { 2, 4 }, stream-format = (string) { raw, adts }; audio/x-opus"));
+
+/* Opus: LG's pipeline gets the OpusHead (from the caps' stream header, else rebuilt from the caps' fields). */
+static gboolean audio_hw_opus_caps(WpebAudioHw *self, GstCaps *caps)
+{
+    GstStructure *s = gst_caps_get_structure(caps, 0);
+    GstBuffer *head = NULL;
+    const GValue *sh = gst_structure_get_value(s, "streamheader");
+    if (sh && GST_VALUE_HOLDS_ARRAY(sh) && gst_value_array_get_size(sh) > 0) {
+        const GValue *first = gst_value_array_get_value(sh, 0);
+        if (G_VALUE_HOLDS(first, GST_TYPE_BUFFER))
+            head = gst_buffer_ref(gst_value_get_buffer(first));
+    }
+    guint32 rate = 0;
+    guint8 channels = 0, family = 0, streams = 0, coupled = 0, mapping[256];
+    if (!gst_codec_utils_opus_parse_caps(caps, &rate, &channels, &family, &streams, &coupled, mapping)) {
+        if (head)
+            gst_buffer_unref(head);
+        GST_ELEMENT_ERROR(self, STREAM, FORMAT, ("Opus caps without channels"), (NULL));
+        return FALSE;
+    }
+    if (!head)
+        head = gst_codec_utils_opus_create_header(rate, channels, family, streams, coupled, mapping, 0, 0);
+    GstMapInfo m;
+    if (!head || !gst_buffer_map(head, &m, GST_MAP_READ)) {
+        if (head)
+            gst_buffer_unref(head);
+        GST_ELEMENT_ERROR(self, STREAM, FORMAT, ("No OpusHead"), (NULL));
+        return FALSE;
+    }
+    gsize size = sizeof(WpebMediaAudio) + m.size;
+    guint8 *msg = g_malloc(size);
+    /* Opus decodes at 48 kHz whatever the input rate was (RFC 7845 5.1): that is the rate LG's decoder outputs. */
+    WpebMediaAudio a = {WPEB_MEDIA_OPUS, 48000, channels, (uint32_t)m.size};
+    memcpy(msg, &a, sizeof(a));
+    memcpy(msg + sizeof(a), m.data, m.size);
+    gst_buffer_unmap(head, &m);
+    gst_buffer_unref(head);
+    self->codec = WPEB_MEDIA_OPUS;
+    GST_INFO_OBJECT(self, "caps %" GST_PTR_FORMAT, caps);
+    gboolean ok = self->video && send_msg(self->video, WPEB_MEDIA_AUDIO_FORMAT, 0, msg, (uint32_t)size);
+    g_free(msg);
+    return ok;
+}
 
 static gboolean wpeb_audio_hw_set_caps(GstBaseSink *sink, GstCaps *caps)
 {
     WpebAudioHw *self = WPEB_AUDIO_HW(sink);
     GstStructure *s = gst_caps_get_structure(caps, 0);
+    if (g_str_equal(gst_structure_get_name(s), "audio/x-opus"))
+        return audio_hw_opus_caps(self, caps);
+    self->codec = WPEB_MEDIA_AAC;
     const char *format = gst_structure_get_string(s, "stream-format");
     int rate = 0, channels = 0;
     gst_structure_get_int(s, "rate", &rate);
@@ -611,7 +732,7 @@ static gboolean wpeb_audio_hw_set_caps(GstBaseSink *sink, GstCaps *caps)
             return FALSE;
         }
     }
-    WpebMediaAudio a = {WPEB_MEDIA_AAC, (uint32_t)rate, (uint32_t)channels};
+    WpebMediaAudio a = {WPEB_MEDIA_AAC, (uint32_t)rate, (uint32_t)channels, 0};
     GST_INFO_OBJECT(self, "caps %" GST_PTR_FORMAT, caps);
     return self->video && send_msg(self->video, WPEB_MEDIA_AUDIO_FORMAT, 0, &a, sizeof(a));
 }
@@ -625,7 +746,7 @@ static GstFlowReturn wpeb_audio_hw_render(GstBaseSink *sink, GstBuffer *buffer)
         return GST_FLOW_ERROR;
     const guint8 *data = map.data;
     gsize size = map.size;
-    if (!self->adts) {
+    if (self->codec == WPEB_MEDIA_AAC && !self->adts) {
         gsize len = map.size + 7;
         guint8 h[7] = {
             0xff, 0xf1, /* sync, MPEG-4, layer 0, no CRC */
@@ -649,6 +770,16 @@ static GstFlowReturn wpeb_audio_hw_render(GstBaseSink *sink, GstBuffer *buffer)
     if (++self->sent == 1)
         GST_INFO_OBJECT(self, "first audio frame: media time %" G_GINT64_FORMAT " us", pts_us);
     return GST_FLOW_OK;
+}
+
+static gboolean wpeb_audio_hw_event(GstBaseSink *sink, GstEvent *event)
+{
+    WpebAudioHw *self = WPEB_AUDIO_HW(sink);
+    if (GST_EVENT_TYPE(event) == GST_EVENT_EOS && self->video) {
+        uint32_t audio = 1;
+        send_msg(self->video, WPEB_MEDIA_EOS, 0, &audio, sizeof(audio));
+    }
+    return GST_BASE_SINK_CLASS(wpeb_audio_hw_parent_class)->event(sink, event);
 }
 
 static void wpeb_audio_hw_finalize(GObject *object)
@@ -678,9 +809,10 @@ static void wpeb_audio_hw_class_init(WpebAudioHwClass *klass)
     G_OBJECT_CLASS(klass)->finalize = wpeb_audio_hw_finalize;
     GST_BASE_SINK_CLASS(klass)->set_caps = wpeb_audio_hw_set_caps;
     GST_BASE_SINK_CLASS(klass)->render = wpeb_audio_hw_render;
+    GST_BASE_SINK_CLASS(klass)->event = wpeb_audio_hw_event;
     gst_element_class_add_static_pad_template(GST_ELEMENT_CLASS(klass), &audio_hw_template);
     gst_element_class_set_static_metadata(GST_ELEMENT_CLASS(klass), "webOS browser hardware audio", "Sink/Audio/Hardware",
-        "AAC to LG's media pipeline, with the playback's hardware video", "wpebrowser");
+        "AAC (or Opus) to LG's media pipeline, with the playback's hardware video", "wpebrowser");
 }
 
 /* ---- audio sink: the bin WebKit uses ---------------------------------------------------------------------- */
@@ -705,16 +837,31 @@ G_DEFINE_TYPE_WITH_CODE(WpebAudioSink, wpeb_audio_sink, GST_TYPE_BIN,
 
 enum { AUDIO_PROP_0, AUDIO_PROP_VOLUME, AUDIO_PROP_MUTE };
 
-/* What decodebin3 may hand over undecoded: AAC (for the hardware path, or decoded here) and raw audio. */
+/* What decodebin3 may hand over undecoded (WebKit takes these caps as its stop caps): AAC (for the hardware path,
+ * or decoded here), with WPEB_HW_OPUS=1 Opus too, and raw audio. */
+#define AUDIO_SINK_CAPS "audio/x-raw; audio/mpeg, mpegversion = (int) { 2, 4 }, stream-format = (string) { raw, adts }"
 static GstStaticPadTemplate audio_sink_template = GST_STATIC_PAD_TEMPLATE("sink", GST_PAD_SINK, GST_PAD_ALWAYS,
-    GST_STATIC_CAPS("audio/x-raw; audio/mpeg, mpegversion = (int) { 2, 4 }, stream-format = (string) { raw, adts }"));
+    GST_STATIC_CAPS(AUDIO_SINK_CAPS));
+static GstStaticPadTemplate audio_sink_template_opus = GST_STATIC_PAD_TEMPLATE("sink", GST_PAD_SINK, GST_PAD_ALWAYS,
+    GST_STATIC_CAPS(AUDIO_SINK_CAPS "; audio/x-opus"));
 
-static gboolean is_aac(GstCaps *caps)
+static gboolean hw_opus_enabled(void)
+{
+    const char *v = g_getenv("WPEB_HW_OPUS");
+    return v && g_str_equal(v, "1");
+}
+
+/* The codec LG's pipeline could take as it is (WPEB_MEDIA_AAC / WPEB_MEDIA_OPUS), 0 for raw audio. */
+static uint32_t hw_codec(GstCaps *caps)
 {
     GstStructure *s = gst_caps_get_structure(caps, 0);
+    const char *name = gst_structure_get_name(s);
     int version = 0;
-    return g_str_equal(gst_structure_get_name(s), "audio/mpeg") && gst_structure_get_int(s, "mpegversion", &version)
-        && (version == 2 || version == 4);
+    if (g_str_equal(name, "audio/mpeg") && gst_structure_get_int(s, "mpegversion", &version) && (version == 2 || version == 4))
+        return WPEB_MEDIA_AAC;
+    if (g_str_equal(name, "audio/x-opus"))
+        return WPEB_MEDIA_OPUS;
+    return 0;
 }
 
 /* The video sink of this playback, if its video is on LG's pipeline and its Load was moments ago (the UI holds the
@@ -790,9 +937,11 @@ static GstElement *make_software_chain(WpebAudioSink *self, gboolean decode)
 /* The first caps decide the path; later caps go to what was built. */
 static gboolean wpeb_audio_sink_build(WpebAudioSink *self, GstCaps *caps)
 {
-    gboolean aac = is_aac(caps);
+    const uint32_t codec = hw_codec(caps);
+    const gboolean encoded = codec != 0;
+    const char *label = codec == WPEB_MEDIA_OPUS ? "Opus" : codec == WPEB_MEDIA_AAC ? "AAC" : "raw audio";
     WpebVideoSink *video = NULL;
-    if (aac && !self->mute && self->volume > 0.001 && !g_getenv("WPE_BROWSER_DEBUG_NO_HW_AUDIO"))
+    if (encoded && !self->mute && self->volume > 0.001 && !g_getenv("WPE_BROWSER_DEBUG_NO_HW_AUDIO"))
         video = hardware_partner(self);
     GstElement *first;
     if (video) {
@@ -800,9 +949,9 @@ static gboolean wpeb_audio_sink_build(WpebAudioSink *self, GstCaps *caps)
         WPEB_AUDIO_HW(self->hw)->video = video;
         gst_bin_add(GST_BIN(self), self->hw);
         first = self->hw;
-        GST_INFO_OBJECT(self, "AAC with hardware video: LG's media pipeline plays it");
+        GST_INFO_OBJECT(self, "%s with hardware video: LG's media pipeline plays it", label);
     } else {
-        if (aac) {
+        if (encoded) {
             /* The UI may be holding LG's Load for this playback's audio: tell it to go ahead without. */
             WpebVideoSink *v = find_video_sink(GST_ELEMENT(self));
             if (v) {
@@ -810,10 +959,10 @@ static gboolean wpeb_audio_sink_build(WpebAudioSink *self, GstCaps *caps)
                 gst_object_unref(v);
             }
         }
-        first = make_software_chain(self, aac);
+        first = make_software_chain(self, encoded);
         if (!first)
             return FALSE;
-        GST_INFO_OBJECT(self, "%s: software audio (PulseAudio)", aac ? "AAC" : "raw audio");
+        GST_INFO_OBJECT(self, "%s: software audio (PulseAudio)", label);
     }
     GstPad *target = gst_element_get_static_pad(first, "sink");
     gst_ghost_pad_set_target(GST_GHOST_PAD(self->ghost), target);
@@ -906,7 +1055,7 @@ static void wpeb_audio_sink_get_property(GObject *object, guint id, GValue *valu
 static void wpeb_audio_sink_init(WpebAudioSink *self)
 {
     self->volume = 1.0;
-    GstPadTemplate *templ = gst_static_pad_template_get(&audio_sink_template);
+    GstPadTemplate *templ = gst_static_pad_template_get(hw_opus_enabled() ? &audio_sink_template_opus : &audio_sink_template);
     self->ghost = gst_ghost_pad_new_no_target_from_template("sink", templ);
     gst_object_unref(templ);
     gst_pad_set_event_function(self->ghost, wpeb_audio_sink_pad_event);
@@ -924,9 +1073,10 @@ static void wpeb_audio_sink_class_init(WpebAudioSinkClass *klass)
     object_class->get_property = wpeb_audio_sink_get_property;
     g_object_class_override_property(object_class, AUDIO_PROP_VOLUME, "volume");
     g_object_class_override_property(object_class, AUDIO_PROP_MUTE, "mute");
-    gst_element_class_add_static_pad_template(element_class, &audio_sink_template);
+    gst_element_class_add_static_pad_template(element_class, hw_opus_enabled() ? &audio_sink_template_opus : &audio_sink_template);
     gst_element_class_set_static_metadata(element_class, "webOS browser audio sink", "Sink/Audio",
-        "AAC with hardware video to LG's media pipeline; other audio decoded and played by PulseAudio", "wpebrowser");
+        "AAC (and with WPEB_HW_OPUS=1 Opus) with hardware video to LG's media pipeline; other audio decoded and played by "
+        "PulseAudio", "wpebrowser");
 }
 
 /* ---- plugin ----------------------------------------------------------------------------------------------- */
