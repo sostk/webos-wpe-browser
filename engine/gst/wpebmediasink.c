@@ -71,6 +71,7 @@ struct _WpebVideoSink {
     gboolean have_area, area_sent;
     WpebMediaArea area;
     guint64 sent;
+    int64_t last_pts_us; /* media time of the last unit sent */
     /* MP4's length-prefixed H.264/HEVC (avc/hvc1): LG's decoder takes Annex B, so NAL lengths become start codes
      * and the parameter sets from the caps go before every keyframe. 0 = already Annex B (or VP9). */
     guint length_size;
@@ -365,6 +366,23 @@ static int collection_has_audio(GstPad *pad)
     return audio;
 }
 
+/* Media time of a buffer, in µs. gst_segment_to_stream_time() has no answer for a buffer that starts before the
+ * segment, which the first AAC frame after a seek or when joining a live stream usually does (frames don't line up
+ * with the seek point); sending 0 for it put the audio 30 s (or a live stream's whole position) behind the video, and
+ * LG's pipeline then showed the first frame and never started its clock (TV, 2026-11-13: Angel One from 30 s,
+ * NetTV live). _full() gives those times too. A buffer without a timestamp keeps the previous one. */
+static int64_t media_time_us(const GstSegment *segment, GstBuffer *buffer, int64_t previous_us)
+{
+    GstClockTime pts = GST_BUFFER_PTS_IS_VALID(buffer) ? GST_BUFFER_PTS(buffer) : GST_BUFFER_DTS(buffer);
+    guint64 stream = GST_CLOCK_TIME_NONE;
+    if (!GST_CLOCK_TIME_IS_VALID(pts))
+        return previous_us;
+    int sign = gst_segment_to_stream_time_full(segment, GST_FORMAT_TIME, pts, &stream);
+    if (sign == 0 || !GST_CLOCK_TIME_IS_VALID(stream))
+        return previous_us;
+    return sign > 0 ? (int64_t)(stream / 1000) : 0; /* before media time 0: not something LG takes */
+}
+
 static GstFlowReturn wpeb_video_sink_render(GstBaseSink *sink, GstBuffer *buffer)
 {
     WpebVideoSink *self = WPEB_VIDEO_SINK(sink);
@@ -377,10 +395,8 @@ static GstFlowReturn wpeb_video_sink_render(GstBaseSink *sink, GstBuffer *buffer
             send_msg(self, WPEB_MEDIA_TRACKS, 0, &has_audio, sizeof(has_audio));
         }
     }
-    GstClockTime pts = GST_BUFFER_PTS_IS_VALID(buffer) ? GST_BUFFER_PTS(buffer) : GST_BUFFER_DTS(buffer);
     /* Media time, as Chromium feeds LG's pipeline (a seek re-anchors it there: WPEB_MEDIA_FLUSH). */
-    guint64 stream = gst_segment_to_stream_time(&sink->segment, GST_FORMAT_TIME, pts);
-    int64_t pts_us = GST_CLOCK_TIME_IS_VALID(stream) ? (int64_t)(stream / 1000) : 0;
+    int64_t pts_us = self->last_pts_us = media_time_us(&sink->segment, buffer, self->last_pts_us);
     GstMapInfo map;
     if (!gst_buffer_map(buffer, &map, GST_MAP_READ))
         return GST_FLOW_ERROR;
@@ -558,6 +574,7 @@ struct _WpebAudioHw {
     guint8 profile, freq_index, channel_config;
     GByteArray *frame;
     guint64 sent;
+    int64_t last_pts_us;
 };
 
 G_DEFINE_TYPE(WpebAudioHw, wpeb_audio_hw, GST_TYPE_BASE_SINK)
@@ -602,9 +619,7 @@ static gboolean wpeb_audio_hw_set_caps(GstBaseSink *sink, GstCaps *caps)
 static GstFlowReturn wpeb_audio_hw_render(GstBaseSink *sink, GstBuffer *buffer)
 {
     WpebAudioHw *self = WPEB_AUDIO_HW(sink);
-    GstClockTime pts = GST_BUFFER_PTS_IS_VALID(buffer) ? GST_BUFFER_PTS(buffer) : GST_BUFFER_DTS(buffer);
-    guint64 stream = gst_segment_to_stream_time(&sink->segment, GST_FORMAT_TIME, pts);
-    int64_t pts_us = GST_CLOCK_TIME_IS_VALID(stream) ? (int64_t)(stream / 1000) : 0;
+    int64_t pts_us = self->last_pts_us = media_time_us(&sink->segment, buffer, self->last_pts_us);
     GstMapInfo map;
     if (!gst_buffer_map(buffer, &map, GST_MAP_READ))
         return GST_FLOW_ERROR;
