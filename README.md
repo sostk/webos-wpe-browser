@@ -1,20 +1,35 @@
-# WPE Browser for LG webOS TVs
+<p align="center"><img src="docs/screenshots/wren-icon.png" width="128" alt="Wren"></p>
+
+# Wren: a web browser for LG webOS TVs
 
 A web browser for LG webOS TVs, built as a native app: **WPE WebKit 2.50.5** with a JavaScript JIT for the TV's
 32-bit ARM, drawn by the TV's GPU, with **hardware video through LG's own media pipeline** and **Widevine DRM** on
-the TV's built-in Widevine CDM. The UI is a Chromium-style browser shell made with the
+the TV's built-in Widevine CDM. Its interface is made for the sofa: a dark glass look, large targets, and everything
+reachable with the arrows, OK and Back of any LG remote. It is built with the
 [webOS native app kit](https://github.com/Native-Webos/webos-native-app-kit).
 
-App id `org.sostk.wpebrowser`, version 0.2.0. Developed and tested on an LG OLED65C1 (webOS 6.5.3, firmware
-03.53.45). The support floor is webOS 6 (glibc 2.28).
+App id `org.sostk.wpebrowser` (kept from its first name, WPE Browser, so updates install over it), version 0.3.0.
+Developed and tested on an LG OLED65C1 (webOS 6.5.3, firmware 03.53.45). The support floor is webOS 6 (glibc 2.28).
+
+## Screenshots
+
+Captured on the TV (1920×1080).
+
+| | |
+|---|---|
+| ![Home page](docs/screenshots/home.jpg) **Home**: search, shortcuts, recent pages, open tabs | ![Browsing](docs/screenshots/browsing.jpg) **Browsing**: ▲ at the top of a page shows the tabs and the toolbar |
+| ![Quick actions](docs/screenshots/quick-actions.jpg) **Hold OK**: quick actions and page zoom | ![Side panel](docs/screenshots/side-panel.jpg) **Menu**: bookmarks, history, zoom, settings |
+| ![All tabs](docs/screenshots/all-tabs.jpg) **All tabs**, with the sites' own icons | |
 
 ## Features
 
-- **Browser UI:** tabs, address bar with search (Google, Bing, DuckDuckGo, Ecosia, Startpage), a New Tab page
-  with shortcuts, bookmarks and a bookmarks bar, history, page zoom, "continue where you left off", clearing
-  browsing data, and settings.
-- **TV input:** D-pad navigation (WebKit spatial navigation), the Magic Remote pointer as a mouse, and the TV
-  keyboard for text fields.
+- **Browser UI:** tabs, address bar with search (Google, Bing, DuckDuckGo, Ecosia, Startpage), a Home page with
+  shortcuts and recent pages, bookmarks, history, page zoom, "continue where you left off", clearing browsing data,
+  and settings. Sites show their own icons (from their icon links; WPE has no favicon API).
+- **TV input, any LG remote:** D-pad navigation in pages (WebKit spatial navigation); ▲ at a page's top edge shows
+  the glass panel with the tab row and toolbar (◀ ▶ + OK switch tabs); **Hold OK** opens quick actions; **CH ±**
+  switches tabs; Back goes back, or to the panel. The Magic Remote pointer is a mouse and its wheel scrolls. Colour
+  keys are optional shortcuts: Red all tabs, Green bookmarks, Yellow quick actions, Blue new tab.
 - **Modern web engine:** WPE WebKit 2.50.5 (Skia), with the Baseline/DFG JIT running on webOS's softfp ABI
   (patch 0004). Pages are painted on the CPU and composited with the TV's Mali GPU straight to the screen.
 - **Hardware video:** MSE and `<video>` (H.264, HEVC, VP9; AAC audio) are decoded by LG's media pipeline
@@ -32,7 +47,7 @@ App id `org.sostk.wpebrowser`, version 0.2.0. Developed and tested on an LG OLED
 Download the ipk from the [Releases](../../releases) page and install it on the TV:
 
 ```sh
-ares-install -d <your-device> org.sostk.wpebrowser_0.2.0_arm.ipk
+ares-install -d <your-device> org.sostk.wpebrowser_0.3.0_arm.ipk
 ```
 
 (or with the Homebrew Channel's local install). The app runs as a normal app in the TV's app jail; it was
@@ -45,6 +60,7 @@ Launch parameters (`ares-launch -d <device> org.sostk.wpebrowser '<json>'`):
 | `{"target": "https://…"}` | open this URL |
 | `{"wpebRenderer": "gpu" \| "software"}` | GPU (default) or software rendering (needs an engine built with `STAGE_MESA=1`) |
 | `{"wpebPresent": "direct" \| "shm"}` | draw pages straight to the screen (default) or via shared memory |
+| `{"wpebShow": "home" \| "panel" \| "quick" \| "side" \| "zoom" \| "tabs"}` | open that screen a few seconds after start (screenshots, tests) |
 | `{"wpebEnv": {"NAME": "value"}}` | environment for the engine, e.g. `WPE_BROWSER_DEBUG_CONSOLE=1` (page console, EME/MSE calls and media events to `engine.log`), `GST_DEBUG`, `WEBKIT_*`, `WPEB_HW_OPUS=1` (experimental hardware Opus) |
 
 Logs on the TV: `/tmp/org.sostk.wpebrowser/engine.log` (and `engine.prev.log`, the run before) and `events.log`.
@@ -85,7 +101,8 @@ where the video is.
 
 | Path | What |
 |---|---|
-| `browser/` | the UI app: chrome (tabs, toolbar, New Tab page), screens (settings, history, bookmarks), engine client, LG media player, storage, tests |
+| `browser/` | the UI app: `wren_ui.*` (the glass interface: Home, tab row, overlays), `chrome.*` (buttons, address bar), screens (settings, history, bookmarks), engine client, LG media player, profile, tests |
+| `browser/branding/` | the Wren icon sources (SVG at three detail levels: 512 master, 130 and 80 px) |
 | `engine/src/` | `wpe-engine`: WebKit views, settings, site quirks, debug console, IPC with the UI |
 | `engine/gst/` | GStreamer sinks that send encoded audio/video to LG's pipeline |
 | `engine/webos-backend/` | libwpe backend for direct GPU presentation on webOS (wl_webos foreign surfaces) |
@@ -149,7 +166,7 @@ docker/run.sh 'make -C /build/buildroot O=/build/br-out BR2_EXTERNAL=/src/buildr
 docker/run.sh 'OUT=/src/build/engine-stage-jit/engine ENGINE_BUILD=/build/engine-build sh /src/tools/stage-engine.sh'
 
 # UI app + engine → ipk
-cd browser && ./build.sh webos                # build/webos-release/dist/org.sostk.wpebrowser_0.2.0_arm.ipk
+cd browser && ./build.sh webos                # build/webos-release/dist/org.sostk.wpebrowser_0.3.0_arm.ipk
 ```
 
 `STAGE_MESA=1` bundles Mesa (software rendering, +30 MB), `STAGE_GST_TOOLS=1` the GStreamer command-line tools.
@@ -157,8 +174,9 @@ cd browser && ./build.sh webos                # build/webos-release/dist/org.sos
 
 ## Licence
 
-The app is GPL-3.0-or-later ([LICENSE](LICENSE)). The ipk bundles open-source libraries under their own
-licences:
+The app is GPL-3.0-or-later ([LICENSE](LICENSE)); its icons and logo are its own. Fonts: Manrope and Atkinson
+Hyperlegible (SIL Open Font License; `browser/fonts/OFL-Manrope.txt`). The ipk bundles open-source libraries under
+their own licences:
 - the UI's (SDL, libwebp, libass, …): in the package's `licenses/` folder;
 - the engine's (WebKit: LGPL-2.1+/BSD; GStreamer, GLib, libsoup, FFmpeg: LGPL; ICU, SQLite, and the rest of its
   Buildroot packages): in `engine/licenses/`, one folder per package with `manifest.csv` (package, version,
