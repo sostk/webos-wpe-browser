@@ -141,8 +141,11 @@ Build outputs go to `~/webos-browser-build/` outside the repository.
 git submodule update --init && third_party/patches/apply-kit-patches.sh
 docker build -t webos-browser-build:1 docker/
 
-# Engine: toolchain + Buildroot (WebKit with the softfp JIT), then stage it with its libraries
+# Engine: toolchain + Buildroot (WebKit with the softfp JIT; it also stages the engine once)
 bash tools/build-softfp-jit.sh start          # detached; `status` shows progress
+
+# Licences of the engine's packages, then (re)stage the engine with its libraries and licences
+docker/run.sh 'make -C /build/buildroot O=/build/br-out BR2_EXTERNAL=/src/buildroot-external WPEB_SOFTFP_JIT=y legal-info'
 docker/run.sh 'OUT=/src/build/engine-stage-jit/engine ENGINE_BUILD=/build/engine-build sh /src/tools/stage-engine.sh'
 
 # UI app + engine → ipk
@@ -154,8 +157,12 @@ cd browser && ./build.sh webos                # build/webos-release/dist/org.sos
 
 ## Licence
 
-The app is GPL-3.0-or-later. The ipk bundles open-source libraries under their own licences: the kit's
-(SDL, libwebp, libass, …) are in the package's `licenses/` folder; the engine's (WebKit: LGPL/BSD; GStreamer,
-GLib, libsoup, FFmpeg: LGPL; and the rest of its Buildroot packages) are listed by Buildroot's
-`make legal-info` and are not yet copied into the package. Widevine is not included: the app uses the CDM
-already on the TV.
+The app is GPL-3.0-or-later ([LICENSE](LICENSE)). The ipk bundles open-source libraries under their own
+licences:
+- the UI's (SDL, libwebp, libass, …): in the package's `licenses/` folder;
+- the engine's (WebKit: LGPL-2.1+/BSD; GStreamer, GLib, libsoup, FFmpeg: LGPL; ICU, SQLite, and the rest of its
+  Buildroot packages): in `engine/licenses/`, one folder per package with `manifest.csv` (package, version,
+  licence, source). These come from Buildroot's `make … legal-info`, which `tools/stage-engine.sh` expects to
+  have been run.
+
+Widevine is not included: the app uses the CDM already on the TV.

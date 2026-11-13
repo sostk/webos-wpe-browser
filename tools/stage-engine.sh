@@ -226,6 +226,36 @@ if [ "$HF" = yes ]; then
     done
     [ "$bad" = 0 ] || exit 1
 fi
+# Licences of the bundled Buildroot packages (WebKit, GStreamer, GLib, FFmpeg, ...): Buildroot's legal-info
+# (`make ... legal-info`), as licenses/<package>-<version>/ plus manifest.csv (package, version, licence, files,
+# source). Mesa and LLVM only when Mesa is bundled.
+LEGAL="$BR/legal-info"
+rm -rf "$OUT/licenses"
+if [ -f "$LEGAL/manifest.csv" ]; then
+    echo "== licences (Buildroot legal-info)"
+    mkdir -p "$OUT/licenses"
+    skip='^"(mesa3d|llvm)",'
+    [ "$STAGE_MESA" = 1 ] && skip='^$'
+    grep -vE "$skip" "$LEGAL/manifest.csv" > "$OUT/licenses/manifest.csv"
+    for d in "$LEGAL"/licenses/*/; do
+        name=$(basename "$d")
+        pkg=$(printf '%s' "$name" | sed 's/-[0-9][^-]*$//')
+        grep -qE "^\"$pkg\"," "$OUT/licenses/manifest.csv" || continue
+        cp -r "$d" "$OUT/licenses/$name"
+    done
+    # This repository's own package (libocdm) is GPL-3.0-or-later, like the app; legal-info leaves a local
+    # source out of its manifest, so it is added here from the source tree.
+    if [ -f "$TARGET/usr/lib/libocdm.so.1" ] || [ -f "$TARGET/usr/lib/libocdm.so" ]; then
+        rm -rf "$OUT"/licenses/ocdm-widevine-*
+        mkdir -p "$OUT/licenses/ocdm-widevine"
+        cp "$SRC/drm/ocdm-widevine/LICENSE" "$OUT/licenses/ocdm-widevine/"
+        printf '"ocdm-widevine","","GPL-3.0-or-later","LICENSE","","this repository (drm/ocdm-widevine)"\n' >> "$OUT/licenses/manifest.csv"
+    fi
+    cp "$SRC/LICENSE" "$OUT/licenses/LICENSE"
+else
+    echo "  ! no $LEGAL/manifest.csv: run Buildroot's legal-info first; the engine's licences are not packaged" >&2
+fi
+
 echo "== check: nothing may need a glibc newer than the TV's 2.28"
 bad=0
 for f in "$OUT/wpe-engine" "$OUT"/libexec/* "$OUT"/lib/*.so* "$OUT"/lib/mesa/*.so* "$OUT"/lib/gstreamer-1.0/*.so "$OUT"/lib/gio/modules/*.so "$OUT"/lib/injected-bundle/*.so; do
