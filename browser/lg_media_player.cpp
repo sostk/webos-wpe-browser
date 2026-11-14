@@ -13,6 +13,7 @@
 
 #if defined(WNK_SDL_WEBOS)
 #include <StarfishMediaAPIs.h>
+#include <dlfcn.h>
 #endif
 
 namespace browser {
@@ -20,6 +21,49 @@ namespace {
 constexpr const char *kCat = "lgmedia";
 
 #if defined(WNK_SDL_WEBOS)
+// libplayerAPIs functions that not every firmware has, looked up at run time so the app still starts without them
+// (tools/fw-check.py): setHdrInfo and setAudioMute are missing before webOS 5, setVolume before webOS 3, and
+// smp::util::getMaxVideoResolution takes its codec by value up to webOS 25 but by const reference in webOS 26.
+// Member functions are called as functions taking `this` first (ARM EABI, non-virtual).
+struct OptionalPlayerApis {
+    using Message = bool (*)(StarfishMediaAPIs *, const char *);
+    using MaxResByValue = bool (*)(std::string, int32_t *, int32_t *, int32_t *);
+    using MaxResByRef = bool (*)(const std::string &, int32_t *, int32_t *, int32_t *);
+    Message set_hdr_info = nullptr, set_audio_mute = nullptr, set_volume = nullptr;
+    MaxResByValue max_res_by_value = nullptr;
+    MaxResByRef max_res_by_ref = nullptr;
+
+    OptionalPlayerApis() {
+        set_hdr_info = find<Message>("_ZN17StarfishMediaAPIs10setHdrInfoEPKc");
+        set_audio_mute = find<Message>("_ZN17StarfishMediaAPIs12setAudioMuteEPKc");
+        set_volume = find<Message>("_ZN17StarfishMediaAPIs9setVolumeEPKc");
+        max_res_by_value = find<MaxResByValue>(
+            "_ZN3smp4util21getMaxVideoResolutionENSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEPiS7_S7_");
+        max_res_by_ref = find<MaxResByRef>(
+            "_ZN3smp4util21getMaxVideoResolutionERKNSt7__cxx1112basic_stringIcSt11char_traitsIcESaIcEEEPiS9_S9_");
+        WNK_LOGI(kCat, "player APIs: setHdrInfo %s, setAudioMute %s, setVolume %s, getMaxVideoResolution %s",
+                 set_hdr_info ? "yes" : "no", set_audio_mute ? "yes" : "no", set_volume ? "yes" : "no",
+                 max_res_by_ref ? "yes (const ref)" : max_res_by_value ? "yes" : "no");
+    }
+
+    bool max_video_resolution(const std::string &codec, int32_t *w, int32_t *h, int32_t *fps) const {
+        if (max_res_by_ref) return max_res_by_ref(codec, w, h, fps);
+        if (max_res_by_value) return max_res_by_value(codec, w, h, fps);
+        return false;
+    }
+
+ private:
+    template <class F>
+    static F find(const char *name) {
+        return reinterpret_cast<F>(dlsym(RTLD_DEFAULT, name));
+    }
+};
+
+const OptionalPlayerApis &player_apis() {
+    static const OptionalPlayerApis apis;
+    return apis;
+}
+
 const char *codec_name(LgMediaPlayer::Codec c) {
     switch (c) {
     case LgMediaPlayer::Codec::H264: return "H264";
@@ -83,7 +127,7 @@ bool LgMediaPlayer::load(const std::string &app_id, const std::string &window_id
     unload();
     int max_w = 3840, max_h = 2160;
     int32_t dw = 0, dh = 0, dfps = 0;
-    if (smp::util::getMaxVideoResolution(codec_name(codec), &dw, &dh, &dfps) && dw > 0 && dh > 0) max_w = dw, max_h = dh;
+    if (player_apis().max_video_resolution(codec_name(codec), &dw, &dh, &dfps) && dw > 0 && dh > 0) max_w = dw, max_h = dh;
     // H.264 that fits FHD is declared as FHD (larger declarations are refused by some firmware); H.264 at its rate
     // class, other codecs at 60 (the kit's verified values). The web process sends a new Load when a later
     // rendition outside this envelope comes (engine/gst/wpebmediasink.c, the same rule).
@@ -255,7 +299,12 @@ void LgMediaPlayer::set_hdr(const WpebMediaHdr &c) {
                                 ",\"colorPrimaries\":" + std::to_string(c.primaries) + ",\"matrixCoeffs\":" +
                                 std::to_string(c.matrix) + ",\"videoFullRangeFlag\":" + (c.full_range ? "true" : "false") +
                                 "}}";
-    const bool ok = api_->setHdrInfo(payload.c_str());
+    const auto set_hdr_info = player_apis().set_hdr_info;
+    if (set_hdr_info == nullptr) {
+        WNK_LOGI(kCat, "%s: this firmware has no setHdrInfo", type);
+        return;
+    }
+    const bool ok = set_hdr_info(api_, payload.c_str());
     WNK_LOGI(kCat, "setHdrInfo %s -> %d", payload.c_str(), ok ? 1 : 0);
 #else
     (void)c;
@@ -268,8 +317,9 @@ void LgMediaPlayer::set_volume(unsigned permille, bool muted) {
     // LG's player takes setVolume(volume, duration, ease) underneath (libpf); the JSON keys are not documented.
     char json[96];
     std::snprintf(json, sizeof json, "{\"volume\":%u,\"duration\":0,\"easeType\":\"Linear\"}", muted ? 0u : permille / 10);
-    const bool v = api_->setVolume(json);
-    const bool m = api_->setAudioMute(muted ? "{\"mute\":true}" : "{\"mute\":false}");
+    const auto &apis = player_apis();
+    const bool v = apis.set_volume != nullptr && apis.set_volume(api_, json);
+    const bool m = apis.set_audio_mute != nullptr && apis.set_audio_mute(api_, muted ? "{\"mute\":true}" : "{\"mute\":false}");
     WNK_LOGI(kCat, "volume %u%%%s: setVolume -> %d, setAudioMute -> %d", permille / 10, muted ? " (muted)" : "", v ? 1 : 0,
              m ? 1 : 0);
 #else

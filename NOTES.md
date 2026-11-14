@@ -620,3 +620,17 @@
 - The glass panel no longer stays while a page is at its top (web apps that never scroll kept it over their
   header and video); it peeks for 2.5 s after a load and after Back, and comes back with Up at the top edge.
 - LG's screen capture (executeOneShot DISPLAY) leaves out the hardware video plane (black); VIDEO is permission-denied.
+
+## 2026-11-14 Older and newer webOS (phase 1)
+- Firmware inventory (webosbrew fw-symbols, one image per release, `~/.cache/plxnative/fwsym/data`): glibc 2.14 (webOS 1), 2.19 (2–3),
+  2.24 (4.x), **2.28 (5.x and 6.x)**, 2.31 (7–8 = webOS 22/23), newer after. So webOS 5 meets the engine's glibc 2.28 floor;
+  the old "webOS 6+" floor was too strict. libpulse 0.20, libwayland-client 0.3.0 and Mali EGL are the same on 5 and 6.
+  Widevine CE CDM: none usable on 4.0–4.4, 14.0 on 4.5, 15.1 on 5, 16.3 on 6, 16.4 on 7–8, 17.x on 9+. No libcurl before webOS 5.
+- The staged engine needs glibc symbols up to GLIBC_2.28 (fcntl64, statx, thrd_exit; 2.27 memfd_create, expf/logf/powf...;
+  2.25 getrandom/getentropy) in 27 files, so webOS 4 (2.24) needs a bundled glibc (plan phase 2: softfp glibc 2.28 + the
+  private-loader link, pointed at the bundled loader only when the TV's glibc is older than 2.28).
+- `tools/fw-check.py` on the 0.3.0 ipk: the UI failed to load on webOS 1–4 **and on webOS 26 (11.2.0)**: libplayerAPIs lacked
+  setHdrInfo/setAudioMute before webOS 5, and webOS 26 changed `smp::util::getMaxVideoResolution` to take `const std::string &`.
+  lg_media_player.cpp now looks these four up with dlsym (both getMaxVideoResolution manglings) and logs which exist
+  ("player APIs: ..."). After: UI loads on webOS 4.4 → 26 (9/14 images). webOS 1–3 still lack the cxx11 `Feed` (not a target).
+- Save logs to USB (Settings → Help and feedback) and .github/ISSUE_TEMPLATE/bug_report.yml added; version 0.3.1.

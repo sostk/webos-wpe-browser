@@ -8,8 +8,14 @@ the TV's built-in Widevine CDM. Its interface is made for the sofa: a dark glass
 reachable with the arrows, OK and Back of any LG remote. It is built with the
 [webOS native app kit](https://github.com/Native-Webos/webos-native-app-kit).
 
-App id `org.sostk.wpebrowser` (kept from its first name, WPE Browser, so updates install over it), version 0.3.0.
-Developed and tested on an LG OLED65C1 (webOS 6.5.3, firmware 03.53.45). The support floor is webOS 6 (glibc 2.28).
+App id `org.sostk.wpebrowser` (kept from its first name, WPE Browser, so updates install over it), version 0.3.1.
+Developed and tested on an LG OLED65C1 (webOS 6.5.3, firmware 03.53.45).
+
+**Which TVs:** the web engine uses the TV's glibc and needs 2.28, which webOS 5 (2020) and newer have, so Wren should run on
+**webOS 5, 6, 22, 23, 24, 25 and 26**. Only webOS 6 has been tested, so reports from other models are very welcome. An offline check
+against LG firmware images (the kit's `tools/fw-check.py`) finds that the interface's own libraries are present on all of them; that says nothing about how well it
+runs. webOS 4 and older are not supported: their glibc is too old for the engine (see NOTES.md). DRM (Widevine) is built for the
+CDM in webOS 6 (16.3); webOS 5 has 15.1, untested.
 
 ## Screenshots
 
@@ -47,7 +53,7 @@ Captured on the TV (1920×1080).
 Download the ipk from the [Releases](../../releases) page and install it on the TV:
 
 ```sh
-ares-install -d <your-device> org.sostk.wpebrowser_0.3.0_arm.ipk
+ares-install -d <your-device> org.sostk.wpebrowser_0.3.1_arm.ipk
 ```
 
 (or with the Homebrew Channel's local install). The app runs as a normal app in the TV's app jail; it was
@@ -171,7 +177,7 @@ docker/run.sh 'make -C /build/buildroot O=/build/br-out BR2_EXTERNAL=/src/buildr
 docker/run.sh 'OUT=/src/build/engine-stage-jit/engine ENGINE_BUILD=/build/engine-build sh /src/tools/stage-engine.sh'
 
 # UI app + engine → ipk
-cd browser && ./build.sh webos                # build/webos-release/dist/org.sostk.wpebrowser_0.3.0_arm.ipk
+cd browser && ./build.sh webos                # build/webos-release/dist/org.sostk.wpebrowser_0.3.1_arm.ipk
 ```
 
 `STAGE_MESA=1` bundles Mesa (software rendering, +30 MB), `STAGE_GST_TOOLS=1` the GStreamer command-line tools.
