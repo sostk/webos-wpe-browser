@@ -181,6 +181,14 @@ class SettingsScreen : public PageScreen {
         const std::string engine = h.engine_version ? h.engine_version() : std::string();
         about.add<wnk::ui::ValueRow>("Engine").set_value(engine.empty() ? "WPE WebKit (not running)" : "WPE WebKit " + engine);
         about.add<wnk::ui::ValueRow>("Licence").set_value("GPL-3.0-or-later");
+
+        auto &help = section("Help and feedback");
+        help.add<wnk::ui::ValueRow>("Save logs to USB")
+            .set_value("For a bug report")
+            .set_on_click([h](Ui &ui) {
+                if (h.save_logs) h.save_logs(ui);
+            });
+        help.add<wnk::ui::ValueRow>("Report a problem").set_value("github.com/sostk/webos-wpe-browser/issues");
     }
 };
 

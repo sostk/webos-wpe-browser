@@ -19,6 +19,7 @@
 #include "engine_client.hpp"
 #include "media_server.hpp"
 #include "keys.hpp"
+#include "log_export.hpp"
 #include "page_view.hpp"
 #include "profile.hpp"
 #include "screens.hpp"
@@ -27,6 +28,8 @@
 
 #include "wnk/app/app.hpp"
 #include "wnk/log.hpp"
+#include "wnk/async/async.hpp"
+#include "wnk/platform/files.hpp"
 #include "wnk/platform/probe.hpp"
 #include "wnk/ui/navigation.hpp"
 #include "wnk/ui/ui.hpp"
@@ -855,7 +858,50 @@ class App : public wnk::app::Delegate {
             clear_browsing_data(ui, history, cookies, cache, seconds);
         };
         h.engine_version = [this]() { return engine_version_; };
+        h.save_logs = [this](wnk::ui::Ui &ui) { save_logs(ui); };
         return h;
+    }
+
+    // Settings → Save logs to USB: the logs (addresses without their queries) to the first writable drive,
+    // on a worker; the answer comes back as a toast.
+    void save_logs(wnk::ui::Ui &ui) {
+        if (saving_logs_) return;
+        std::string dest;
+        for (const auto &v : wnk::platform::removable_volumes()) {
+            if (v.read_only) continue;
+            dest = v.path;
+            break;
+        }
+        if (dest.empty()) {
+            ui.toast("Plug in a USB drive, then try again", 3000);
+            return;
+        }
+        browser::LogExportRequest req;
+        req.runtime_dir = ctx_->runtime_dir().empty() ? "/tmp" : ctx_->runtime_dir();
+        const auto &d = ctx_->device();
+        req.header.push_back(std::string("Wren ") + kVersion + ", WPE WebKit " +
+                             (engine_version_.empty() ? std::string("(not running)") : engine_version_));
+        req.header.push_back("TV: " + d.summary());
+        WNK_LOGI(kCat, "saving logs to %s", dest.c_str());
+        saving_logs_ = true;
+        ui.toast("Saving logs…", 1500);
+        auto *ctx = ctx_;
+        ctx->pool().submit([this, ctx, req, dest](const wnk::async::CancellationToken &) {
+            std::string err;
+            const std::string path = browser::export_logs(req, dest, &err);
+            ctx->dispatcher().post([this, ctx, path, err] {
+                saving_logs_ = false;
+                if (path.empty()) {
+                    WNK_LOGW(kCat, "saving logs failed: %s", err.c_str());
+                    ctx->ui().toast("Couldn't save the logs: " + err, 4000);
+                } else {
+                    WNK_LOGI(kCat, "logs saved: %s", path.c_str());
+                    const auto slash = path.rfind('/');
+                    ctx->ui().toast("Saved " + path.substr(slash + 1) + " to the USB drive. Attach it to your bug report.",
+                                    6000);
+                }
+            });
+        });
     }
 
     void clear_browsing_data(wnk::ui::Ui &ui, bool history, bool cookies, bool cache, uint32_t seconds) {
@@ -1238,6 +1284,7 @@ class App : public wnk::app::Delegate {
     TabId active_ = 0;
     TabId next_id_ = 1;
     std::string engine_version_;
+    bool saving_logs_ = false;  // Save logs to USB is running
     bool pointer_in_page_ = false;
     bool focused_once_ = false;
     int32_t last_x_ = 0, last_y_ = 0;

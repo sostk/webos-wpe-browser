@@ -27,6 +27,7 @@ struct PageHooks {
     // Deletes the chosen data: history in the app, cookies/site data/cache in the engine.
     std::function<void(wnk::ui::Ui &, bool history, bool cookies, bool cache, uint32_t seconds)> clear;
     std::function<std::string()> engine_version;  // "" until the engine is ready
+    std::function<void(wnk::ui::Ui &)> save_logs;   // the logs to a USB drive, for a bug report
 };
 
 std::unique_ptr<wnk::ui::Screen> make_settings_screen(Profile &profile, PageHooks hooks);

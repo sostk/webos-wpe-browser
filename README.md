@@ -64,6 +64,11 @@ Launch parameters (`ares-launch -d <device> org.sostk.wpebrowser '<json>'`):
 | `{"wpebEnv": {"NAME": "value"}}` | environment for the engine, e.g. `WPE_BROWSER_DEBUG_CONSOLE=1` (page console, EME/MSE calls and media events to `engine.log`), `GST_DEBUG`, `WEBKIT_*`, `WPEB_HW_OPUS=1` (experimental hardware Opus) |
 
 Logs on the TV: `/tmp/org.sostk.wpebrowser/engine.log` (and `engine.prev.log`, the run before) and `events.log`.
+They are cleared when the TV restarts.
+
+**Reporting a bug:** plug a USB drive into the TV, then in Wren hold OK → **Settings** → **Help and feedback** →
+**Save logs to USB**. That writes `wren-logs-<date>.txt` (all three logs, with query strings and fragments cut
+from web addresses) to the drive. Attach it to a [bug report](https://github.com/sostk/webos-wpe-browser/issues/new?template=bug_report.yml).
 
 ## Limitations
 

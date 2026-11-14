@@ -1,0 +1,64 @@
+name: Bug report
+description: Something doesn't work in Wren on your TV
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for testing Wren! The logs help most. To save them:
+
+        1. **Don't turn off the TV**: the logs are cleared when it restarts. If Wren crashed, open it again first.
+        2. Plug a USB drive into the TV.
+        3. In Wren, **hold OK** and choose **Settings** (or press the Green button, then Settings). Under **Help and feedback**, choose **Save logs to USB**.
+        4. A message names the file (`wren-logs-….txt`). Attach that file below.
+
+        Web addresses in the file keep only the site and page path. Search terms and tokens are removed. The file still shows which sites you visited, so please read it before you attach it.
+  - type: input
+    id: model
+    attributes:
+      label: TV model
+      placeholder: e.g. OLED65C1, 43UP7500
+    validations:
+      required: true
+  - type: input
+    id: webos
+    attributes:
+      label: webOS version
+      description: Settings → General → About This TV (or the "TV:" line at the top of the log file)
+      placeholder: e.g. webOS 6.5.3
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Wren version
+      description: Wren → Settings → About Wren
+      placeholder: e.g. 0.3.0
+    validations:
+      required: true
+  - type: input
+    id: site
+    attributes:
+      label: Website
+      description: Which site, if it happens on one (just the site is fine)
+      placeholder: e.g. youtube.com
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you did, what you expected, what happened instead (a crash, a black screen, no sound, a key that does nothing...)
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Drag the wren-logs-….txt file here. If you have no USB drive, say so.
+  - type: dropdown
+    id: root
+    attributes:
+      label: Is your TV rooted?
+      options:
+        - "No"
+        - "Yes"
+        - "Don't know"
