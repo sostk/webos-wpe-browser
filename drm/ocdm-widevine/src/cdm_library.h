@@ -8,6 +8,11 @@
 
 namespace ocdm_widevine {
 
+// The CDM interface version cdm.h describes; load() refuses other major versions.
+constexpr int kSupportedMajor = 16;
+// Major version of a CDM version string ("16.3.0", "fake-16.3.0"), or -1.
+int cdm_major_version(const char* version);
+
 class CdmLibrary {
 public:
     // |path| defaults to $OCDM_WIDEVINE_CDM_PATH or the TV's /usr/lib copy.

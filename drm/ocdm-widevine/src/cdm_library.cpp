@@ -2,6 +2,7 @@
 
 #include <cstdlib>
 #include <dlfcn.h>
+#include <string>
 
 namespace ocdm_widevine {
 
@@ -10,6 +11,18 @@ namespace ocdm_widevine {
 static const char kInitialize[] = "_ZN8widevine3Cdm10initializeENS0_16SecureOutputTypeERKNS0_10ClientInfoEPNS0_8IStorageEPNS0_6IClockEPNS0_6ITimerENS0_8LogLevelE";
 static const char kCreate[] = "_ZN8widevine3Cdm6createEPNS0_14IEventListenerEPNS0_8IStorageEb";
 static const char kVersion[] = "_ZN8widevine3Cdm7versionEv";
+
+// Major version of a CDM version string ("16.3.0", "fake-16.3.0"), or -1.
+int cdm_major_version(const char* version)
+{
+    if (!version)
+        return -1;
+    while (*version && (*version < '0' || *version > '9'))
+        ++version;
+    if (!*version)
+        return -1;
+    return atoi(version);
+}
 
 bool CdmLibrary::load(std::string path)
 {
@@ -30,6 +43,21 @@ bool CdmLibrary::load(std::string path)
     version_ = reinterpret_cast<VersionFn>(dlsym(handle_, kVersion));
     if (!loaded()) {
         error_ = path + ": missing widevine::Cdm entry points";
+        dlclose(handle_);
+        handle_ = nullptr;
+        return false;
+    }
+    // cdm.h is the 16.x interface (vtable slots, the batch decrypt). 14.0 and 15.1 (webOS 4.5, 5) export the same
+    // entry points but have another vtable, so calling into them would crash; 17.x renamed initialize anyway.
+    // OCDM_WIDEVINE_ANY_VERSION=1 skips this check for experiments.
+    const char* any = getenv("OCDM_WIDEVINE_ANY_VERSION");
+    const int major = cdm_major_version(version_());
+    if (major != kSupportedMajor && !(any && *any == '1')) {
+        error_ = path + ": Widevine CDM " + version_() + " is not supported (only " + std::to_string(kSupportedMajor) +
+            ".x)";
+        initialize_ = nullptr;
+        create_ = nullptr;
+        version_ = nullptr;
         dlclose(handle_);
         handle_ = nullptr;
         return false;

@@ -8,6 +8,7 @@ namespace ocdm_widevine {
 
 namespace {
 
+// webOS 1-4 name it libcurl.so.5 (LG's soname), webOS 5+ libcurl.so.4; same functions.
 // The few libcurl symbols and option numbers we use (stable since libcurl 7.x; see curl.h).
 typedef void CURL;
 struct curl_slist;
@@ -39,7 +40,7 @@ struct Curl {
 
     bool load()
     {
-        for (const char* name : { "libcurl.so.4", "libcurl.so" }) {
+        for (const char* name : { "libcurl.so.4", "libcurl.so.5", "libcurl.so" }) {
             handle = dlopen(name, RTLD_NOW | RTLD_LOCAL);
             if (handle)
                 break;

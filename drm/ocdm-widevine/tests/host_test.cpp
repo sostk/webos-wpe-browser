@@ -1,4 +1,5 @@
 // Unit test for ocdm_widevine::Host (storage, clock, timers). Runs on the build machine.
+#include "../src/cdm_library.h"
 #include "../src/host.h"
 
 #include <atomic>
@@ -31,6 +32,15 @@ struct Client : widevine::ITimerClient {
 
 int main()
 {
+    // The CDM version gate: only the interface cdm.h describes (16.x) is loaded.
+    CHECK(ocdm_widevine::cdm_major_version("16.3.0") == 16);
+    CHECK(ocdm_widevine::cdm_major_version("fake-16.3.0") == 16);
+    CHECK(ocdm_widevine::cdm_major_version("15.1.0") == 15);
+    CHECK(ocdm_widevine::cdm_major_version("17.1.2") == 17);
+    CHECK(ocdm_widevine::cdm_major_version("") == -1);
+    CHECK(ocdm_widevine::cdm_major_version(nullptr) == -1);
+    CHECK(ocdm_widevine::kSupportedMajor == 16);
+
     char tmpl[] = "/tmp/host_test.XXXXXX";
     std::string root = mkdtemp(tmpl);
     std::string dir = root + "/nested/widevine";

@@ -654,3 +654,25 @@
   - Not covered: TV libraries built against an older glibc (only a webOS 4 TV can show that), gconv conversions.
 - So on webOS 4 the remaining blockers are the TV itself: no usable Widevine before 4.5 and no libcurl (licence
   requests), lower RAM. Phase 3 needs a webOS 4 tester.
+
+## 2026-11-14 DRM and the app on older webOS: feasibility (offline, firmware symbol inventory)
+- **Correction:** webOS 1–4 do ship libcurl, as `libcurl.so.5` (LG's soname; same `curl_easy_*`); 5+ has `libcurl.so.4`.
+  libocdm now tries both (provisioning).
+- Widevine CE CDM entry points: 14.0 (4.5) and 15.1 (5) export the same `initialize`/`create`/`version` as 16.x, but
+  14.0 still has the old `decrypt(InputBuffer, OutputBuffer)` (`CdmEngine::Decrypt`, no `DecryptV16`), so its vtable
+  differs from cdm.h; 15.1 is stripped (144 symbols), layout unknown. 17.1 (webOS 24+) dropped `ClientInfo` from
+  `initialize`, so our mangled name is missing there. **libocdm now loads only 16.x** (`kSupportedMajor`;
+  `OCDM_WIDEVINE_ANY_VERSION=1` skips the check); other versions report the key system unsupported instead of calling
+  into a foreign vtable.
+- Chromium's public CDM interface (`CreateCdmInstance`, `cdm::ContentDecryptionModule_N`) is on every TV from 3.4:
+  `_4` on 3.4 (libwvcdm_shared 2.x), **`_8` on 3.9, 4.4 and 4.10** (libwvcdm_shared 3.0.5 / 3.2.1 / 14.0, driven by
+  LG's Pepper plugin libwidevinecdmadapter.so), **`_10` on 5–8** (libwvcdm_shared 15.1–16.4) and on 9–11 (in
+  libwidevine-wrapper.so, which also needs luna-service2). LG's `WvContentDecryptionModule_8` constructor takes LG
+  `IhIClock/IhIStorage/IhITimer`; whether `CreateCdmInstance` builds those from `Host_8` needs the binary.
+  A `_10` backend in libocdm could cover webOS 5–26 and can be developed on the C1 (6.4 has `_10`); `_8` would then
+  add 3.5–4.5 (untestable here). Same limit as now: only keys allowing decryption outside the secure video path.
+- App on webOS 1–3 (fw-check + the engine's TV-library symbols): 3.x lacks only the cxx11 `StarfishMediaAPIs::Feed`
+  (old-ABI `Feed` exists) for the UI, and `wl_proxy_marshal_constructor_versioned` (wayland < 1.10) for the engine;
+  libpulse is fine everywhere; bundled glibc 2.28 needs kernel ≥ 3.2 (memfd_create ≥ 3.17 is a risk). webOS 1–2 also lack
+  the wayland read-queue API (`wl_display_prepare_read_queue`...) and have other Starfish `Load`/constructor
+  signatures: not a target.

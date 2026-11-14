@@ -1,4 +1,4 @@
-// Minimal HTTPS POST through the system libcurl, loaded at run time (the TV ships libcurl.so.4).
+// Minimal HTTPS POST through the system libcurl, loaded at run time (libcurl.so.4 on webOS 5+, libcurl.so.5 before).
 // Used once per device for Widevine provisioning.
 #pragma once
 
