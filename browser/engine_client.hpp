@@ -60,6 +60,9 @@ struct EngineLaunch {
     std::string surface_group, surface_layer, wayland_socket;
     // Hardware video (browser/media_server.hpp): the UI's decoder service, empty when there is none.
     std::string media_socket;
+    // The engine's own glibc, when it has one: "auto" (only on TVs older than glibc 2.28), "bundled", "system"
+    // (launch parameter {"wpebGlibc": ...}; browser/private_loader.hpp).
+    std::string glibc = "auto";
     // Extra engine environment for experiments (launch parameter {"wpebEnv": {"WEBKIT_...": "..."}}): applied last,
     // only names starting with WEBKIT_, JSC_, WPE_BROWSER_DEBUG or GST_DEBUG.
     std::vector<std::pair<std::string, std::string>> extra_env;

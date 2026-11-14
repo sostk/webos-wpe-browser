@@ -29,6 +29,7 @@ YouTube's TV app; the engine variable `WPE_BROWSER_DESKTOP_YOUTUBE=1` keeps the 
 | `{"target": "https://…"}` | open this URL |
 | `{"wpebRenderer": "gpu" \| "software"}` | GPU (default) or software rendering (needs an engine built with `STAGE_MESA=1`) |
 | `{"wpebPresent": "direct" \| "shm"}` | draw pages straight to the screen (default) or via shared memory |
+| `{"wpebGlibc": "bundled" \| "system"}` | force the engine's bundled glibc or the TV's (default: bundled only where the TV's glibc is older than 2.28) |
 | `{"wpebShow": "home" \| "panel" \| "quick" \| "side" \| "zoom" \| "tabs"}` | open that screen a few seconds after start (screenshots, tests) |
 | `{"wpebEnv": {"NAME": "value"}}` | environment for the engine, e.g. `WPE_BROWSER_DEBUG_CONSOLE=1` (page console, EME/MSE calls and media events to `engine.log`), `WPE_BROWSER_DESKTOP_YOUTUBE=1`, `GST_DEBUG`, `WEBKIT_*`, `WPEB_HW_OPUS=1` (experimental hardware Opus) |
 

@@ -67,9 +67,29 @@ std::string elf_interpreter(const std::string &path) {
     return r;
 }
 
+int compare_versions(const std::string &a, const std::string &b) {
+    size_t i = 0, j = 0;
+    while (i < a.size() || j < b.size()) {
+        long x = 0, y = 0;
+        while (i < a.size() && a[i] >= '0' && a[i] <= '9') x = x * 10 + (a[i++] - '0');
+        while (j < b.size() && b[j] >= '0' && b[j] <= '9') y = y * 10 + (b[j++] - '0');
+        if (x != y) return x < y ? -1 : 1;
+        while (i < a.size() && (a[i] < '0' || a[i] > '9')) ++i;
+        while (j < b.size() && (b[j] < '0' || b[j] > '9')) ++j;
+    }
+    return 0;
+}
+
+GlibcPolicy glibc_policy_from(const std::string &s) {
+    if (s == "bundled") return GlibcPolicy::Bundled;
+    if (s == "system") return GlibcPolicy::System;
+    return GlibcPolicy::Auto;
+}
+
 bool prepare_private_loader(const std::string &engine_exe, const std::string &engine_lib,
-                            const std::string &runtime_dir, bool &private_loader, std::string &error) {
-    private_loader = false;
+                            const std::string &runtime_dir, GlibcPolicy policy, const std::string &system_glibc,
+                            const std::string &system_lib, LoaderChoice &choice, std::string &error) {
+    choice = LoaderChoice{};
     const std::string want = elf_interpreter(engine_exe);
     if (want.empty()) {
         error = "cannot read the dynamic loader of " + engine_exe;
@@ -81,27 +101,61 @@ bool prepare_private_loader(const std::string &engine_exe, const std::string &en
     const std::string app_folder = slash == std::string::npos ? dir : dir.substr(slash + 1);
     const auto rslash = runtime_dir.rfind('/');
     const std::string runtime_folder = rslash == std::string::npos ? runtime_dir : runtime_dir.substr(rslash + 1);
-    if (dir.compare(0, 5, "/tmp/") != 0 || app_folder != runtime_folder) return true; // the system's loader
-
-    private_loader = true;
+    if (dir.compare(0, 5, "/tmp/") != 0 || app_folder != runtime_folder) {
+        choice.why = "the system's loader " + want;
+        return true;
+    }
+    choice.linked = true;
     if (dir != runtime_dir) {
         error = "the engine expects its loader in " + dir + " but the app's runtime folder is " +
                 (runtime_dir.empty() ? std::string("unavailable") : runtime_dir);
         return false;
     }
-    const std::string target = engine_lib + want.substr(dir.size()); // engine_lib + "/<loader>"
-    if (::access(target.c_str(), R_OK | X_OK) != 0) {
-        error = "missing bundled loader " + target;
+    const std::string name = want.substr(dir.size() + 1);  // "ld-linux.so.3"
+    choice.hard_float = name.find("armhf") != std::string::npos;
+    // The bundled glibc: engine/lib/glibc/ (softfp, optional) or engine/lib/ (hard-float).
+    std::string bundled_dir = engine_lib + "/glibc";
+    if (::access((bundled_dir + "/" + name).c_str(), R_OK | X_OK) != 0) bundled_dir = engine_lib;
+    const std::string bundled = bundled_dir + "/" + name;
+    const bool have_bundled = ::access(bundled.c_str(), R_OK | X_OK) == 0;
+    const std::string system = system_lib + "/" + name;
+    const bool have_system = !choice.hard_float && ::access(system.c_str(), R_OK | X_OK) == 0;
+    const bool old_system = !system_glibc.empty() && compare_versions(system_glibc, "2.28") < 0;
+
+    bool use_bundled;
+    if (!have_system) {
+        use_bundled = true;
+        choice.why = "the TV has no " + name;
+    } else if (!have_bundled) {
+        use_bundled = false;
+        choice.why = "the engine has no glibc of its own";
+    } else if (policy == GlibcPolicy::Bundled) {
+        use_bundled = true;
+        choice.why = "bundled glibc requested";
+    } else if (policy == GlibcPolicy::System) {
+        use_bundled = false;
+        choice.why = "the TV's glibc requested";
+    } else {
+        use_bundled = old_system;
+        choice.why = "the TV's glibc is " + (system_glibc.empty() ? std::string("unknown") : system_glibc) +
+                     (old_system ? ", older than 2.28" : "");
+    }
+    if (use_bundled && !have_bundled) {
+        error = "missing bundled loader " + bundled;
         return false;
     }
+    choice.bundled_glibc = use_bundled;
+    if (use_bundled) choice.glibc_dir = bundled_dir;
+    choice.target = use_bundled ? bundled : system;
+
     char cur[4096];
     const ssize_t n = ::readlink(want.c_str(), cur, sizeof cur - 1);
-    if (n > 0 && std::string(cur, static_cast<size_t>(n)) == target) return true;
+    if (n > 0 && std::string(cur, static_cast<size_t>(n)) == choice.target) return true;
 
     // runtime_dir is owned by this uid (the kit checks it), so the link can't be swapped by another user.
     const std::string tmp = want + ".new" + std::to_string(::getpid());
     ::unlink(tmp.c_str());
-    if (::symlink(target.c_str(), tmp.c_str()) != 0 || ::rename(tmp.c_str(), want.c_str()) != 0) {
+    if (::symlink(choice.target.c_str(), tmp.c_str()) != 0 || ::rename(tmp.c_str(), want.c_str()) != 0) {
         error = "cannot link " + want + ": " + std::strerror(errno);
         ::unlink(tmp.c_str());
         return false;

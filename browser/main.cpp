@@ -1191,6 +1191,7 @@ class App : public wnk::app::Delegate {
         if (renderer.empty() && std::getenv("WPE_BROWSER_RENDERER")) renderer = std::getenv("WPE_BROWSER_RENDERER");
         if (renderer.empty()) renderer = kDefaultRenderer;
         l.gpu = renderer == "gpu";
+        if (std::string g = launch_param(params, "wpebGlibc"); !g.empty()) l.glibc = g;
         // Direct presentation (with gpu): pages draw into a surface below this window (docs/webkit-like-chromium.md).
         std::string present = launch_param(params, "wpebPresent");
         if (present.empty() && std::getenv("WPE_BROWSER_PRESENT")) present = std::getenv("WPE_BROWSER_PRESENT");

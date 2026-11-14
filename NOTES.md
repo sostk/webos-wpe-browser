@@ -634,3 +634,23 @@
   lg_media_player.cpp now looks these four up with dlsym (both getMaxVideoResolution manglings) and logs which exist
   ("player APIs: ..."). After: UI loads on webOS 4.4 → 26 (9/14 images). webOS 1–3 still lack the cxx11 `Feed` (not a target).
 - Save logs to USB (Settings → Help and feedback) and .github/ISSUE_TEMPLATE/bug_report.yml added; version 0.3.1.
+
+## 2026-11-14 Phase 2: bundled softfp glibc, chosen at launch (tested on the C1)
+- `tools/stage-engine.sh` (STAGE_GLIBC=1, default for softfp): glibc 2.28 from the Buildroot target (ld-linux.so.3,
+  libc/libm/libpthread/..., libnss_files/dns) plus the toolchain's gconv modules go to `engine/lib/glibc/` (14 MB, 12 MB of
+  it gconv; ipk 87.8 → 92.9 MB). PT_INTERP of wpe-engine and libexec/* is `/tmp/org.sostk.wpebrowser/ld-linux.so.3`.
+- `browser/private_loader.cpp`: the UI points that link at `engine/lib/glibc/ld-linux.so.3` when the TV's glibc
+  (gnu_get_libc_version) is older than 2.28, else at the TV's `/lib/ld-linux.so.3`. Launch parameter
+  `{"wpebGlibc": "bundled" | "system"}` forces either. With the bundled one: LD_LIBRARY_PATH starts with lib/glibc,
+  GCONV_PATH = lib/glibc/gconv, LD_PRELOAD empty. GPU stays on (softfp, unlike the hard-float tree). Log line
+  "engine loader: ...". Host test browser.private_loader covers the choices.
+- TV (OLED65C1, webOS 6.5.3), 2026-11-14:
+  - auto: "the TV's glibc (2.28)", link → /lib/ld-linux.so.3, Widevine H.264 eme-test played to the end.
+  - bundled forced: wpe-engine, WPEWebProcess and WPENetworkProcess all map engine/lib/glibc/libc.so.6; the TV's Mali
+    EGL/GLES load into them (direct presentation, GPU rendering); TV Widevine CDM: H.264/AAC (cenc) played to the end,
+    1493 frames, 2 dropped; VP9 on LG's decoder + Opus through the TV's libpulse: a PulseAudio sink input
+    (s16le 2ch 48 kHz), 874 frames, 0 dropped. DNS/TLS (Shaka from jsDelivr, Google's licence proxy) worked through
+    the bundled NSS modules.
+  - Not covered: TV libraries built against an older glibc (only a webOS 4 TV can show that), gconv conversions.
+- So on webOS 4 the remaining blockers are the TV itself: no usable Widevine before 4.5 and no libcurl (licence
+  requests), lower RAM. Phase 3 needs a webOS 4 tester.

@@ -19,6 +19,9 @@
 # Hard-float Buildroot output (BR2_ARM_EABIHF, tools/build-hf.sh): glibc is bundled too (lib/ld-linux-armhf.so.3,
 # libc, NSS modules for DNS, lib/gconv), and every executable's PT_INTERP is set to $LOADER_LINK, a link the UI
 # creates in its runtime folder (browser/private_loader.cpp). The TV has no hard-float loader of its own.
+# Softfp with STAGE_GLIBC=1 (the default): glibc 2.28 goes to lib/glibc/ (loader, libc & co., NSS modules, gconv/) and
+# PT_INTERP is set to $LOADER_LINK too. The UI points that link at lib/glibc/ld-linux.so.3 on TVs whose glibc is older
+# than 2.28 (webOS 4), else at the TV's /lib/ld-linux.so.3, so the bundled glibc is only used where it is needed.
 set -eu
 
 BR=${BR:-/build/br-out}
@@ -26,9 +29,17 @@ SRC=${SRC:-/src}
 OUT=${OUT:-/src/build/engine-stage/engine}
 TARGET=$BR/target
 ENGINE_BUILD=${ENGINE_BUILD:-/build/engine-build}
-LOADER_LINK=${LOADER_LINK:-/tmp/org.sostk.wpebrowser/ld-linux-armhf.so.3}
 HF=no
 grep -qx 'BR2_ARM_EABIHF=y' "$BR/.config" && HF=yes
+STAGE_GLIBC=${STAGE_GLIBC:-1}
+[ "$HF" = yes ] && STAGE_GLIBC=0  # hard-float bundles glibc in lib/ (below)
+if [ "$HF" = yes ]; then
+    LOADER_LINK=${LOADER_LINK:-/tmp/org.sostk.wpebrowser/ld-linux-armhf.so.3}
+else
+    LOADER_LINK=${LOADER_LINK:-/tmp/org.sostk.wpebrowser/ld-linux.so.3}
+fi
+# gconv modules of the toolchain's glibc (Buildroot does not copy them to the target unless asked).
+TOOLCHAIN_GCONV=${TOOLCHAIN_GCONV:-/build/x-tools/arm-webos-linux-gnueabi/arm-webos-linux-gnueabi/sysroot/usr/lib/gconv}
 STAGING=$BR/staging
 READELF=$BR/host/bin/arm-webos-linux-gnueabi-readelf
 [ -x "$READELF" ] || READELF=$(ls "$BR"/host/bin/*-readelf | head -n 1)
@@ -181,6 +192,22 @@ if [ "$HF" = yes ]; then
         "$PATCHELF" --set-interpreter "$LOADER_LINK" "$exe"
     done
 fi
+if [ "$STAGE_GLIBC" = 1 ]; then
+    echo "== bundled glibc (softfp, lib/glibc; used only on TVs with glibc older than 2.28)"
+    mkdir -p "$OUT/lib/glibc"
+    for so in $SYSTEM_LIBS libnss_files.so.2 libnss_dns.so.2; do
+        case "$so" in libpulse*) continue ;; esac
+        cp -L "$TARGET/lib/$so" "$OUT/lib/glibc/"
+    done
+    [ -d "$TOOLCHAIN_GCONV" ] || { echo "missing $TOOLCHAIN_GCONV (gconv modules)" >&2; exit 1; }
+    cp -r "$TOOLCHAIN_GCONV" "$OUT/lib/glibc/gconv"
+    PATCHELF=$BR/host/bin/patchelf
+    for exe in "$OUT/wpe-engine" "$OUT"/libexec/*; do
+        "$READELF" -l "$exe" 2>/dev/null | grep -q 'Requesting program interpreter' || continue
+        "$PATCHELF" --set-interpreter "$LOADER_LINK" "$exe"
+    done
+    "$BR"/host/bin/*-strip --strip-unneeded "$OUT"/lib/glibc/*.so* "$OUT"/lib/glibc/gconv/*.so 2>/dev/null || true
+fi
 "$BR"/host/bin/*-strip --strip-unneeded "$OUT"/lib/*.so* "$OUT"/lib/mesa/*.so* "$OUT"/lib/gstreamer-1.0/*.so "$OUT"/lib/gio/modules/*.so "$OUT"/lib/injected-bundle/*.so "$OUT"/libexec/* 2>/dev/null || true
 
 # Direct GPU presentation (engine/webos-backend, built on the host with the webOS NDK by
@@ -254,6 +281,18 @@ if [ -f "$LEGAL/manifest.csv" ]; then
     cp "$SRC/LICENSE" "$OUT/licenses/LICENSE"
 else
     echo "  ! no $LEGAL/manifest.csv: run Buildroot's legal-info first; the engine's licences are not packaged" >&2
+fi
+
+if [ "$STAGE_GLIBC" = 1 ]; then
+    echo "== check: every executable's loader is $LOADER_LINK"
+    bad=0
+    for f in "$OUT/wpe-engine" "$OUT"/libexec/*; do
+        "$READELF" -l "$f" 2>/dev/null | grep -q 'Requesting program interpreter' || continue
+        i=$("$READELF" -l "$f" | sed -n 's/.*Requesting program interpreter: \(.*\)]/\1/p')
+        [ "$i" = "$LOADER_LINK" ] || { echo "  ! $(basename "$f") loader is '$i'" >&2; bad=1; }
+    done
+    [ -x "$OUT/lib/glibc/ld-linux.so.3" ] || { echo "  ! no lib/glibc/ld-linux.so.3" >&2; bad=1; }
+    [ "$bad" = 0 ] || exit 1
 fi
 
 echo "== check: nothing may need a glibc newer than the TV's 2.28"

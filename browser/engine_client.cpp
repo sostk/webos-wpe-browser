@@ -2,6 +2,8 @@
 #include "engine_client.hpp"
 #include "private_loader.hpp"
 
+#include <gnu/libc-version.h>
+
 #include "wnk/log.hpp"
 
 #include <algorithm>
@@ -66,14 +68,19 @@ bool EngineClient::start(const EngineLaunch &l, std::string &error) {
         error = "cannot read the bundled TLS certificates at " + ca_bundle;
         return false;
     }
-    // Hard-float engine (JIT): its executables use the bundled loader through a link in the runtime folder.
-    bool private_loader = false;
-    if (!prepare_private_loader(exe, l.engine_dir + "/lib", l.runtime_dir, private_loader, error)) return false;
+    // The engine's own glibc (softfp: engine/lib/glibc, used on TVs older than glibc 2.28; hard-float: always) is reached
+    // through a loader link in the runtime folder (private_loader.hpp).
+    LoaderChoice loader;
+    if (!prepare_private_loader(exe, l.engine_dir + "/lib", l.runtime_dir, glibc_policy_from(l.glibc),
+                                gnu_get_libc_version(), "/lib", loader, error))
+        return false;
+    if (loader.linked)
+        WNK_LOGI(kCat, "engine loader: %s (%s)", loader.bundled_glibc ? "bundled glibc" : "the TV's glibc", loader.why.c_str());
     // The TV's Mali libraries are softfp and can't load into a hard-float process: llvmpipe only. The softfp engine
     // ships without Mesa (tools/stage-engine.sh, STAGE_MESA=1 adds it): software rendering then has nothing to draw
     // with, and the GPU is used anyway.
     const bool have_mesa = ::access((l.engine_dir + "/lib/mesa/libEGL.so.1").c_str(), R_OK) == 0;
-    const bool gpu = private_loader ? false : (l.gpu || !have_mesa);
+    const bool gpu = loader.hard_float ? false : (l.gpu || !have_mesa);
     if (l.gpu && !gpu) WNK_LOGW(kCat, "GPU mode needs the softfp engine; using software rendering");
     if (!l.gpu && gpu) WNK_LOGW(kCat, "software rendering needs Mesa, which this engine does not bundle; using the GPU");
 
@@ -100,12 +107,15 @@ bool EngineClient::start(const EngineLaunch &l, std::string &error) {
     // (the loader read LD_LIBRARY_PATH at our start), so the TV's Mali EGL and the bundled Mesa never meet.
     // Software mode adds engine/lib/mesa (libEGL/libGLESv2 + llvmpipe); in GPU mode the web process
     // finds the TV's libEGL.so.1/libGLESv2.so.2 on the default search path instead.
-    set_env(env, "LD_LIBRARY_PATH", gpu ? d + "/lib" : d + "/lib:" + d + "/lib/mesa");
+    std::string lib_path = gpu ? d + "/lib" : d + "/lib:" + d + "/lib/mesa";
+    // The bundled glibc first, so its libc wins over the TV's (the TV's other libraries come after, from /usr/lib).
+    if (loader.bundled_glibc && loader.glibc_dir != d + "/lib") lib_path = loader.glibc_dir + ":" + lib_path;
+    set_env(env, "LD_LIBRARY_PATH", lib_path);
     set_env(env, "WEBKIT_EXEC_PATH", d + "/libexec");
     set_env(env, "WPE_BROWSER_CA_FILE", ca_bundle);
-    if (private_loader) {
-        // The bundled glibc must not pick up the TV's (softfp) iconv modules or preloads.
-        set_env(env, "GCONV_PATH", d + "/lib/gconv");
+    if (loader.bundled_glibc) {
+        // The bundled glibc must not pick up the TV's iconv modules (built for its own glibc) or preloads.
+        set_env(env, "GCONV_PATH", loader.glibc_dir + "/gconv");
         set_env(env, "LD_PRELOAD", "");
     }
     set_env(env, "GIO_MODULE_DIR", d + "/lib/gio/modules");
