@@ -245,7 +245,7 @@ class SidePanel : public Overlay {
 };
 
 struct QuickHandlers {
-    std::function<void(wnk::ui::Ui &)> new_tab, bookmark, tabs, reload, close_tab, history, home, settings;
+    std::function<void(wnk::ui::Ui &)> new_tab, bookmark, tabs, reload, close_tab, history, home, settings, toolbar;
     std::function<void(int delta)> zoom;
     std::function<std::string()> zoom_text;
 };

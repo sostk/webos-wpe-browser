@@ -976,7 +976,7 @@ QuickActions::QuickActions(QuickHandlers h) : h_(std::move(h)) {
     act("tabs", "Tabs", &QuickHandlers::tabs);
     act("reload", "Reload", &QuickHandlers::reload);
     act("close", "Close tab", &QuickHandlers::close_tab);
-    act("history", "History", &QuickHandlers::history);
+    act("menu", "Toolbar", &QuickHandlers::toolbar);
     act("home", "Home", &QuickHandlers::home);
     act("settings", "Settings", &QuickHandlers::settings);
     zoom_row_ = &add<wnk::ui::Row>(15);

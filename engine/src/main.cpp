@@ -39,7 +39,10 @@
 #include <algorithm>
 #include <map>
 #include <memory>
+#include <cctype>
+#include <cstring>
 #include <string>
+#include <utility>
 
 // Also used by direct.cpp.
 void log_msg(const char *fmt, ...) G_GNUC_PRINTF(1, 2);
@@ -593,6 +596,84 @@ void on_scroll_message(WebKitUserContentManager *, JSCValue *value, gpointer dat
     send_msg(WPE_ENGINE_SCROLL, id, &flag, sizeof(flag));
 }
 
+// YouTube opens as its TV app (youtube.com/tv, "leanback"): on the TV it is interactive in ~1.6 s and ~180 MB
+// against 10-15 s and ~600 MB for the desktop site, and is made for the remote (2026-11-14). Page navigations to
+// youtube.com / m.youtube.com / youtu.be go there instead, videos deep-linked (#/watch?v=ID). Embedded players
+// (/embed/), APIs and the TV app itself are left alone. WPE_BROWSER_DESKTOP_YOUTUBE=1 turns it off.
+std::string youtube_tv_url(const char *uri)
+{
+    if (!uri || getenv("WPE_BROWSER_DESKTOP_YOUTUBE"))
+        return {};
+    std::string u = uri;
+    const size_t scheme = u.find("://");
+    if (scheme == std::string::npos || u.compare(0, 4, "http") != 0)
+        return {};
+    const size_t host_start = scheme + 3;
+    const size_t host_end = u.find_first_of("/?#", host_start);
+    std::string host = u.substr(host_start, host_end == std::string::npos ? std::string::npos : host_end - host_start);
+    std::string rest = host_end == std::string::npos ? "/" : u.substr(host_end);
+    if (rest[0] != '/')
+        rest = "/" + rest;
+    auto video_id_ok = [](const std::string &id) {
+        if (id.empty() || id.size() > 20)
+            return false;
+        for (char c : id)
+            if (!isalnum(static_cast<unsigned char>(c)) && c != '-' && c != '_')
+                return false;
+        return true;
+    };
+    auto watch = [&](const std::string &id) { return video_id_ok(id) ? "https://www.youtube.com/tv#/watch?v=" + id : std::string("https://www.youtube.com/tv"); };
+    if (host == "youtu.be") {
+        const std::string id = rest.substr(1, rest.find_first_of("/?#", 1) == std::string::npos ? std::string::npos : rest.find_first_of("/?#", 1) - 1);
+        return watch(id);
+    }
+    if (host != "youtube.com" && host != "www.youtube.com" && host != "m.youtube.com")
+        return {};
+    const std::string path = rest.substr(0, rest.find_first_of("?#"));
+    if (path.rfind("/watch", 0) == 0) {
+        const size_t v = rest.find("v=");
+        if (v == std::string::npos)
+            return watch({});
+        const size_t end = rest.find_first_of("&#", v + 2);
+        return watch(rest.substr(v + 2, end == std::string::npos ? std::string::npos : end - v - 2));
+    }
+    if (path.rfind("/shorts/", 0) == 0) {
+        const size_t end = path.find('/', 8);
+        return watch(path.substr(8, end == std::string::npos ? std::string::npos : end - 8));
+    }
+    // The site's pages (not /tv, /embed/, /api/, /s/, /youtubei/, sign-in, ...).
+    static const char *const kPages[] = {"/", "/results", "/feed/", "/@", "/channel/", "/c/", "/user/", "/playlist", "/gaming", "/premium"};
+    for (const char *p : kPages) {
+        if (path == p || (strlen(p) > 1 && path.rfind(p, 0) == 0))
+            return "https://www.youtube.com/tv";
+    }
+    return {};
+}
+
+gboolean load_later(gpointer data)
+{
+    auto *job = static_cast<std::pair<WebKitWebView *, std::string> *>(data);
+    webkit_web_view_load_uri(job->first, job->second.c_str());
+    g_object_unref(job->first);
+    delete job;
+    return G_SOURCE_REMOVE;
+}
+
+gboolean on_decide_policy(WebKitWebView *view, WebKitPolicyDecision *decision, WebKitPolicyDecisionType type, gpointer)
+{
+    if (type != WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION)
+        return FALSE;
+    WebKitNavigationAction *action = webkit_navigation_policy_decision_get_navigation_action(WEBKIT_NAVIGATION_POLICY_DECISION(decision));
+    const char *uri = webkit_uri_request_get_uri(webkit_navigation_action_get_request(action));
+    const std::string tv = youtube_tv_url(uri);
+    if (tv.empty())
+        return FALSE;
+    log_msg("tab %u: %s -> %s (YouTube's TV app)", tab_of_web_view(view), uri, tv.c_str());
+    webkit_policy_decision_ignore(decision);
+    g_idle_add(load_later, new std::pair<WebKitWebView *, std::string>(WEBKIT_WEB_VIEW(g_object_ref(view)), tv));
+    return TRUE;
+}
+
 void on_icon_message(WebKitUserContentManager *, JSCValue *value, gpointer data)
 {
     gchar *url = jsc_value_to_string(value);
@@ -987,6 +1068,7 @@ void tab_open(uint32_t id, const std::string &uri, WebKitWebView *opener)
     g_signal_connect(web_view, "create", G_CALLBACK(on_create), nullptr);
     g_signal_connect(web_view, "close", G_CALLBACK(on_close), nullptr);
     g_signal_connect(web_view, "permission-request", G_CALLBACK(on_permission_request), nullptr);
+    g_signal_connect(web_view, "decide-policy", G_CALLBACK(on_decide_policy), nullptr);
     g_signal_connect(web_view, "enter-fullscreen", G_CALLBACK(on_fullscreen_changed), GUINT_TO_POINTER(1));
     g_signal_connect(web_view, "leave-fullscreen", G_CALLBACK(on_fullscreen_changed), GUINT_TO_POINTER(0));
     g_signal_connect(webkit_web_view_get_back_forward_list(web_view), "changed", G_CALLBACK(on_history_changed), web_view);

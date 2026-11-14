@@ -114,6 +114,20 @@ std::string to_url(std::string text, const std::string &search_prefix) {
 
 using browser::make_dir;
 
+// A site's TV version (made for a remote, full screen, its own navigation): YouTube's /tv, or any page at a /tv path
+// or on a tv. host. The browser's panel stays hidden there until asked for (Hold OK > Toolbar, Back with no
+// history, the pointer at the top edge).
+bool is_tv_app(const std::string &url) {
+    const size_t scheme = url.find("://");
+    if (scheme == std::string::npos || url.compare(0, 4, "http") != 0) return false;
+    const size_t host_start = scheme + 3;
+    const size_t host_end = url.find_first_of("/?#", host_start);
+    const std::string host = url.substr(host_start, host_end == std::string::npos ? std::string::npos : host_end - host_start);
+    const std::string path = host_end == std::string::npos ? "/" : url.substr(host_end, url.find_first_of("?#", host_end) - host_end);
+    if (host.rfind("tv.", 0) == 0) return true;
+    return path == "/tv" || path.rfind("/tv/", 0) == 0;
+}
+
 struct Tab {
     TabId id = 0;
     std::string url, title;
@@ -121,7 +135,8 @@ struct Tab {
     bool loading = false;
     bool can_back = false, can_forward = false;
     bool live = false;  // has a WebKit view in the engine
-    bool at_top = true;  // the page is scrolled to its top (the toolbar peeks over it then)
+    bool at_top = true;  // the page is scrolled to its top
+    bool tv_mode = false;  // a site's TV version (is_tv_app): the panel stays hidden until asked for
     bool fullscreen = false;  // the page is in fullscreen (a video's fullscreen button): no chrome at all
     TabId opener = 0;    // the tab whose page opened this one (window.open), shown again when it closes itself
     double last_shown_ms = 0;
@@ -413,7 +428,7 @@ class App : public wnk::app::Delegate {
         const bool page_mode = ui.focused() == screen_->page_ && t != nullptr && t->live && !t->url.empty() &&
                                !screen_->message_->visible() && ui.top_dialog() == nullptr && nav_->depth() == 1;
         if (!page_mode) return true;
-        if (t->fullscreen) return false;
+        if (t->fullscreen || t->tv_mode) return false;
         // With a hardware video the page goes above the UI while the chrome is hidden (DirectOwner::set_page_z), so
         // being at the top no longer keeps the chrome: it would hide the page's video controls.
         // It peeks for kChromePeekMs when a page loads and after Back; it no longer stays while the page is at its
@@ -440,7 +455,7 @@ class App : public wnk::app::Delegate {
         chrome->set_translation({0, -(1.0f - chrome_shown_) * h});
         if (!want && chrome_shown_ <= 0.0f && chrome->visible()) chrome->set_visible(false);
         const Tab *t = tab(active_);
-        screen_->thin_progress_->set_visible(!chrome->visible() && t != nullptr && !t->url.empty());
+        screen_->thin_progress_->set_visible(!chrome->visible() && t != nullptr && !t->url.empty() && !t->tv_mode);
         // The hint pill while the panel has focus (not while it only peeks over the focused page).
         const bool hints = chrome->visible() && chrome_shown_ >= 1.0f && ui.focused() != nullptr &&
                            screen_->chrome_->is_ancestor_of(ui.focused());
@@ -984,6 +999,9 @@ class App : public wnk::app::Delegate {
         cb.uri = [this](TabId id, const std::string &uri) {
             if (Tab *t = tab(id); t && t->live) {
                 t->url = uri;
+                const bool tv = is_tv_app(uri);
+                if (tv != t->tv_mode) WNK_LOGI(kCat, "tab %u: %s TV mode", id, tv ? "entered" : "left");
+                t->tv_mode = tv;
                 if (id == active_) refresh_chrome();
             }
         };
@@ -1002,7 +1020,7 @@ class App : public wnk::app::Delegate {
             if (t == nullptr) return;
             if (e == WPE_LOAD_FINISHED) profile_.add_visit(t->title, t->url);
             const bool loading = e == WPE_LOAD_STARTED || e == WPE_LOAD_COMMITTED;
-            if (id == active_ && (e == WPE_LOAD_COMMITTED || e == WPE_LOAD_FINISHED)) peek_chrome();  // where we are
+            if (id == active_ && !t->tv_mode && (e == WPE_LOAD_COMMITTED || e == WPE_LOAD_FINISHED)) peek_chrome();
             if (loading != t->loading) {
                 t->loading = loading;
                 if (loading) t->progress = 0;
@@ -1335,6 +1353,7 @@ BrowserScreen::BrowserScreen(App &app, browser::EngineClient &engine) : Screen("
     qh.reload = [&app](wnk::ui::Ui &) { app.reload_or_stop(); };
     qh.close_tab = [&app](wnk::ui::Ui &) { app.close_active_tab(); };
     qh.history = [&app](wnk::ui::Ui &ui) { app.show_history_page(ui); };
+    qh.toolbar = [&app](wnk::ui::Ui &ui) { app.focus_tabs(ui); };
     qh.home = [&app](wnk::ui::Ui &) { app.go_home(); };
     qh.settings = [&app](wnk::ui::Ui &ui) { app.show_settings_page(ui); };
     qh.zoom = [&app](int d) { app.zoom_step(d); };
