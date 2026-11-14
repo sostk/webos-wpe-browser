@@ -63,7 +63,7 @@ using browser::TabId;
 namespace pal = browser::palette;
 
 constexpr const char *kCat = "browser";
-constexpr const char *kVersion = "0.3.1";
+constexpr const char *kVersion = "0.3.2";
 // Pages are rendered at this fraction of the view's size in 1920x1080 logical units and scaled up by the
 // GPU: CPU rendering at about 1280 px wide keeps scrolling usable, and CSS px at that size read well from a sofa.
 constexpr float kRenderScale = 2.0f / 3.0f;

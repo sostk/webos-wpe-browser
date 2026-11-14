@@ -177,7 +177,7 @@ class SettingsScreen : public PageScreen {
             .set_on_click([h](Ui &ui) { h.show_bookmarks(ui); });
 
         auto &about = section("About Wren");
-        about.add<wnk::ui::ValueRow>("Version").set_value("0.3.1");
+        about.add<wnk::ui::ValueRow>("Version").set_value("0.3.2");
         const std::string engine = h.engine_version ? h.engine_version() : std::string();
         about.add<wnk::ui::ValueRow>("Engine").set_value(engine.empty() ? "WPE WebKit (not running)" : "WPE WebKit " + engine);
         about.add<wnk::ui::ValueRow>("Licence").set_value("GPL-3.0-or-later");

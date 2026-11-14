@@ -50,7 +50,7 @@ wnk_add_webos_package(
         TARGET wpebrowser
         APPID org.sostk.wpebrowser
         TITLE "Wren"
-        VERSION 0.3.1
+        VERSION 0.3.2
         VENDOR "sostk"
         ICON "${CMAKE_CURRENT_SOURCE_DIR}/icon.png"
         LARGE_ICON "${CMAKE_CURRENT_SOURCE_DIR}/largeIcon.png"
