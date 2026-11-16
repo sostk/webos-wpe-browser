@@ -191,6 +191,7 @@ bool EngineClient::start(const EngineLaunch &l, std::string &error) {
             // Needs playbin3 (WebKit only punches holes there) and direct presentation (a page surface with alpha
             // above the video plane).
             set_env(env, "WPEB_MEDIA_SOCKET", l.media_socket);
+            if (l.media_acb) set_env(env, "WPEB_MEDIA_ACB", "1");
             set_env(env, "WEBKIT_GST_QUIRKS", "rialto");
             set_env(env, "WEBKIT_GST_HOLE_PUNCH_QUIRK", "rialto");
             set_env(env, "WEBKIT_GST_USE_PLAYBIN3", "1");

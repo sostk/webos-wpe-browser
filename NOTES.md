@@ -761,6 +761,17 @@
   build/perf-bench/jit-{A-default,B-baseline100,C-dfg300}.txt. run.sh now logs the web process's CPU and memory per
   load and takes WPEB_ENV (engine environment), SITES and NO_SCROLL.
 
+## 2026-11-17 webOS 3.x and 4.x: hardware video through ACB (experimental, issue #2)
+- satgit62's video-caps report (OLED B7, webOS 3.9.0, firmware 06.00.25): no wl_webos_foreign; libAcbAPI with every
+  AcbAPI_* function; libplayerAPIs (old string Feed); NDL API 1 only. The firmware symbol data shows the same for
+  3.9.2, 4.4.2 and 4.10 (webOS 4.5, gotwig's B9/C9); video windows come with webOS 5.
+- {"wpebVideo":"acb"}: without video windows and NDL API 2, the media server uses the kit's StarfishBackend, which
+  on webOS 1-4 places LG's pipeline with ACB (Kodi's flow: setMediaVideoData from the pipeline's video info, sink
+  MAIN, media id, setState, setCustomDisplayWindow in 1920x1080) and renumbers the old pipeline events. Every
+  stream goes there, its AAC audio too (WPEB_MEDIA_ACB=1 lets the web process's audio sink pair with a video that
+  has no window); Opus stays video only. The page's hole areas (page pixels) are moved to the page's place on the
+  screen (MediaServer::set_page_geometry). Off by default; untested on a TV (the C1 has no libAcbAPI).
+
 ## 2026-11-16 Cloudflare checks and a Web Audio crash (user: Cloudflare "verifying" never finishes)
 - Cloudflare's managed challenge passes on the TV but takes 68-84 s (www.scrapingcourse.com/cloudflare-challenge,
   cookies forgotten first, from load start to the widget's "complete" postMessage); earlier tests stopped too soon.

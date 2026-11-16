@@ -609,6 +609,7 @@ class App : public wnk::app::Delegate {
                 screen_->page_->set_page_size(w, h);
                 engine_.resize(w, h);
             }
+            if (media_.acb()) media_.set_page_geometry(r, screen_->page_->page_width(), screen_->page_->page_height());
         }
         if (Tab *t = tab(active_)) {
             screen_->panel_->set_progress(t->loading, t->progress);
@@ -1270,12 +1271,18 @@ class App : public wnk::app::Delegate {
                 l.surface_group = direct_.group();
                 l.surface_layer = direct_.layer();
                 l.wayland_socket = direct_.socket();
-                // {"wpebVideo":"software"} keeps video on the CPU (GStreamer's own decoders, drawn into the page).
+                // {"wpebVideo":"software"} keeps video on the CPU (GStreamer's own decoders, drawn into the page);
+                // {"wpebVideo":"acb"} tries LG's pipeline placed by ACB where there are no video windows (webOS 3.x
+                // and 4.x, experimental: issue #2).
                 std::string why;
-                if (launch_param(params, "wpebVideo") == "software")
+                const std::string video = launch_param(params, "wpebVideo");
+                if (video == "software")
                     WNK_LOGI(kCat, "hardware video off (launch parameter)");
-                else if (media_.running() || media_.start(l.runtime_dir + "/media.sock", direct_.has_video_window(), &why))
+                else if (media_.running() ||
+                         media_.start(l.runtime_dir + "/media.sock", direct_.has_video_window(), video == "acb", &why)) {
                     l.media_socket = media_.path();
+                    l.media_acb = media_.acb();
+                }
                 else
                     WNK_LOGW(kCat, "hardware video unavailable: %s; software video", why.c_str());
             }

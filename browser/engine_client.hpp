@@ -64,6 +64,7 @@ struct EngineLaunch {
     uint32_t screen_width = 0, screen_height = 0;
     // Hardware video (browser/media_server.hpp): the UI's decoder service, empty when there is none.
     std::string media_socket;
+    bool media_acb = false;  // the UI plays video through ACB: the page has no video windows, its audio still goes along
     // The engine's own glibc, when it has one: "auto" (only on TVs older than glibc 2.28), "bundled", "system"
     // (launch parameter {"wpebGlibc": ...}; browser/private_loader.hpp).
     std::string glibc = "auto";

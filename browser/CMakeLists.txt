@@ -30,7 +30,7 @@ endif ()
 
 add_executable(wpebrowser main.cpp chrome.cpp screens.cpp profile.cpp storage.cpp private_loader.cpp engine_client.cpp page_view.cpp keys.cpp direct_owner.cpp media_server.cpp lg_media_player.cpp wren_ui.cpp log_export.cpp)
 target_include_directories(wpebrowser PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../common")
-target_link_libraries(wpebrowser PRIVATE wnk_app wnk_media_ndl ${CMAKE_DL_LIBS})
+target_link_libraries(wpebrowser PRIVATE wnk_app wnk_media_ndl wnk_media_starfish ${CMAKE_DL_LIBS})
 if (WNK_WEBOS)
     # LG's buffer-feed media pipeline (lg_media_player.cpp), from the NDK's starfish-media-pipeline header.
     target_include_directories(wpebrowser SYSTEM PRIVATE "${CMAKE_SYSROOT}/usr/include/starfish-media-pipeline")

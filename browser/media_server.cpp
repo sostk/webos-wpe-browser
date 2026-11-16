@@ -4,6 +4,7 @@
 #include "wpe_media_ipc.h"
 #include "wnk/log.hpp"
 #include "wnk/media/ndl_backend.hpp"
+#include "wnk/media/starfish_backend.hpp"
 
 #include <cerrno>
 #include <chrono>
@@ -54,12 +55,13 @@ MediaServer::~MediaServer() { stop(); }
 
 void MediaServer::set_foreground(bool foreground) { wnk::media::NdlBackend::set_app_foreground(foreground); }
 
-bool MediaServer::start(const std::string &path, bool video_window, std::string *why) {
+bool MediaServer::start(const std::string &path, bool video_window, bool acb, std::string *why) {
     if (running()) return true;
     // LG's media pipeline (StarfishMediaAPIs) is the main path; NDL's v2 API (webOS 5+) only a fallback. webOS 3.x
     // and 4.x have the pipeline but an older NDL without NDL_DirectMediaLoad. The pipeline shows video in a video
-    // window (wl_webos_foreign), which webOS 3.x's compositor lacks: there neither path works, so pages get
-    // software video instead (issue #2: on an OLED B7, webOS 3.9, every video failed).
+    // window (wl_webos_foreign), which the compositors of webOS 3.x and 4.x lack: there neither path works, so pages
+    // get software video instead (issue #2: on an OLED B7, webOS 3.9, every video failed), unless `acb` asks for
+    // the pipeline placed by ACB (libAcbAPI, as moonlight-tv and Kodi do there; experimental, issue #2).
     std::string ndl_why;
     const bool ndl = wnk::media::NdlBackend::available(&ndl_why);
     const bool lg = LgMediaPlayer::available();
@@ -67,11 +69,30 @@ bool MediaServer::start(const std::string &path, bool video_window, std::string 
         *why = "no LG media pipeline (" + LgMediaPlayer::unavailable_reason() + ") and " + ndl_why;
         return false;
     }
+    std::unique_ptr<wnk::media::MediaBackend> backend;
     if (!ndl && !video_window) {
-        *why = "no video windows (wl_webos_foreign) for LG's media pipeline and " + ndl_why;
-        return false;
+        if (!acb) {
+            *why = "no video windows (wl_webos_foreign) for LG's media pipeline and " + ndl_why;
+            return false;
+        }
+        std::string starfish_why;
+        if (!wnk::media::StarfishBackend::available(&starfish_why)) {
+            *why = "ACB: no usable LG media pipeline (" + starfish_why + ")";
+            return false;
+        }
+        wnk::media::StarfishOptions o;
+        o.app_id = "org.sostk.wpebrowser";
+        auto starfish = std::make_unique<wnk::media::StarfishBackend>(o);
+        if (starfish->plane() != wnk::media::VideoPlane::Acb) {
+            *why = "ACB: libAcbAPI unusable (see the starfish lines)";
+            return false;
+        }
+        backend = std::move(starfish);
+        acb_ = true;
+        WNK_LOGI(kCat, "no video windows: LG media pipeline placed by ACB (experimental)");
+    } else if (!ndl) {
+        WNK_LOGI(kCat, "NDL fallback unavailable (%s); LG media pipeline only", ndl_why.c_str());
     }
-    if (!ndl) WNK_LOGI(kCat, "NDL fallback unavailable (%s); LG media pipeline only", ndl_why.c_str());
     sockaddr_un addr{};
     addr.sun_family = AF_UNIX;
     if (path.size() >= sizeof(addr.sun_path)) {
@@ -89,10 +110,32 @@ bool MediaServer::start(const std::string &path, bool video_window, std::string 
     }
     path_ = path;
     listen_fd_ = fd;
-    backend_ = std::make_unique<wnk::media::NdlBackend>();
+    backend_ = backend ? std::move(backend) : std::make_unique<wnk::media::NdlBackend>();
     acceptor_ = std::thread([this] { accept_loop(); });
     WNK_LOGI(kCat, "hardware video service on %s", path.c_str());
     return true;
+}
+
+void MediaServer::set_page_geometry(const wnk::Rect &screen, uint32_t page_width, uint32_t page_height) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (screen.x == page_screen_.x && screen.y == page_screen_.y && screen.w == page_screen_.w &&
+        screen.h == page_screen_.h && page_width == page_w_ && page_height == page_h_)
+        return;
+    page_screen_ = screen;
+    page_w_ = page_width;
+    page_h_ = page_height;
+    if (acb_) place_acb_locked();
+}
+
+// ACB places the video in the 1920x1080 app space (the UI's pixels): the area from the web process, in page pixels,
+// moved to where the page is on the screen.
+void MediaServer::place_acb_locked() {
+    if (!backend_ || area_.width <= 0 || area_.height <= 0 || page_w_ == 0 || page_h_ == 0 || page_screen_.w <= 0 ||
+        page_screen_.h <= 0)
+        return;
+    const float sx = page_screen_.w / static_cast<float>(page_w_), sy = page_screen_.h / static_cast<float>(page_h_);
+    backend_->set_area(wnk::Rect{page_screen_.x + area_.x * sx, page_screen_.y + area_.y * sy, area_.width * sx,
+                                 area_.height * sy});
 }
 
 void MediaServer::stop() {
@@ -107,7 +150,7 @@ void MediaServer::stop() {
     for (int i = 0; i < 100 && connections_.load() > 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(20));
     std::lock_guard<std::mutex> lock(mutex_);
     lg_.unload();
-    use_lg_ = ndl_loaded_ = false;
+    use_lg_ = ndl_loaded_ = backend_audio_ = false;
     if (connections_.load() == 0) backend_.reset();  // releases LG's decoder
     else backend_.release();                          // a thread still uses it: leaked at exit, NDL quits atexit
     ::close(wake_[0]);
@@ -190,6 +233,10 @@ void MediaServer::serve(int fd, uint64_t id) {
                     if (owner_.load() == id && use_lg_ && !pushed_eos && ended[0] && (ended[1] || !lg_.has_audio())) {
                         lg_.end_of_stream();
                         pushed_eos = true;
+                    } else if (owner_.load() == id && acb_ && ndl_loaded_ && backend_ && !pushed_eos && ended[0] &&
+                               (ended[1] || !backend_audio_)) {
+                        backend_->end_of_stream();
+                        pushed_eos = true;
                     }
                 }
                 ql.lock();
@@ -204,7 +251,7 @@ void MediaServer::serve(int fd, uint64_t id) {
                         if (pick == 0 || lg_.has_audio())
                             full = lg_.feed(pick == 1, u.packet.data.data(), u.packet.data.size(), u.packet.pts_us) ==
                                    LgMediaPlayer::Feed::Full;
-                    } else if (pick == 0) {
+                    } else if (pick == 0 || backend_audio_) {
                         full = backend_->feed(u.packet) == wnk::media::MediaBackend::Feed::Full;
                     }
                 }
@@ -237,7 +284,7 @@ void MediaServer::serve(int fd, uint64_t id) {
             std::lock_guard<std::mutex> lock(mutex_);
             lg_.unload();
             if (backend_ && ndl_loaded_) backend_->unload();
-            use_lg_ = ndl_loaded_ = false;
+            use_lg_ = ndl_loaded_ = backend_audio_ = false;
             WNK_LOGI(kCat, "stream %llu released the decoder after %llu access units (%llu waits for room)",
                      static_cast<unsigned long long>(id), static_cast<unsigned long long>(units.load()),
                      static_cast<unsigned long long>(full_waits.load()));
@@ -293,14 +340,35 @@ void MediaServer::serve(int fd, uint64_t id) {
             if (use_lg_) lg_.set_hdr(l.hdr);
             if (!use_lg_) WNK_LOGW(kCat, "stream %llu: LG media pipeline: %s; trying NDL", static_cast<unsigned long long>(id), error.c_str());
         }
+        backend_audio_ = false;
+        if (!use_lg_ && acb_) {
+            // The kit's StarfishBackend takes AAC with ADTS headers, as the web process sends it; Opus it does not.
+            if (with_audio && audio_format.codec != WPEB_MEDIA_OPUS) {
+                wnk::media::AudioFormat a;
+                a.codec = wnk::media::CodecId::Aac;
+                a.sample_rate = static_cast<int>(audio_format.rate);
+                a.channels = static_cast<int>(audio_format.channels);
+                f.audio = a;
+                backend_audio_ = true;
+            } else if (with_audio) {
+                WNK_LOGW(kCat, "stream %llu: Opus cannot go to ACB's pipeline: video only", static_cast<unsigned long long>(id));
+            }
+            v.colour.transfer = static_cast<int>(l.hdr.transfer);
+            v.colour.primaries = static_cast<int>(l.hdr.primaries);
+            v.colour.matrix = static_cast<int>(l.hdr.matrix);
+            v.colour.full_range = l.hdr.full_range != 0;
+            f.video = v;
+        }
         if (!use_lg_) {
             error.clear();
             ndl_loaded_ = b.load(f, &error);
+            if (!ndl_loaded_) backend_audio_ = false;
+            if (ndl_loaded_ && acb_) place_acb_locked();
         }
         if (use_lg_ || ndl_loaded_)
             WNK_LOGI(kCat, "stream %llu: %s for %s %ux%u @ %.2f fps%s%s%s", static_cast<unsigned long long>(id),
-                     use_lg_ ? "LG media pipeline" : "NDL", codec_label(l.codec), l.width, l.height, l.fps_milli / 1000.0,
-                     !(use_lg_ && with_audio) ? "" : audio_format.codec == WPEB_MEDIA_OPUS ? " with its Opus audio" : " with its AAC audio", l.window_id[0] ? ", window " : "", l.window_id);
+                     use_lg_ ? "LG media pipeline" : acb_ ? "LG media pipeline (ACB)" : "NDL", codec_label(l.codec), l.width, l.height, l.fps_milli / 1000.0,
+                     !((use_lg_ && with_audio) || backend_audio_) ? "" : audio_format.codec == WPEB_MEDIA_OPUS ? " with its Opus audio" : " with its AAC audio", l.window_id[0] ? ", window " : "", l.window_id);
         else
             WNK_LOGW(kCat, "stream %llu: decoder load failed: %s", static_cast<unsigned long long>(id), error.c_str());
     };
@@ -420,6 +488,13 @@ void MediaServer::serve(int fd, uint64_t id) {
             WpebMediaArea a;
             std::memcpy(&a, payload.data(), sizeof(a));
             std::lock_guard<std::mutex> lock(mutex_);
+            if (acb_) {
+                if (a.width > 0 && a.height > 0 && (owner_.load() == id || owner_.load() == 0)) {
+                    area_ = WpebAreaPx{a.x, a.y, a.width, a.height};
+                    place_acb_locked();
+                }
+                break;
+            }
             if (backend_ && a.width > 0 && a.height > 0 && (owner_.load() == id || owner_.load() == 0) && !use_lg_)
                 backend_->set_area(wnk::Rect{static_cast<float>(a.x), static_cast<float>(a.y), static_cast<float>(a.width),
                                              static_cast<float>(a.height)});

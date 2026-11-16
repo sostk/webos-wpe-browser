@@ -864,6 +864,12 @@ static uint32_t hw_codec(GstCaps *caps)
     return 0;
 }
 
+static gboolean acb_mode(void)
+{
+    const char *v = g_getenv("WPEB_MEDIA_ACB");
+    return v && g_str_equal(v, "1");
+}
+
 /* The video sink of this playback, if its video is on LG's pipeline and its Load was moments ago (the UI holds the
  * Load for this answer for a second). Waits a little for video caps that have not come yet. */
 static WpebVideoSink *hardware_partner(WpebAudioSink *self)
@@ -876,7 +882,8 @@ static WpebVideoSink *hardware_partner(WpebAudioSink *self)
     g_mutex_lock(&g_caps_lock);
     for (;;) {
         g_mutex_lock(&video->lock);
-        gboolean ready = video->codec != 0 && video->fd >= 0 && video->have_window;
+        /* With WPEB_MEDIA_ACB the UI plays the stream without a video window (webOS 3.x and 4.x), audio included. */
+        gboolean ready = video->codec != 0 && video->fd >= 0 && (video->have_window || acb_mode());
         g_mutex_unlock(&video->lock);
         if (ready) {
             ok = g_get_monotonic_time() - video->load_time < 800 * G_TIME_SPAN_MILLISECOND;
