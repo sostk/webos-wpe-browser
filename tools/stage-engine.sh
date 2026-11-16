@@ -223,6 +223,24 @@ if [ "$HF" = no ] && [ -f "$BACKEND" ]; then
     cp "$BACKEND" "$SRC/build/webos-backend/libwpeb-owner.so" "$OUT/lib/"
 fi
 
+# The ad blocker's rule list (tools/adblock): EasyList and EasyPrivacy converted to WebKit's format and compiled
+# here with this WPE WebKit, under QEMU (binfmt_misc with the F flag, so it works inside the container): compiling on
+# the TV needs several hundred MB. The engine loads adblock/ContentRuleList-wren-adblock (engine_client.cpp).
+echo "== ad blocker rule list"
+ADBLOCK=$SRC/build/adblock
+LISTS="$SRC/tools/adblock/lists/easylist.txt $SRC/tools/adblock/lists/easyprivacy.txt"
+STAMP=$(cat "$SRC/tools/adblock/convert.py" "$SRC/tools/adblock/compile-rules.c" $LISTS "$STAGING/usr/lib/libWPEWebKit-2.0.so.1" | sha256sum | cut -c1-16)
+mkdir -p "$ADBLOCK" "$OUT/adblock"
+if [ "$(cat "$ADBLOCK/stamp" 2>/dev/null)" != "$STAMP" ]; then
+    rm -rf "$ADBLOCK/store"
+    python3 "$SRC/tools/adblock/convert.py" "$ADBLOCK/rules.json" $LISTS
+    "$(ls "$STAGING"/lib/ld-linux*.so.3 | head -n 1)" --library-path "$STAGING/usr/lib:$STAGING/lib" "$ENGINE_BUILD/compile-rules" \
+        "$ADBLOCK/rules.json" "$ADBLOCK/store" wren-adblock
+    echo "$STAMP" > "$ADBLOCK/stamp"
+fi
+rm -f "$OUT/adblock/"*
+install -m 644 "$ADBLOCK/store/ContentRuleList-wren-adblock" "$OUT/adblock/"
+
 echo "== fonts, certificates"
 cp -r "$TARGET/usr/share/fonts" "$OUT/share/"
 cp "$TARGET/etc/ssl/certs/ca-certificates.crt" "$OUT/etc/ssl/certs/"

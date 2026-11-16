@@ -22,6 +22,11 @@ set_target_properties(wpe-engine PROPERTIES
     INSTALL_RPATH "$ORIGIN/lib")
 install(TARGETS wpe-engine RUNTIME DESTINATION .)
 
+# Build-time tool, not shipped: compiles the ad blocker's rule list with this WPE WebKit (run under QEMU by
+# tools/stage-engine.sh; the store format changes between WebKit releases).
+add_executable(compile-rules ../tools/adblock/compile-rules.c)
+target_link_libraries(compile-rules PRIVATE PkgConfig::WPE)
+
 # Hardware video (engine/gst/wpebmediasink.c): GStreamer sinks that hand the encoded stream to the UI process.
 pkg_check_modules(GSTBASE IMPORTED_TARGET gstreamer-1.0 gstreamer-base-1.0 gstreamer-audio-1.0 gstreamer-video-1.0
                   gstreamer-pbutils-1.0)

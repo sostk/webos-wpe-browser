@@ -1008,6 +1008,10 @@ QuickActions::QuickActions(QuickHandlers h) : h_(std::move(h)) {
         zoom_label_->set_text(h_.zoom_text());
     }, 66);
     zoom_in_->accessible_label = "Zoom in";
+    ads_button_ = &add<GlassButton>("", "Blocked", [this](Ui &u) {
+        close(u);
+        if (h_.toggle_ads) h_.toggle_ads(u);
+    }, 66);
     hints_ = &add<HintPill>(Glass::Dark);
     hints_->set_hints({{"◀ ▶ ▲ ▼", {}, "Choose"}, {"OK", {}, "Do it"}, {"BACK", {}, "Close"}});
 }
@@ -1016,6 +1020,13 @@ void QuickActions::show(Ui &ui, const std::string &title, const std::string &url
     title_ = title.empty() ? (url.empty() ? "New tab" : host_of(url)) : title;
     url_ = url;
     if (h_.zoom_text) zoom_label_->set_text(h_.zoom_text());
+    const std::string ads = h_.ads_label ? h_.ads_label() : std::string();
+    ads_shown_ = !ads.empty();
+    ads_button_->set_visible(ads_shown_);
+    if (ads_shown_) {
+        ads_button_->set_label(ads);
+        ads_button_->accessible_label = ads == "Allowed" ? "Ads allowed on this site. Block them" : "Ads blocked on this site. Allow them";
+    }
     if (auto *star = dynamic_cast<ActionTile *>(grid_->children()[1].get())) star->accessible_label = bookmarked ? "Remove bookmark" : "Bookmark";
     set_visible(true);
     ui.focus(focus_zoom ? zoom_in_ : grid_->children().front().get());
@@ -1024,11 +1035,15 @@ void QuickActions::show(Ui &ui, const std::string &title, const std::string &url
 void QuickActions::layout_content(Ui &ui, const Rect &c) {
     const float w = 1110;
     const Size gs = grid_->measure(ui, {w - 90, 600});
-    const float h = 45 + 66 + 33 + gs.h + 27 + 87 + 42;
+    const float h = 45 + 66 + 33 + gs.h + 27 + 87 + (ads_shown_ ? 18 + 87 : 0) + 42;
     panel_ = {c.cx() - w * 0.5f, c.y + (c.h - h) * 0.47f, w, h};
     grid_->layout(ui, {panel_.x + 45, panel_.y + 45 + 66 + 33, w - 90, gs.h});
     const Size zs = zoom_row_->measure(ui, {600, 66});
     zoom_row_->layout(ui, {panel_.right() - 45 - 12 - zs.w, grid_->frame().bottom() + 27 + 10.5f, zs.w, 66});
+    if (ads_shown_) {
+        const Size as = ads_button_->measure(ui, {600, 66});
+        ads_button_->layout(ui, {panel_.right() - 45 - 12 - as.w, grid_->frame().bottom() + 27 + 87 + 18 + 10.5f, as.w, 66});
+    }
     const Size hs = hints_->measure(ui, {c.w, 69});
     hints_->layout(ui, {c.cx() - hs.w * 0.5f, c.bottom() - 39 - 69, hs.w, 69});
 }
@@ -1053,6 +1068,12 @@ void QuickActions::draw(Ui &ui) {
     r.stroke_rect(zoom, ui.fade(kWhite.with_alpha(0.10f)), 1.5f, 30);
     const TextStyle cap = style(fonts().semibold, 18, ui.fade(kSoft));
     r.draw_text(cap, {zoom.x + 30, baseline(r, cap, zoom)}, "PAGE ZOOM");
+    if (ads_shown_) {
+        const Rect ads{zoom.x, zoom.bottom() + 18, zoom.w, 87};
+        r.fill_rect(ads, ui.fade(kWhite.with_alpha(0.06f)), 30);
+        r.stroke_rect(ads, ui.fade(kWhite.with_alpha(0.10f)), 1.5f, 30);
+        r.draw_text(cap, {ads.x + 30, baseline(r, cap, ads)}, "ADS ON THIS SITE");
+    }
 }
 
 }  // namespace browser::wren

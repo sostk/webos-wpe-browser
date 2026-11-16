@@ -331,6 +331,40 @@ class App : public wnk::app::Delegate {
     }
 
     // The star in the omnibox: bookmark the page, or remove the bookmark.
+    // "Allow ads on this site": the shown page's host (without www.), where the ad blocker stays off.
+    static std::string ads_host(const std::string &url) {
+        if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0) return {};
+        std::string h = browser::host_of(url);
+        for (char &c : h) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return h;
+    }
+    bool ads_allowed_on(const std::string &url) const {
+        const std::string h = ads_host(url);
+        const auto &a = profile_.settings.ads_allowed;
+        return !h.empty() && std::find(a.begin(), a.end(), h) != a.end();
+    }
+    // The quick actions' ad strip: what OK on it does next, or "" when it has nothing to offer.
+    std::string ads_label() {
+        const Tab *t = tab(active_);
+        if (!profile_.settings.block_ads || t == nullptr || ads_host(t->url).empty()) return {};
+        return ads_allowed_on(t->url) ? "Allowed" : "Blocked";
+    }
+    void toggle_site_ads() {
+        Tab *t = tab(active_);
+        if (t == nullptr) return;
+        const std::string h = ads_host(t->url);
+        if (h.empty()) return;
+        auto &a = profile_.settings.ads_allowed;
+        const bool allow = std::find(a.begin(), a.end(), h) == a.end();
+        if (allow) a.push_back(h);
+        else a.erase(std::remove(a.begin(), a.end(), h), a.end());
+        profile_.settings_changed();
+        apply_settings();
+        WNK_LOGI(kCat, "ads %s on a site (%zu allowed)", allow ? "allowed" : "blocked again", a.size());
+        ctx_->ui().toast(allow ? "Ads allowed on " + h + ". Reloading" : "Ads blocked on " + h + " again. Reloading");
+        if (t->live) engine_.reload(t->id);
+    }
+
     void toggle_bookmark() {
         Tab *t = tab(active_);
         if (t == nullptr || t->url.empty()) return;
@@ -976,6 +1010,7 @@ class App : public wnk::app::Delegate {
     }
 
     void apply_settings() {
+        engine_.set_adblock(profile_.settings.block_ads, profile_.settings.ads_allowed);
         engine_.set_zoom(static_cast<uint32_t>(browser::kZoomLevels[static_cast<size_t>(profile_.settings.zoom)]));
         // Pages lay out at 2/3 of the screen (kRenderScale); 1/kRenderScale renders them at full resolution.
         // Direct presentation always does: the page surface is shown 1:1, not scaled to the page area.
@@ -1487,6 +1522,8 @@ BrowserScreen::BrowserScreen(App &app, browser::EngineClient &engine) : Screen("
     qh.settings = [&app](wnk::ui::Ui &ui) { app.show_settings_page(ui); };
     qh.zoom = [&app](int d) { app.zoom_step(d); };
     qh.zoom_text = [&app]() { return app.zoom_text(); };
+    qh.toggle_ads = [&app](wnk::ui::Ui &) { app.toggle_site_ads(); };
+    qh.ads_label = [&app]() { return app.ads_label(); };
     quick_ = &stack.add<browser::wren::QuickActions>(qh);
     for (browser::wren::Overlay *o : {static_cast<browser::wren::Overlay *>(overview_), static_cast<browser::wren::Overlay *>(side_),
                                       static_cast<browser::wren::Overlay *>(quick_)})

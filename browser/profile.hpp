@@ -24,6 +24,8 @@ struct Settings {
     int zoom = 0;            // index into kZoomLevels
     bool restore_session = false;  // "Continue where you left off"
     bool sharp_text = true;  // render pages at the screen's resolution (1.5x), not 2/3 of it
+    bool block_ads = true;   // the engine's ad blocker (EasyList, EasyPrivacy)
+    std::vector<std::string> ads_allowed;  // hosts where ads are not blocked ("Allow ads on this site")
 };
 
 struct SearchEngine {

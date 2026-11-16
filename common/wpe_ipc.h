@@ -24,7 +24,7 @@
 
 #include <stdint.h>
 
-#define WPE_IPC_VERSION 11u
+#define WPE_IPC_VERSION 12u
 #define WPE_IPC_ENGINE_FD 3
 #define WPE_IPC_FRAME_SLOTS 3u
 #define WPE_IPC_MAX_TEXT 2048u   /* bytes including the terminating NUL */
@@ -61,6 +61,8 @@ typedef enum {
     WPE_APP_SET_SCALE,        /* WpeZoom: device scale for every tab (1500 = render 1.5x the CSS size) */
     WPE_APP_SET_LAYER,        /* WpeText: direct presentation: the surface-group layer pages attach to from now on
                                  (a new one after a web-process crash; the dead process's surface can keep the old) */
+    WPE_APP_SET_ADBLOCK,      /* WpeText: "1" (block ads) or "0", then one host per line where ads are allowed (its
+                                 subdomains too); applies from each tab's next page load */
 
     /* engine -> app */
     WPE_ENGINE_READY = 100,   /* WpeEngineReady */

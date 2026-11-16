@@ -16,6 +16,7 @@ the arrows, OK and Back of any LG remote.
 - Tabs, bookmarks, history, search engine choice, page zoom, "continue where you left off", sites' own icons
 - Hardware video (H.264, HEVC, VP9; MSE, DASH, HLS) with HDR10/HLG, on LG's decoder
 - Widevine DRM (EME) through the TV's own CDM
+- Ad and tracker blocking (EasyList, EasyPrivacy), on by default; ads can be allowed per site from **Hold OK**
 - YouTube opens as its fast TV app, full screen
 - Remote-first: a slim toolbar above the page (**▲** at the top of a page goes to it), **Hold OK** for quick actions, **CH ±** to switch tabs; the
   Magic Remote pointer and colour keys work too ([all keys](docs/usage.md))
@@ -59,6 +60,8 @@ Logs are cleared when the TV restarts, so save them first.
 - Wren uses the TV's own provisioned Widevine CDM. This is outside the terms LG and Google ship it under, and the
   TV's Widevine certificate could in principle be revoked. **Use at your own risk.**
 - Opus and Vorbis audio is decoded in software; only one hardware video plays at a time.
+- The ad blocker cannot stop YouTube's video ads, which come from the same servers as the videos. Its lists are
+  updated with each Wren release.
 - Cloudflare security checks ("Verifying you are human") take about a minute on a TV's processor. Wait for
   them; the site then remembers the pass for a while.
 
@@ -70,5 +73,6 @@ building, patches. The development log is [NOTES.md](NOTES.md).
 ## Licence
 
 GPL-3.0-or-later ([LICENSE](LICENSE)). Fonts: Manrope and Atkinson Hyperlegible (SIL OFL). Bundled libraries keep
-their own licences ([details](docs/building.md#licences-in-the-package)). Widevine is not included: Wren uses the
+their own licences ([details](docs/building.md#licences-in-the-package)). The ad blocker's lists are
+[EasyList and EasyPrivacy](https://easylist.to) (GPL-3.0-or-later or CC BY-SA 3.0). Widevine is not included: Wren uses the
 CDM already on the TV. Built with the [webOS native app kit](https://github.com/Native-Webos/webos-native-app-kit).

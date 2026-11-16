@@ -761,6 +761,21 @@
   build/perf-bench/jit-{A-default,B-baseline100,C-dfg300}.txt. run.sh now logs the web process's CPU and memory per
   load and takes WPEB_ENV (engine environment), SITES and NO_SCROLL.
 
+## 2026-11-17 Ad blocker
+- WebKit's content blockers (WebKitUserContentFilterStore, Safari's JSON format) with EasyList and EasyPrivacy.
+  tools/adblock/convert.py turns ABP syntax into 113,750 rules (106,589 block, 5,767 element-hiding groups, 1,417
+  exceptions; ~1,400 rules WebKit cannot express are skipped: scriptlets, redirects, $document blocks, extended CSS).
+- Compiling on the TV is out: on the PC (WebKitGTK 2.52) it took 4 s and ~360 MB over the baseline; EasyList alone
+  ~260 MB. The store format is per WebKit release (WPE 2.50: version 20, WebKitGTK 2.52: 21), so tools/stage-engine.sh
+  compiles it with the staged WPE itself under QEMU (binfmt F flag, works in the container): 22 s, 44.6 MB, shipped
+  as engine/adblock/ContentRuleList-wren-adblock (+20 MB ipk). Prefix variants of the ||domain^ regex did not shrink it.
+- Engine: every tab's content manager gets the list; a main-frame load (start, redirect) of an allowed host (or its
+  subdomain) takes it off that tab. WPE_APP_SET_ADBLOCK ("1"/"0" + allowed hosts; IPC 12). UI: Settings switch (on by
+  default), "ADS ON THIS SITE" in the quick actions (reloads the page).
+- C1 (tools/adblock/test.html): jQuery loads; adsbygoogle, GPT and analytics.js blocked; an .adsbygoogle-box element
+  hidden (a bare .adsbygoogle div is not in EasyList). With the host allowed, all load and the box shows. Web process
+  76 MB with the list vs 95 MB allowed (the ad scripts then run). The quick-actions strip was not driven on the TV.
+
 ## 2026-11-17 webOS 3.x and 4.x: hardware video through ACB (experimental, issue #2)
 - satgit62's video-caps report (OLED B7, webOS 3.9.0, firmware 06.00.25): no wl_webos_foreign; libAcbAPI with every
   AcbAPI_* function; libplayerAPIs (old string Feed); NDL API 1 only. The firmware symbol data shows the same for

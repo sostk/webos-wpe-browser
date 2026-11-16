@@ -252,6 +252,9 @@ struct QuickHandlers {
     std::function<void(wnk::ui::Ui &)> new_tab, bookmark, tabs, reload, close_tab, history, home, settings, toolbar;
     std::function<void(int delta)> zoom;
     std::function<std::string()> zoom_text;
+    // The ad blocker on the shown site: toggle_ads flips it, ads_label says its state ("" hides the strip).
+    std::function<void(wnk::ui::Ui &)> toggle_ads;
+    std::function<std::string()> ads_label;
 };
 
 class QuickActions : public Overlay {
@@ -269,6 +272,8 @@ class QuickActions : public Overlay {
     std::string title_, url_;
     wnk::ui::Grid *grid_;
     wnk::ui::Row *zoom_row_;
+    GlassButton *ads_button_ = nullptr;
+    bool ads_shown_ = false;
     wnk::ui::Label *zoom_label_;
     wnk::ui::View *zoom_in_ = nullptr;
     wnk::Rect panel_{};

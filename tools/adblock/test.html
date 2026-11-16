@@ -1,0 +1,27 @@
+<!doctype html>
+<!-- Ad blocker check: requests known ad and tracker URLs and one ordinary resource, and checks an element with an
+     ad class; results go to tools/eme-test/minihttpd's report (/log?...). Open http://127.0.0.1:8099/test.html. -->
+<html><head><meta charset="utf-8"><title>Ad blocker test</title></head>
+<body style="background:#fff;font:28px sans-serif"><pre id="o"></pre>
+<div class="adsbygoogle-box" id="ad" style="width:300px;height:100px;background:#c00">AD</div>
+<script>
+function log(m) { document.getElementById('o').textContent += m + '\n'; new Image().src = '/log?' + encodeURIComponent(m); }
+function probe(name, url) {
+  return new Promise((done) => {
+    const s = document.createElement('script');
+    const t = setTimeout(() => { log(name + ' TIMEOUT'); done(); }, 8000);
+    s.onload = () => { clearTimeout(t); log(name + ' loaded'); done(); };
+    s.onerror = () => { clearTimeout(t); log(name + ' blocked-or-failed'); done(); };
+    s.src = url; document.head.appendChild(s);
+  });
+}
+(async () => {
+  await probe('control jquery', 'https://code.jquery.com/jquery-3.7.1.min.js');
+  await probe('ad adsbygoogle', 'https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js');
+  await probe('ad doubleclick', 'https://securepubads.g.doubleclick.net/tag/js/gpt.js');
+  await probe('tracker google-analytics', 'https://www.google-analytics.com/analytics.js');
+  await new Promise((r) => setTimeout(r, 500));
+  log('element .adsbygoogle-box display=' + getComputedStyle(document.getElementById('ad')).display);
+  log('ended');
+})();
+</script></body></html>

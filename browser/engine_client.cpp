@@ -119,6 +119,11 @@ bool EngineClient::start(const EngineLaunch &l, std::string &error) {
         set_env(env, "LD_PRELOAD", "");
     }
     set_env(env, "GIO_MODULE_DIR", d + "/lib/gio/modules");
+    // The ad blocker's rule list, compiled at build time (tools/adblock, tools/stage-engine.sh).
+    if (::access((d + "/adblock/ContentRuleList-wren-adblock").c_str(), R_OK) == 0) {
+        set_env(env, "WPEB_ADBLOCK_STORE", d + "/adblock");
+        set_env(env, "WPEB_ADBLOCK_ID", "wren-adblock");
+    }
     // GIO scans EXTRA_MODULES first; inherited firmware paths would win over MODULE_DIR.
     set_env(env, "GIO_EXTRA_MODULES", "");
     set_env(env, "WEBKIT_INJECTED_BUNDLE_PATH", d + "/lib/injected-bundle");
@@ -266,6 +271,15 @@ void EngineClient::send_text(uint32_t type, TabId tab, const std::string &text) 
     std::memcpy(t.text, text.data(), len);
     t.text[len] = '\0';
     send(type, tab, &t, static_cast<uint32_t>(offsetof(WpeText, text) + len + 1));
+}
+
+void EngineClient::set_adblock(bool on, const std::vector<std::string> &allowed) {
+    std::string text = on ? "1" : "0";
+    for (const std::string &h : allowed) {
+        if (text.size() + 1 + h.size() >= WPE_IPC_MAX_TEXT) break;  // ~100 sites at least; more are not sent
+        text += "\n" + h;
+    }
+    send_text(WPE_APP_SET_ADBLOCK, 0, text);
 }
 
 void EngineClient::resize(uint32_t w, uint32_t h) {

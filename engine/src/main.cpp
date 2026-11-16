@@ -43,6 +43,7 @@
 #include <cstring>
 #include <string>
 #include <utility>
+#include <vector>
 
 // Also used by direct.cpp.
 void log_msg(const char *fmt, ...) G_GNUC_PRINTF(1, 2);
@@ -65,6 +66,7 @@ struct Tab {
     direct::View *direct = nullptr;           // direct mode (owned by the web view's backend)
     WebKitInputMethodContext *ime = nullptr;  // direct mode (owned by the web view)
     bool resize_pending = false;              // direct mode: resized while hidden, applied when shown
+    bool ad_filtered = false;                 // the ad blocker's rule list is on the tab's content manager
 };
 
 struct Engine {
@@ -83,6 +85,12 @@ struct Engine {
     uint32_t width = 1280, height = 720;
     double zoom = 1.0;
     double scale = 1.0;      // device scale: buffers are CSS size x scale (sharp text on a 1080p screen)
+
+    // The ad blocker: EasyList and EasyPrivacy, compiled at build time (tools/adblock) into a store the engine
+    // only loads. On until the UI says otherwise; hosts in adblock_allowed (and their subdomains) are left alone.
+    WebKitUserContentFilter *adblock = nullptr;
+    bool adblock_on = true;
+    std::vector<std::string> adblock_allowed;
 
     // Frame slots in a memfd shared with the UI.
     int frames_fd = -1;
@@ -105,6 +113,8 @@ guint32 now_ms()
 {
     return static_cast<guint32>(g_get_monotonic_time() / 1000);
 }
+
+void adblock_apply(Tab &t, const char *uri);
 
 Tab *tab_by_id(uint32_t id)
 {
@@ -439,6 +449,10 @@ void on_progress(WebKitWebView *view, GParamSpec *, gpointer)
 
 void on_load_changed(WebKitWebView *view, WebKitLoadEvent event, gpointer)
 {
+    if (event == WEBKIT_LOAD_STARTED || event == WEBKIT_LOAD_REDIRECTED) {
+        if (Tab *t = tab_by_id(tab_of_web_view(view)))
+            adblock_apply(*t, webkit_web_view_get_uri(view));
+    }
     WpeLoad l {};
     switch (event) {
     case WEBKIT_LOAD_STARTED: l.event = WPE_LOAD_STARTED; break;
@@ -1236,6 +1250,7 @@ void tab_open(uint32_t id, const std::string &uri, WebKitWebView *opener)
     add_scroll_reporter(web_view, id);
 
     Tab &t = g.tabs[id];
+    adblock_apply(t, nullptr);
     resize_view(t);
     webkit_web_view_set_zoom_level(web_view, g.zoom);
     const bool active = id == g.active;
@@ -1352,6 +1367,97 @@ void clear_data(const WpeClearData &c)
             send_msg(WPE_ENGINE_DATA_CLEARED, 0, &done, sizeof(done));
         },
         what);
+}
+
+// Whether the ad blocker applies to a page at `uri` (its top-level document).
+bool adblock_wanted(const char *uri)
+{
+    if (!g.adblock || !g.adblock_on)
+        return false;
+    if (!uri || g.adblock_allowed.empty())
+        return true;
+    GUri *parsed = g_uri_parse(uri, G_URI_FLAGS_NONE, nullptr);
+    const char *h = parsed ? g_uri_get_host(parsed) : nullptr;
+    std::string host = h ? h : "";
+    if (parsed)
+        g_uri_unref(parsed);
+    for (char &c : host)
+        c = g_ascii_tolower(c);
+    for (const std::string &a : g.adblock_allowed) {
+        if (host == a || (host.size() > a.size() && host.compare(host.size() - a.size(), a.size(), a) == 0
+                && host[host.size() - a.size() - 1] == '.'))
+            return false;
+    }
+    return true;
+}
+
+// Puts the rule list on or takes it off the tab for the page it is loading. Rules count from the next request
+// the web process sends, so this runs when a main-frame load starts (and on its redirects).
+void adblock_apply(Tab &t, const char *uri)
+{
+    const bool want = adblock_wanted(uri);
+    if (want == t.ad_filtered)
+        return;
+    WebKitUserContentManager *ucm = webkit_web_view_get_user_content_manager(t.web_view);
+    if (want)
+        webkit_user_content_manager_add_filter(ucm, g.adblock);
+    else
+        webkit_user_content_manager_remove_filter(ucm, g.adblock);
+    t.ad_filtered = want;
+}
+
+void adblock_apply_all()
+{
+    for (auto &[id, t] : g.tabs)
+        adblock_apply(t, webkit_web_view_get_uri(t.web_view));
+}
+
+// WPE_APP_SET_ADBLOCK: "1" or "0", then one allowed host per line.
+void set_adblock(const std::string &text)
+{
+    std::vector<std::string> lines;
+    size_t at = 0;
+    while (at <= text.size()) {
+        const size_t nl = text.find('\n', at);
+        std::string line = text.substr(at, nl == std::string::npos ? std::string::npos : nl - at);
+        for (char &c : line)
+            c = g_ascii_tolower(c);
+        if (!line.empty())
+            lines.push_back(line);
+        if (nl == std::string::npos)
+            break;
+        at = nl + 1;
+    }
+    g.adblock_on = !lines.empty() && lines[0] == "1";
+    g.adblock_allowed.assign(lines.empty() ? lines.end() : lines.begin() + 1, lines.end());
+    log_msg("ad blocker %s%s, %zu site(s) allowed", g.adblock_on ? "on" : "off", g.adblock ? "" : " (no rule list)",
+        g.adblock_allowed.size());
+    adblock_apply_all();
+}
+
+void on_adblock_loaded(GObject *store, GAsyncResult *result, gpointer)
+{
+    GError *error = nullptr;
+    g.adblock = webkit_user_content_filter_store_load_finish(WEBKIT_USER_CONTENT_FILTER_STORE(store), result, &error);
+    if (g.adblock)
+        log_msg("ad blocker: rule list %s loaded", webkit_user_content_filter_get_identifier(g.adblock));
+    else
+        log_msg("ad blocker: rule list not loaded: %s", error ? error->message : "?");
+    g_clear_error(&error);
+    g_object_unref(store);
+    adblock_apply_all();
+}
+
+// WPEB_ADBLOCK_STORE (the engine's adblock/ directory) and WPEB_ADBLOCK_ID (the list in it), from the UI.
+void load_adblock()
+{
+    const char *dir = getenv("WPEB_ADBLOCK_STORE"), *id = getenv("WPEB_ADBLOCK_ID");
+    if (!dir || !*dir || !id || !*id) {
+        log_msg("ad blocker: no rule list");
+        return;
+    }
+    webkit_user_content_filter_store_load(webkit_user_content_filter_store_new(dir), id, nullptr, on_adblock_loaded,
+        nullptr);
 }
 
 void set_zoom(uint32_t permille)
@@ -1483,6 +1589,9 @@ void handle_message(const uint8_t *buf, ssize_t n)
         }
         break;
     }
+    case WPE_APP_SET_ADBLOCK:
+        set_adblock(text_of(buf, n, h));
+        break;
     case WPE_APP_QUIT:
         g_main_loop_quit(g.loop);
         break;
@@ -1663,6 +1772,7 @@ int main(int, char **)
     if (const char *sites = getenv("WPE_BROWSER_DEBUG_FORGET_COOKIES"); sites && *sites)
         forget_cookies(sites);
 
+    load_adblock();
     g_unix_fd_add(g.sock, static_cast<GIOCondition>(G_IO_IN | G_IO_HUP | G_IO_ERR), on_socket, nullptr);
 
     WpeEngineReady ready { WPE_IPC_VERSION, webkit_get_major_version(), webkit_get_minor_version(), webkit_get_micro_version() };
@@ -1679,6 +1789,8 @@ int main(int, char **)
     }
     while (!g.tabs.empty())
         tab_close(g.tabs.begin()->first);
+    if (g.adblock)
+        webkit_user_content_filter_unref(g.adblock);
     g_object_unref(g.settings);
     g_object_unref(g.session);
     g_clear_object(&g.display);

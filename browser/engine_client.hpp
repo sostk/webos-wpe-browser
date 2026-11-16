@@ -103,6 +103,8 @@ class EngineClient {
     // Leaves the page's fullscreen (Back on the remote), from the top document down.
     void exit_fullscreen(TabId tab) { run_js(tab, "document.fullscreenElement && document.exitFullscreen()"); }
     void set_layer(const std::string &layer) { send_text(WPE_APP_SET_LAYER, 0, layer); }
+    // The ad blocker, for every tab from its next page load: on or off, and the hosts where ads are allowed.
+    void set_adblock(bool on, const std::vector<std::string> &allowed);
 
     // Page size and input: always the active tab.
     void resize(uint32_t w, uint32_t h);
