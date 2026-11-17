@@ -6,17 +6,19 @@ presentation gives each web process its own compositor surface for a view, and t
 compositor cannot hand the view's layer from one process's surface to another's without
 hiding the app. WPE_BROWSER_NO_PROCESS_SWAP (set by the engine in that mode) keeps a view in its process.
 
+---
+diff --git a/Source/WebKit/UIProcess/API/glib/WebKitWebContext.cpp b/Source/WebKit/UIProcess/API/glib/WebKitWebContext.cpp
 --- a/Source/WebKit/UIProcess/API/glib/WebKitWebContext.cpp
 +++ b/Source/WebKit/UIProcess/API/glib/WebKitWebContext.cpp
-@@ -448,7 +448,10 @@
-     configuration.setUseSystemAppearanceForScrollbars(priv->useSystemAppearanceForScrollbars);
+@@ -448,7 +448,10 @@ static void webkitWebContextConstructed(GObject* object)
+     configuration->setUseSystemAppearanceForScrollbars(priv->useSystemAppearanceForScrollbars);
  #endif
  #else
--    configuration.setProcessSwapsOnNavigation(true);
+-    configuration->setProcessSwapsOnNavigation(true);
 +    // webOS browser: WPE_BROWSER_NO_PROCESS_SWAP keeps a view in its web process on cross-site navigation (and COOP).
 +    // Direct presentation gives each web process its own compositor surface for the view, and the webOS compositor
 +    // cannot move the view's layer from one process's surface to another's without hiding the app.
-+    configuration.setProcessSwapsOnNavigation(!g_getenv("WPE_BROWSER_NO_PROCESS_SWAP"));
++    configuration->setProcessSwapsOnNavigation(!g_getenv("WPE_BROWSER_NO_PROCESS_SWAP"));
  #endif
      if (priv->memoryPressureSettings) {
-         configuration.setMemoryPressureHandlerConfiguration(webkitMemoryPressureSettingsGetMemoryPressureHandlerConfiguration(priv->memoryPressureSettings));
+         configuration->setMemoryPressureHandlerConfiguration(webkitMemoryPressureSettingsGetMemoryPressureHandlerConfiguration(priv->memoryPressureSettings));

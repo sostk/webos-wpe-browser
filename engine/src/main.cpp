@@ -1587,10 +1587,16 @@ int main(int, char **)
     }
 
     // Grayscale text antialiasing: LCD subpixel AA (WPE's default, RGB) shows as coloured, soft glyph edges
-    // on a TV panel, more so once the page is scaled to the screen. 0xFF is not a WPE layout; WebKit
-    // patch 0003 reads it as "none". (Direct mode: fontconfig's rgba setting in the bundled fonts.conf.)
+    // on a TV panel, more so once the page is scaled to the screen. WPE 2.52+ has a "none" layout; before
+    // that, 0xFF (not a WPE layout) is read as "none" by WebKit patch 0003 (2.50 only).
+    // (Direct mode: fontconfig's rgba setting in the bundled fonts.conf.)
+#if WPE_PLATFORM_CHECK_VERSION(2, 52, 0)
+    const guint8 no_subpixel_layout = WPE_SETTINGS_SUBPIXEL_LAYOUT_NONE;
+#else
+    const guint8 no_subpixel_layout = 0xFF;
+#endif
     if (WPESettings *settings = g.display ? wpe_display_get_settings(g.display) : nullptr) {
-        if (!wpe_settings_set_byte(settings, WPE_SETTING_FONT_SUBPIXEL_LAYOUT, 0xFF, WPE_SETTINGS_SOURCE_PLATFORM, &error)) {
+        if (!wpe_settings_set_byte(settings, WPE_SETTING_FONT_SUBPIXEL_LAYOUT, no_subpixel_layout, WPE_SETTINGS_SOURCE_PLATFORM, &error)) {
             log_msg("font settings: %s", error->message);
             g_clear_error(&error);
         }

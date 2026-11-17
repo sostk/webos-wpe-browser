@@ -18,7 +18,7 @@ drivers, Wayland, PulseAudio and Widevine CDM are used.
 
 ## Engine
 
-WPE WebKit 2.50.5 (Skia), with the Baseline/DFG JavaScript JIT running on webOS's softfp ABI (patch 0004). Pages are
+WPE WebKit 2.52.6 (Skia), with the Baseline/DFG JavaScript JIT running on webOS's softfp ABI (patch 0004). Pages are
 painted on the CPU and composited with the TV's Mali GPU straight to the screen. See [patches.md](patches.md).
 
 ## Media

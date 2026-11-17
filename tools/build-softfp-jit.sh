@@ -24,6 +24,7 @@ case "${1:-status}" in
     echo "== $(date) start"
     mk() { make -C /build/buildroot O=/build/br-out BR2_EXTERNAL=/src/buildroot-external WPEB_SOFTFP_JIT=y BR2_JLEVEL=4 "$@"; }
     printf 'webkit\n' > /build/br-jit.status
+    sh /src/tools/patch-buildroot.sh /build/buildroot   # WPE WebKit version bump (buildroot-external/buildroot-patches)
     mk webos_browser_defconfig
     # Fresh WebKit tree: patches 0001-0004 applied by Buildroot, CMake reconfigured with the JIT and -mthumb.
     mk wpewebkit-dirclean

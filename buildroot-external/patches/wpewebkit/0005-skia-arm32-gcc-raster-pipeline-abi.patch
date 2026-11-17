@@ -8,9 +8,11 @@ channels' values: linear gradients, CSS masks and colour filters are drawn as
 vertical stripes. Use the attribute only with clang; GCC keeps the NEON stages
 with its default ABI (output identical to SKRP_CPU_SCALAR).
 
+---
+diff --git a/Source/ThirdParty/skia/src/opts/SkRasterPipeline_opts.h b/Source/ThirdParty/skia/src/opts/SkRasterPipeline_opts.h
 --- a/Source/ThirdParty/skia/src/opts/SkRasterPipeline_opts.h
 +++ b/Source/ThirdParty/skia/src/opts/SkRasterPipeline_opts.h
-@@ -1520,7 +1520,10 @@
+@@ -1520,7 +1520,10 @@ static constexpr size_t N = sizeof(F) / sizeof(float);
  
  // Any custom ABI to use for all (non-externally-facing) stage functions?
  // Also decide here whether to use narrow (compromise) or wide (ideal) stages.

@@ -35,6 +35,7 @@ case "${1:-status}" in
       chmod u-w "$inc"
     fi
     printf 'buildroot\n' > /build/br-hf.status
+    sh /src/tools/patch-buildroot.sh /build/buildroot   # WPE WebKit version bump (buildroot-external/buildroot-patches)
     make -C /build/buildroot O=/build/br-out-hf BR2_EXTERNAL=/src/buildroot-external webos_browser_hf_defconfig
     make -C /build/buildroot O=/build/br-out-hf BR2_JLEVEL=4
     printf 'stage\n' > /build/br-hf.status

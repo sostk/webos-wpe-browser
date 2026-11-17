@@ -803,3 +803,29 @@
   wpebVideo=software path). Untested on webOS 3.
 - PR #4 found that webOS 3.x's launcher shows a dark tile unless appinfo has "supportGIP": true. Its patch never
   set it (PKG_ prefix, option not declared); the kit now has SUPPORT_GIP (wnk_add_webos_package), which Wren sets.
+
+## 2026-11-17 WPE WebKit 2.52.6 (branch wpewebkit-2.52); 2.54 tried and dropped
+- Goal: move off 2.50.5. Current stable is 2.54.2, but 2.54 turned the 32-bit JSC JIT off and main has since deleted
+  it (318389@main; Igalia meta-webkit PR #602). Without the JIT, JS would be ~4x slower (desktop: 12.6 s interpreter vs
+  3.1 s, see the Cloudflare entry above).
+- 2.54 + ARMv7 JIT (user's choice, then dropped): four switches off (PlatformEnable ENABLE_JIT/DFG, Options.h
+  jitEnabledByDefault, OptionsList useDFGJIT and forceICFailure) and ~10 32-bit build errors; with those fixed JSC
+  builds and links, but every indexed store crashes in the Baseline JIT on softfp and hard-float alike: 2.54's
+  BaselineJITData always holds HandlerPropertyInlineCache, whose generators are empty stubs on 32-bit
+  (operationPutByValSloppyOptimize -> repatchArrayPutByVal -> addAccessCase -> listedAccessCases). Fixing it means
+  porting ~3000 lines of handler-IC code. Patches, test scripts and repros: ../wpe-2.54-jit-attempt/ (outside the repo).
+- 2.52.6 (last series with the ARMv7 JIT): patches 0001, 0005, 0008 unchanged; 0002, 0004, 0006, 0007, 0009 rebased;
+  all apply with --fuzz=0 to the release tarball. 0003 dropped: 2.52 has WPE_SETTINGS_SUBPIXEL_LAYOUT_NONE, which the
+  engine now sets (WPE_PLATFORM_CHECK_VERSION(2, 52, 0); 0xFF stays for 2.50). WebAssembly keeps its 32-bit tiers.
+- Buildroot master still has 2.50.5: buildroot-external/buildroot-patches/0001 bumps package/wpewebkit (version,
+  hashes); tools/patch-buildroot.sh applies it (idempotent), called by build-softfp-jit.sh and build-hf.sh. All of
+  Buildroot's CMake options exist in 2.52; GCC minimum 12.2.
+- JIT check (PORT=JSCOnly, Debian GCC 14 cross build, -march=armv7-a -mfpu=neon -mfloat-abi=softfp -mthumb, QEMU):
+  useJIT/useDFGJIT on, Baseline and DFG compile; tools/jsc-softfp/run.sh boundary.js identical in Baseline and DFG
+  (36 compilations, WebAssembly included); array and typed-array stores (the 2.54 crash) match the interpreter.
+  Not yet: a full Buildroot engine build and a TV run.
+- Build setup on this PC (2026-11-17): Podman with a `docker` shim in ~/.local/bin (`run` gets --userns=keep-id);
+  docker/run.sh now mounts the repo it lives in instead of a fixed path. webOS NDK 2026.08-webos at
+  ~/webos-ndk/arm-webos-linux-gnueabi_sdk-buildroot. Buildroot cdd3776b at ~/webos-browser-build/buildroot with the
+  bump applied. The kit's five Wren patches are all upstream in its pinned commit, so apply-kit-patches.sh reports
+  errors for 0002 and 0005 (merged in a different form, 6bf42cc); nothing is missing.

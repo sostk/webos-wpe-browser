@@ -13,6 +13,7 @@ cell were always mapped). The header pointer now goes through an empty volatile
 asm inside the branches that need it.
 
 ---
+diff --git a/Source/JavaScriptCore/runtime/IndexingHeaderInlines.h b/Source/JavaScriptCore/runtime/IndexingHeaderInlines.h
 --- a/Source/JavaScriptCore/runtime/IndexingHeaderInlines.h
 +++ b/Source/JavaScriptCore/runtime/IndexingHeaderInlines.h
 @@ -31,12 +31,26 @@
@@ -43,7 +44,7 @@ asm inside the branches that need it.
  }
  
  inline size_t IndexingHeader::indexingPayloadSizeInBytes(Structure* structure)
-@@ -46,10 +60,10 @@
+@@ -46,10 +60,10 @@ inline size_t IndexingHeader::indexingPayloadSizeInBytes(Structure* structure)
      case ALL_INT32_INDEXING_TYPES:
      case ALL_DOUBLE_INDEXING_TYPES:
      case ALL_CONTIGUOUS_INDEXING_TYPES:

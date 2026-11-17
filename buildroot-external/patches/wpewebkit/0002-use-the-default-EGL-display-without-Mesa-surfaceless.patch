@@ -17,7 +17,29 @@ with CPU Skia painting. GPU Skia painting corrupts tiles; app-jail validation
 remains pending. Keep Mesa as the default fallback. See NOTES.md.
 Upstream: not sent yet.
 Signed-off-by: webos-wpe-browser <poudelswastik@gmail.com>
+
 ---
+diff --git a/Source/WebCore/platform/graphics/egl/GLContext.cpp b/Source/WebCore/platform/graphics/egl/GLContext.cpp
+--- a/Source/WebCore/platform/graphics/egl/GLContext.cpp
++++ b/Source/WebCore/platform/graphics/egl/GLContext.cpp
+@@ -243,11 +243,14 @@ std::unique_ptr<GLContext> GLContext::createOffscreenContext(GLDisplay& display,
+ #endif
+ #if USE(GBM)
+     case Target::GBM:
+-#endif
+-    case Target::Surfaceless:
+         // Do not fallback to pbuffers.
+         RELEASE_LOG_INFO(Compositing, "Could not create EGL surfaceless context: %s.", lastErrorString());
+         return nullptr;
++#endif
++    case Target::Surfaceless:
++        // A vendor EGL used through its default display (see PlatformDisplaySurfaceless) may lack
++        // EGL_KHR_surfaceless_context; a 1x1 pbuffer gives the same offscreen context there.
++        break;
+     default:
+         break;
+     }
+diff --git a/Source/WebCore/platform/graphics/egl/PlatformDisplaySurfaceless.cpp b/Source/WebCore/platform/graphics/egl/PlatformDisplaySurfaceless.cpp
 --- a/Source/WebCore/platform/graphics/egl/PlatformDisplaySurfaceless.cpp
 +++ b/Source/WebCore/platform/graphics/egl/PlatformDisplaySurfaceless.cpp
 @@ -28,34 +28,52 @@
@@ -41,16 +63,15 @@ Signed-off-by: webos-wpe-browser <poudelswastik@gmail.com>
 -        glDisplay = GLDisplay::create(eglGetPlatformDisplayEXT(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, nullptr));
 -    else if (GLContext::isExtensionSupported(extensions, "EGL_KHR_platform_base"))
 -        glDisplay = GLDisplay::create(eglGetPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, nullptr));
--
--    if (!glDisplay) {
--        WTFLogAlways("Could not create surfaceless EGL display: %s. Aborting...", GLContext::lastErrorString());
--        CRASH();
 +    if (mesaSurfaceless) {
 +        if (GLContext::isExtensionSupported(extensions, "EGL_EXT_platform_base"))
 +            glDisplay = GLDisplay::create(eglGetPlatformDisplayEXT(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, nullptr));
 +        else if (GLContext::isExtensionSupported(extensions, "EGL_KHR_platform_base"))
 +            glDisplay = GLDisplay::create(eglGetPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, nullptr));
-+
+ 
+-    if (!glDisplay) {
+-        WTFLogAlways("Could not create surfaceless EGL display: %s. Aborting...", GLContext::lastErrorString());
+-        CRASH();
 +        if (!glDisplay) {
 +            WTFLogAlways("Could not create surfaceless EGL display: %s. Aborting...", GLContext::lastErrorString());
 +            CRASH();
@@ -77,7 +98,7 @@ Signed-off-by: webos-wpe-browser <poudelswastik@gmail.com>
  
 -PlatformDisplaySurfaceless::PlatformDisplaySurfaceless(Ref<GLDisplay>&& glDisplay)
 +PlatformDisplaySurfaceless::PlatformDisplaySurfaceless(Ref<GLDisplay>&& glDisplay, bool mesaSurfaceless)
-     : PlatformDisplay(WTFMove(glDisplay))
+     : PlatformDisplay(WTF::move(glDisplay))
 +    , m_mesaSurfaceless(mesaSurfaceless)
  {
  #if ENABLE(WEBGL)
@@ -86,9 +107,10 @@ Signed-off-by: webos-wpe-browser <poudelswastik@gmail.com>
      m_angleNativeDisplay = EGL_DEFAULT_DISPLAY;
  #endif
  }
+diff --git a/Source/WebCore/platform/graphics/egl/PlatformDisplaySurfaceless.h b/Source/WebCore/platform/graphics/egl/PlatformDisplaySurfaceless.h
 --- a/Source/WebCore/platform/graphics/egl/PlatformDisplaySurfaceless.h
 +++ b/Source/WebCore/platform/graphics/egl/PlatformDisplaySurfaceless.h
-@@ -34,10 +34,16 @@
+@@ -34,10 +34,16 @@ public:
      static std::unique_ptr<PlatformDisplaySurfaceless> create();
  
      virtual ~PlatformDisplaySurfaceless();
@@ -106,22 +128,3 @@ Signed-off-by: webos-wpe-browser <poudelswastik@gmail.com>
  };
  
  } // namespace WebCore
---- a/Source/WebCore/platform/graphics/egl/GLContext.cpp
-+++ b/Source/WebCore/platform/graphics/egl/GLContext.cpp
-@@ -241,11 +241,14 @@
- #endif
- #if USE(GBM)
-     case Target::GBM:
--#endif
--    case Target::Surfaceless:
-         // Do not fallback to pbuffers.
-         RELEASE_LOG_INFO(Compositing, "Could not create EGL surfaceless context: %s.", lastErrorString());
-         return nullptr;
-+#endif
-+    case Target::Surfaceless:
-+        // A vendor EGL used through its default display (see PlatformDisplaySurfaceless) may lack
-+        // EGL_KHR_surfaceless_context; a 1x1 pbuffer gives the same offscreen context there.
-+        break;
-     default:
-         break;
-     }

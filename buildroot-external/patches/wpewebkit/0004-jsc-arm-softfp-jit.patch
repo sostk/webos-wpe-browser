@@ -18,10 +18,11 @@ ARM_THUMB2 UnaryDoubleOpWrapper in ThunkGenerators.cpp). Do the same here:
 LLInt and IPInt pass only pointers/ints to C; the JIT-to-JIT conventions (JSToWasm/WasmToJS
 argument shuffles) do not involve the C ABI and are unchanged.
 
-diff -ru a/Source/JavaScriptCore/jit/CCallHelpers.h b/Source/JavaScriptCore/jit/CCallHelpers.h
---- a/Source/JavaScriptCore/jit/CCallHelpers.h	2026-11-10 22:44:27.013228658 +1100
-+++ b/Source/JavaScriptCore/jit/CCallHelpers.h	2026-11-10 22:45:35.699509659 +1100
-@@ -208,6 +208,7 @@
+---
+diff --git a/Source/JavaScriptCore/jit/CCallHelpers.h b/Source/JavaScriptCore/jit/CCallHelpers.h
+--- a/Source/JavaScriptCore/jit/CCallHelpers.h
++++ b/Source/JavaScriptCore/jit/CCallHelpers.h
+@@ -210,6 +210,7 @@ private:
              fprDestinations.fill(InvalidFPRReg);
              crossSources.fill(InvalidFPRReg);
              crossDestinations.fill(InvalidGPRReg);
@@ -29,7 +30,7 @@ diff -ru a/Source/JavaScriptCore/jit/CCallHelpers.h b/Source/JavaScriptCore/jit/
          }
  
          template<unsigned a, unsigned b, unsigned c, unsigned d, unsigned e, unsigned f, unsigned g, unsigned h>
-@@ -219,6 +220,7 @@
+@@ -221,6 +222,7 @@ private:
              fprDestinations = other.fprDestinations;
              crossSources = other.crossSources;
              crossDestinations = other.crossDestinations;
@@ -37,7 +38,7 @@ diff -ru a/Source/JavaScriptCore/jit/CCallHelpers.h b/Source/JavaScriptCore/jit/
          }
  
          ArgCollection<numGPRArgs + 1, numGPRSources + 1, numFPRArgs, numFPRSources, numCrossSources, extraGPRArgs, nonArgGPRs, extraPoke> pushRegArg(GPRReg argument, GPRReg destination)
-@@ -248,6 +250,19 @@
+@@ -250,6 +252,19 @@ private:
              return result;
          }
  
@@ -57,7 +58,7 @@ diff -ru a/Source/JavaScriptCore/jit/CCallHelpers.h b/Source/JavaScriptCore/jit/
          ArgCollection<numGPRArgs, numGPRSources + 1, numFPRArgs, numFPRSources, numCrossSources, extraGPRArgs + 1, nonArgGPRs, extraPoke> pushExtraRegArg(GPRReg argument, GPRReg destination)
          {
              ArgCollection<numGPRArgs, numGPRSources + 1, numFPRArgs, numFPRSources, numCrossSources, extraGPRArgs + 1, nonArgGPRs, extraPoke> result(*this);
-@@ -305,8 +320,16 @@
+@@ -307,8 +322,16 @@ private:
          // store FPR -> GPR assignments
          std::array<FPRReg, GPRInfo::numberOfRegisters> crossSources;
          std::array<GPRReg, GPRInfo::numberOfRegisters> crossDestinations;
@@ -74,7 +75,7 @@ diff -ru a/Source/JavaScriptCore/jit/CCallHelpers.h b/Source/JavaScriptCore/jit/
      template<unsigned TargetSize, typename RegType>
      std::array<RegType, TargetSize> clampArrayToSize(std::array<RegType, InfoTypeForReg<RegType>::numberOfRegisters> sourceArray)
      {
-@@ -329,7 +352,7 @@
+@@ -331,7 +354,7 @@ private:
      ALWAYS_INLINE unsigned calculatePokeOffset(unsigned currentGPRArgument, unsigned currentFPRArgument, unsigned numCrossSources, unsigned extraGPRArgs, unsigned nonArgGPRs, unsigned extraPoke)
      {
          // Clang claims that it cannot find the symbol for FPRReg/GPRReg::numberOfArgumentRegisters when they are passed directly to std::max... seems like a bug
@@ -83,7 +84,7 @@ diff -ru a/Source/JavaScriptCore/jit/CCallHelpers.h b/Source/JavaScriptCore/jit/
          unsigned numberOfGPArgumentRegisters = GPRInfo::numberOfArgumentRegisters;
  
          UNUSED_PARAM(nonArgGPRs);
-@@ -421,12 +444,48 @@
+@@ -423,12 +446,48 @@ private:
  #else // USE(JSVALUE64)
  #if CPU(ARM_THUMB2)
  
@@ -133,7 +134,7 @@ diff -ru a/Source/JavaScriptCore/jit/CCallHelpers.h b/Source/JavaScriptCore/jit/
          unsigned numberOfFPArgumentRegisters = FPRInfo::numberOfArgumentRegisters;
          unsigned currentFPArgCount = argSourceRegs.argCount(arg);
  
-@@ -444,6 +503,7 @@
+@@ -446,6 +505,7 @@ private:
              pokeForArgument(arg, numGPRArgs, numFPRArgs, numCrossSources, extraGPRArgs, nonArgGPRs, extraPoke + 1);
              setupArgumentsImpl<OperationType>(argSourceRegs.addStackArg(arg).addPoke().addPoke(), args...);
          }
@@ -141,7 +142,7 @@ diff -ru a/Source/JavaScriptCore/jit/CCallHelpers.h b/Source/JavaScriptCore/jit/
      }
  
      template<typename OperationType, unsigned numGPRArgs, unsigned numGPRSources, unsigned numFPRArgs, unsigned numFPRSources, unsigned numCrossSources, unsigned extraGPRArgs, unsigned nonArgGPRs, unsigned extraPoke, typename... Args>
-@@ -669,7 +729,14 @@
+@@ -659,7 +719,14 @@ private:
          static_assert(fprArgsCount<TraitsType>(std::make_index_sequence<TraitsType::arity>()) == numFPRArgs);
  
          shuffleRegisters<GPRReg, numGPRSources>(clampArrayToSize<numGPRSources, GPRReg>(argSourceRegs.gprSources), clampArrayToSize<numGPRSources, GPRReg>(argSourceRegs.gprDestinations));
@@ -156,7 +157,7 @@ diff -ru a/Source/JavaScriptCore/jit/CCallHelpers.h b/Source/JavaScriptCore/jit/
  
          shuffleRegisters<FPRReg, numFPRSources>(clampArrayToSize<numFPRSources, FPRReg>(argSourceRegs.fprSources), clampArrayToSize<numFPRSources, FPRReg>(argSourceRegs.fprDestinations));
      }
-@@ -750,8 +817,14 @@
+@@ -740,8 +807,14 @@ public:
      
      void setupResults(FPRReg destA)
      {
@@ -171,10 +172,10 @@ diff -ru a/Source/JavaScriptCore/jit/CCallHelpers.h b/Source/JavaScriptCore/jit/
      }
  
      void jumpToExceptionHandler(VM& vm)
-diff -ru a/Source/JavaScriptCore/runtime/OptionsList.h b/Source/JavaScriptCore/runtime/OptionsList.h
---- a/Source/JavaScriptCore/runtime/OptionsList.h	2026-11-10 22:44:27.024889618 +1100
-+++ b/Source/JavaScriptCore/runtime/OptionsList.h	2026-11-10 22:44:40.967639720 +1100
-@@ -38,6 +38,15 @@
+diff --git a/Source/JavaScriptCore/runtime/OptionsList.h b/Source/JavaScriptCore/runtime/OptionsList.h
+--- a/Source/JavaScriptCore/runtime/OptionsList.h
++++ b/Source/JavaScriptCore/runtime/OptionsList.h
+@@ -38,6 +38,15 @@ using WTF::PrintStream;
  
  namespace JSC {
  
@@ -190,19 +191,19 @@ diff -ru a/Source/JavaScriptCore/runtime/OptionsList.h b/Source/JavaScriptCore/r
  #define MAXIMUM_NUMBER_OF_FTL_COMPILER_THREADS 8
  
  JS_EXPORT_PRIVATE bool canUseJITCage();
-@@ -557,7 +566,7 @@
+@@ -568,7 +577,7 @@ bool hasCapacityToUseLargeGigacage();
+     v(Bool, verboseBBQJITAllocation, false, Normal, "Logs extra information about register allocation during BBQ JIT"_s) \
      v(Bool, verboseBBQJITInstructions, false, Normal, "Logs instruction information during BBQ JIT"_s) \
      v(Bool, disableBBQConsts, false, Normal, "Wasm <type>.const instructions in BBQ JIT won't lower to a const BBQ::Value"_s) \
-     v(Bool, useWasmLLInt, true, Normal, nullptr) \
 -    v(Bool, useBBQJIT, true, Normal, "allows the BBQ JIT to be used if true"_s) \
 +    v(Bool, useBBQJIT, !isARMSoftFPVFP(), Normal, "allows the BBQ JIT to be used if true (off for ARM softfp: its C calls still assume hardfp)"_s) \
      v(Bool, useOMGJIT, !isARM_THUMB2(), Normal, "allows the OMG JIT to be used if true"_s) \
-     v(Bool, useWasmLLIntPrologueOSR, true, Normal, "allows prologue OSR from wasm LLInt if true"_s) \
-     v(Bool, useWasmLLIntLoopOSR, true, Normal, "allows loop OSR from wasm LLInt if true"_s) \
-diff -ru a/Source/JavaScriptCore/wasm/js/WasmToJS.cpp b/Source/JavaScriptCore/wasm/js/WasmToJS.cpp
---- a/Source/JavaScriptCore/wasm/js/WasmToJS.cpp	2026-11-10 22:44:27.019060631 +1100
-+++ b/Source/JavaScriptCore/wasm/js/WasmToJS.cpp	2026-11-10 22:44:40.967756521 +1100
-@@ -405,7 +405,11 @@
+     v(OptionRange, wasmFunctionIndexRangeToCompile, nullptr, Normal, "wasm function index range to allow compilation on, e.g. 1:100"_s) \
+     v(Bool, useEagerWasmModuleHashing, false, Normal, "Unnamed Wasm modules are identified in backtraces through their hash, if available."_s) \
+diff --git a/Source/JavaScriptCore/wasm/js/WasmToJS.cpp b/Source/JavaScriptCore/wasm/js/WasmToJS.cpp
+--- a/Source/JavaScriptCore/wasm/js/WasmToJS.cpp
++++ b/Source/JavaScriptCore/wasm/js/WasmToJS.cpp
+@@ -415,7 +415,11 @@ Expected<MacroAssemblerCodeRef<WasmEntryPtrTag>, BindingFailure> wasmToJS(TypeIn
              jit.callOperation<OperationPtrTag>(operationConvertToF32);
              jit.loadPtr(CCallHelpers::Address(GPRInfo::wasmContextInstancePointer, JSWebAssemblyInstance::offsetOfVM()), GPRInfo::nonPreservedNonReturnGPR);
              exceptionChecks.append(jit.branchTestPtr(CCallHelpers::NonZero, CCallHelpers::Address(GPRInfo::nonPreservedNonReturnGPR, VM::exceptionOffset())));
@@ -214,7 +215,7 @@ diff -ru a/Source/JavaScriptCore/wasm/js/WasmToJS.cpp b/Source/JavaScriptCore/wa
              done.link(&jit);
              break;
          }
-@@ -433,7 +437,11 @@
+@@ -443,7 +447,11 @@ Expected<MacroAssemblerCodeRef<WasmEntryPtrTag>, BindingFailure> wasmToJS(TypeIn
              jit.callOperation<OperationPtrTag>(operationConvertToF64);
              jit.loadPtr(CCallHelpers::Address(GPRInfo::wasmContextInstancePointer, JSWebAssemblyInstance::offsetOfVM()), GPRInfo::nonPreservedNonReturnGPR);
              exceptionChecks.append(jit.branchTestPtr(CCallHelpers::NonZero, CCallHelpers::Address(GPRInfo::nonPreservedNonReturnGPR, VM::exceptionOffset())));
@@ -226,9 +227,9 @@ diff -ru a/Source/JavaScriptCore/wasm/js/WasmToJS.cpp b/Source/JavaScriptCore/wa
              done.link(&jit);
              break;
          }
-diff -ru a/Source/WTF/wtf/PlatformCPU.h b/Source/WTF/wtf/PlatformCPU.h
---- a/Source/WTF/wtf/PlatformCPU.h	2026-11-10 22:44:27.001269492 +1100
-+++ b/Source/WTF/wtf/PlatformCPU.h	2026-11-10 22:44:40.967342938 +1100
+diff --git a/Source/WTF/wtf/PlatformCPU.h b/Source/WTF/wtf/PlatformCPU.h
+--- a/Source/WTF/wtf/PlatformCPU.h
++++ b/Source/WTF/wtf/PlatformCPU.h
 @@ -142,6 +142,14 @@
  #define WTF_CPU_ARM_HARDFP 1
  #endif
@@ -244,10 +245,10 @@ diff -ru a/Source/WTF/wtf/PlatformCPU.h b/Source/WTF/wtf/PlatformCPU.h
  /* Set WTF_ARM_ARCH_VERSION */
  #if   defined(__ARM_ARCH_4__) \
      || defined(__ARM_ARCH_4T__) \
-diff -ru a/Source/WTF/wtf/PlatformEnable.h b/Source/WTF/wtf/PlatformEnable.h
---- a/Source/WTF/wtf/PlatformEnable.h	2026-11-10 22:44:27.007194336 +1100
-+++ b/Source/WTF/wtf/PlatformEnable.h	2026-11-10 22:44:40.967486326 +1100
-@@ -637,7 +637,7 @@
+diff --git a/Source/WTF/wtf/PlatformEnable.h b/Source/WTF/wtf/PlatformEnable.h
+--- a/Source/WTF/wtf/PlatformEnable.h
++++ b/Source/WTF/wtf/PlatformEnable.h
+@@ -725,7 +725,7 @@
  #endif
  
  #if USE(JSVALUE32_64)

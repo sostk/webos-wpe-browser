@@ -9,11 +9,12 @@ garbage pointer and the web process crashes (SIGSEGV, fault address 0x1, in
 param_spec_pool_hash) when an MSE/blob: video is set up with playbin3.
 
 ---
---- a/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp	2026-11-11 16:48:28.819616884 +1100
-+++ b/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp	2026-11-11 16:48:28.820671524 +1100
-@@ -2681,7 +2681,7 @@
+diff --git a/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp b/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
+--- a/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
++++ b/Source/WebCore/platform/graphics/gstreamer/MediaPlayerPrivateGStreamer.cpp
+@@ -2739,7 +2739,7 @@ void MediaPlayerPrivateGStreamer::configureElement(GstElement* element)
      // mode. Some demuxers (matroskademux) don't work as well in push mode.
-     if (nameView.startsWith("urisourcebin"_s) && !m_isLegacyPlaybin && m_preload == MediaPlayer::Preload::Auto) {
+     if (startsWith(name.span(), "urisourcebin"_s) && !m_isLegacyPlaybin && m_preload == MediaPlayer::Preload::Auto) {
          if (isBlob)
 -            g_object_set(element, "ring-buffer-max-size", 2 * MB, nullptr);
 +            g_object_set(element, "ring-buffer-max-size", static_cast<guint64>(2 * MB), nullptr);

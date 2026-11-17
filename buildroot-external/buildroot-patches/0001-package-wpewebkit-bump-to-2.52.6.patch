@@ -1,0 +1,34 @@
+package/wpewebkit: bump to version 2.52.6
+
+Buildroot master (as of 2026-11) still has 2.50.5. 2.52 is the last WPE WebKit series with the ARMv7
+JavaScript JIT (2.54 switched it off; main deleted it). Applied to the Buildroot checkout by
+tools/patch-buildroot.sh (webOS browser).
+
+---
+diff --git a/package/wpewebkit/wpewebkit.hash b/package/wpewebkit/wpewebkit.hash
+--- a/package/wpewebkit/wpewebkit.hash
++++ b/package/wpewebkit/wpewebkit.hash
+@@ -1,7 +1,7 @@
+-# From https://wpewebkit.org/releases/wpewebkit-2.50.5.tar.xz.sums
+-md5  1d81485379005cca0236a278706f194f  wpewebkit-2.50.5.tar.xz
+-sha1  dd56b76eff8ba157a0291c0b61220666eed59313  wpewebkit-2.50.5.tar.xz
+-sha256  de4bfd20bfc921cdfc77e839ee4da84e2674bcb58b2f916172978d62fa115fc2  wpewebkit-2.50.5.tar.xz
++# From https://wpewebkit.org/releases/wpewebkit-2.52.6.tar.xz.sums
++md5  a5ab0470904d86e22680e7e89dd88035  wpewebkit-2.52.6.tar.xz
++sha1  92b315bda8ef52ec131bddceccdbc5465c804847  wpewebkit-2.52.6.tar.xz
++sha256  b2bafef2751625b7fdf530f230ff0f542ff0eeba3590c3a989d931b2a55c858e  wpewebkit-2.52.6.tar.xz
+ 
+ # Hashes for license files:
+ sha256  0b5d3a7cc325942567373b0ecd757d07c132e0ebd7c97bfc63f7e1a76094edb4  Source/WebCore/LICENSE-APPLE
+diff --git a/package/wpewebkit/wpewebkit.mk b/package/wpewebkit/wpewebkit.mk
+--- a/package/wpewebkit/wpewebkit.mk
++++ b/package/wpewebkit/wpewebkit.mk
+@@ -5,7 +5,7 @@
+ ################################################################################
+ 
+ # The middle number is even for stable releases, odd for development ones.
+-WPEWEBKIT_VERSION = 2.50.5
++WPEWEBKIT_VERSION = 2.52.6
+ WPEWEBKIT_SITE = https://wpewebkit.org/releases
+ WPEWEBKIT_SOURCE = wpewebkit-$(WPEWEBKIT_VERSION).tar.xz
+ WPEWEBKIT_INSTALL_STAGING = YES

@@ -14,13 +14,20 @@ rendering in the installed app. This native patch has not yet been
 validated in a full rebuilt WebKit on the TV.
 
 ---
+diff --git a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp
 --- a/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp
 +++ b/Source/WebKit/WebProcess/WebPage/CoordinatedGraphics/AcceleratedSurface.cpp
-@@ -38,2 +38,3 @@
+@@ -38,6 +38,7 @@
+ #include <array>
+ #include <fcntl.h>
  #include <unistd.h>
 +#include <utility>
  #include <wtf/SafeStrerror.h>
-@@ -366,3 +367,15 @@
+ #include <wtf/SystemTracing.h>
+ #include <wtf/TZoneMallocInlines.h>
+@@ -513,7 +514,19 @@ AcceleratedSurface::RenderTargetSHMImage::~RenderTargetSHMImage()
+ 
+ void AcceleratedSurface::RenderTargetSHMImage::didRenderFrame(Vector<IntRect, 1>&& damageRects)
  {
 -    glReadPixels(0, 0, m_bitmap->size().width(), m_bitmap->size().height(), GL_BGRA, GL_UNSIGNED_BYTE, m_bitmap->mutableSpan().data());
 +    bool supportsBGRAReadback = true;
@@ -36,4 +43,6 @@ validated in a full rebuilt WebKit on the TV.
 +        for (size_t offset = 0; offset < pixels.size(); offset += 4)
 +            std::swap(pixels[offset], pixels[offset + 2]);
 +    }
-     RenderTargetShareableBuffer::didRenderFrame(WTFMove(damageRects));
+     RenderTargetShareableBuffer::didRenderFrame(WTF::move(damageRects));
+ }
+ 
