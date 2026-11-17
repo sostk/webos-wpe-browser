@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "media_server.hpp"
+#include "app_id.hpp"
 
 #include "wpe_media_ipc.h"
 #include "wnk/log.hpp"
@@ -81,7 +82,7 @@ bool MediaServer::start(const std::string &path, bool video_window, bool acb, st
             return false;
         }
         wnk::media::StarfishOptions o;
-        o.app_id = "org.sostk.wpebrowser";
+        o.app_id = WPEB_APP_ID;
         auto starfish = std::make_unique<wnk::media::StarfishBackend>(o);
         if (starfish->plane() != wnk::media::VideoPlane::Acb) {
             *why = "ACB: libAcbAPI unusable (see the starfish lines)";
@@ -335,7 +336,7 @@ void MediaServer::serve(int fd, uint64_t id) {
             a.rate = static_cast<int>(audio_format.rate);
             a.channels = static_cast<int>(audio_format.channels);
             a.header = audio_header;
-            use_lg_ = lg_.load("org.sostk.wpebrowser", l.window_id, c, static_cast<int>(l.width),
+            use_lg_ = lg_.load(WPEB_APP_ID, l.window_id, c, static_cast<int>(l.width),
                                static_cast<int>(l.height), l.fps_milli / 1000.0, with_audio ? &a : nullptr, &error);
             if (use_lg_) lg_.set_hdr(l.hdr);
             if (!use_lg_) WNK_LOGW(kCat, "stream %llu: LG media pipeline: %s; trying NDL", static_cast<unsigned long long>(id), error.c_str());

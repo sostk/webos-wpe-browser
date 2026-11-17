@@ -24,6 +24,14 @@ cd browser && ./build.sh webos                # build/webos-release/dist/org.sos
 - Check a package against LG firmware images offline:
   `third_party/webos-native-app-kit/tools/fw-check.py --min-release 1.0.0 <ipk>` (needs the webosbrew firmware symbol
   inventory; see the kit's docs).
+- A test package that installs next to the normal Wren: its own app id and title, and an engine staged with the
+  loader path of that id (the runtime folder is `/tmp/<app id>`):
+  ```sh
+  docker/run.sh 'LOADER_LINK=/tmp/org.sostk.wpebrowser.webkit252/ld-linux.so.3 OUT=/src/build/engine-stage-jit-252/engine ENGINE_BUILD=/build/engine-build sh /src/tools/stage-engine.sh'
+  cd browser && cmake --preset webos-release -B build/webos-252 -DWPEB_ENGINE_STAGE="$PWD/../build/engine-stage-jit-252/engine" \
+      -DWPEB_APP_ID=org.sostk.wpebrowser.webkit252 -DWPEB_APP_TITLE="Wren 2.52"
+  cmake --build build/webos-252 -j8 && cmake --build build/webos-252 --target wnk-ipks   # needs WEBOS_NDK / the kit's resolve_ndk
+  ```
 
 See [NOTES.md](../NOTES.md) for the toolchain details.
 

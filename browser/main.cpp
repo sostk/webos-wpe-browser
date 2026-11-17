@@ -13,6 +13,7 @@
 // Back goes back in history, or to the panel when there is none. Hold OK = quick actions. CH+/CH- = next/previous
 // tab. Colour keys, when the remote has them: Red = all tabs, Green = bookmarks, Yellow = quick actions (zoom),
 // Blue = new tab. The Magic Remote pointer is a mouse in pages and its wheel scrolls.
+#include "app_id.hpp"
 #include "chrome.hpp"
 #include "wren_ui.hpp"
 #include "direct_owner.hpp"
@@ -1513,8 +1514,8 @@ bool BrowserScreen::on_back(wnk::ui::Ui &ui) {
 
 int main(int argc, char **argv) {
     wnk::app::AppConfig config;
-    config.fallback_app_id = "org.sostk.wpebrowser";
-    config.title = "Wren";
+    config.fallback_app_id = WPEB_APP_ID;
+    config.title = WPEB_APP_TITLE;
     config.font_regular = "fonts/Manrope-Regular.ttf";
     config.font_bold = "fonts/Manrope-SemiBold.ttf";
     config.script_env_prefix = "APP_WPEBROWSER";

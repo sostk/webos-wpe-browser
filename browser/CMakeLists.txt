@@ -28,6 +28,12 @@ else ()
     message(STATUS "wpebrowser: no staged engine; the package will show 'engine not found'")
 endif ()
 
+# App id and launcher title (app_id.hpp). Change both to install a test build next to the normal one; restage the engine
+# with LOADER_LINK=/tmp/<id>/ld-linux.so.3 to match (tools/stage-engine.sh).
+set(WPEB_APP_ID "org.sostk.wpebrowser" CACHE STRING "webOS app id")
+set(WPEB_APP_TITLE "Wren" CACHE STRING "Launcher title")
+add_compile_definitions(WPEB_APP_ID="${WPEB_APP_ID}" WPEB_APP_TITLE="${WPEB_APP_TITLE}")
+
 add_executable(wpebrowser main.cpp chrome.cpp screens.cpp profile.cpp storage.cpp private_loader.cpp engine_client.cpp page_view.cpp keys.cpp direct_owner.cpp media_server.cpp lg_media_player.cpp wren_ui.cpp log_export.cpp)
 target_include_directories(wpebrowser PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../common")
 target_link_libraries(wpebrowser PRIVATE wnk_app wnk_media_ndl wnk_media_starfish ${CMAKE_DL_LIBS})
@@ -48,8 +54,8 @@ add_custom_command(TARGET wpebrowser POST_BUILD
 
 wnk_add_webos_package(
         TARGET wpebrowser
-        APPID org.sostk.wpebrowser
-        TITLE "Wren"
+        APPID "${WPEB_APP_ID}"
+        TITLE "${WPEB_APP_TITLE}"
         VERSION 0.3.4
         VENDOR "sostk"
         ICON "${CMAKE_CURRENT_SOURCE_DIR}/icon.png"
