@@ -9,6 +9,9 @@ WPEWEBKIT_CONF_OPTS += \
 	-DENABLE_WPE_PLATFORM_DRM=OFF \
 	-DENABLE_WPE_PLATFORM_WAYLAND=OFF
 
+# WPE WebKit 2.52 turns USE_LIBHYPHEN on by default; Buildroot has no libhyphen package (2.50 built without it too).
+WPEWEBKIT_CONF_OPTS += -DUSE_LIBHYPHEN=OFF
+
 # HTTPS trust: the GnuTLS runtime patch accepts WPE_BROWSER_CA_FILE, set to the
 # immutable bundled CA list by EngineClient. The configured path is only a fallback
 # for older launchers; normal app startup no longer writes a shared /tmp file.

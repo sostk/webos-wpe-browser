@@ -3,6 +3,7 @@
 # softfp engine with the JavaScript JIT (patch 0004, docs/webkit-like-chromium.md). Local only: no device commands.
 #   bash tools/build-softfp-jit.sh start     detached: WebKit dirclean + rebuild (Thumb-2, JIT) -> jsc shell -> stage
 #   bash tools/build-softfp-jit.sh status
+# Parallel jobs: WPEB_JOBS (default 8). WebCore unified sources peak at ~3.7 GB per cc1plus; 14 jobs ran a 30 GB machine out of memory.
 # Output: build/engine-stage-jit/engine (the interpreter build in build/engine-stage stays as the fallback),
 # jsc shell at ~/webos-browser-build/br-out/build/wpewebkit-*/bin/jsc. Then on the host:
 #   bash tools/jsc-softfp/run.sh <jsc> <lib dir>   and   bash tools/js-probe.sh build/engine-stage-jit/engine
@@ -16,13 +17,14 @@ case "${1:-status}" in
     test -f "$project/buildroot-external/patches/wpewebkit/0004-jsc-arm-softfp-jit.patch"
     printf 'starting\n' > "$build_root/br-jit.status"
     docker run --detach --rm --name "$container" --user "$(id -u):$(id -g)" -e HOME=/build \
+      -e WPEB_JOBS="${WPEB_JOBS:-8}" \
       -v "$project:/src" -v "$build_root:/build" -w /build webos-browser-build:1 \
       bash /src/tools/build-softfp-jit.sh inside ;;
   inside)
     exec >> /build/br-jit.log 2>&1
     trap 'result=$?; printf "exit=%d\n" "$result" > /build/br-jit.status' EXIT
     echo "== $(date) start"
-    mk() { make -C /build/buildroot O=/build/br-out BR2_EXTERNAL=/src/buildroot-external WPEB_SOFTFP_JIT=y BR2_JLEVEL=4 "$@"; }
+    mk() { make -C /build/buildroot O=/build/br-out BR2_EXTERNAL=/src/buildroot-external WPEB_SOFTFP_JIT=y BR2_JLEVEL="${WPEB_JOBS:-8}" "$@"; }
     printf 'webkit\n' > /build/br-jit.status
     sh /src/tools/patch-buildroot.sh /build/buildroot   # WPE WebKit version bump (buildroot-external/buildroot-patches)
     mk webos_browser_defconfig
@@ -34,7 +36,7 @@ case "${1:-status}" in
     grep -q '^ENABLE_JIT:BOOL=ON' "$wk/CMakeCache.txt" || { echo "JIT is not enabled in the WebKit configuration" >&2; exit 1; }
     printf 'jsc\n' > /build/br-jit.status
     # The jsc shell is declared by WebKit but not installed: build it for the differential tests.
-    PATH=/build/br-out/host/bin:$PATH ninja -C "$wk" jsc
+    PATH=/build/br-out/host/bin:$PATH ninja -j "${WPEB_JOBS:-8}" -C "$wk" jsc
     # The rest of the target tree (e.g. GStreamer) is unchanged; make sure everything else is installed.
     printf 'buildroot\n' > /build/br-jit.status
     mk
