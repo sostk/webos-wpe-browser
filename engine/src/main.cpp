@@ -912,7 +912,7 @@ constexpr const char *kConsoleScript = R"JS((function () {
     MS.isTypeSupported = function (t) { const r = its(t); ask(name + '.isTypeSupported', t, r); return r; };
   }
   if (window.HTMLMediaElement) {
-    for (const ev of ['loadedmetadata', 'playing', 'waiting', 'stalled', 'encrypted', 'waitingforkey', 'error', 'abort', 'emptied']) {
+    for (const ev of ['loadedmetadata', 'playing', 'pause', 'waiting', 'stalled', 'encrypted', 'waitingforkey', 'error', 'abort', 'emptied']) {
       addEventListener(ev, (e) => {
         const v = e.target; if (!(v instanceof HTMLMediaElement)) return;
         send('media', [ev, (v.currentSrc || v.src || '').slice(0, 120), 't=' + v.currentTime.toFixed(1), 'rs=' + v.readyState,
@@ -1374,7 +1374,7 @@ bool adblock_wanted(const char *uri)
 {
     if (!g.adblock || !g.adblock_on)
         return false;
-    if (!uri || g.adblock_allowed.empty())
+    if (!uri)
         return true;
     GUri *parsed = g_uri_parse(uri, G_URI_FLAGS_NONE, nullptr);
     const char *h = parsed ? g_uri_get_host(parsed) : nullptr;
@@ -1383,9 +1383,16 @@ bool adblock_wanted(const char *uri)
         g_uri_unref(parsed);
     for (char &c : host)
         c = g_ascii_tolower(c);
+    const auto on = [&host](const std::string &a) {
+        return host == a || (host.size() > a.size() && host.compare(host.size() - a.size(), a.size(), a) == 0
+                             && host[host.size() - a.size() - 1] == '.');
+    };
+    // Never on YouTube: the lists cannot stop its video ads (they come from the video servers), and where it has
+    // an ad to show, a blocked ad request kept its player from sending any video (an LG B7 in Germany, issue #2).
+    if (on("youtube.com") || on("youtube-nocookie.com") || on("youtu.be"))
+        return false;
     for (const std::string &a : g.adblock_allowed) {
-        if (host == a || (host.size() > a.size() && host.compare(host.size() - a.size(), a.size(), a) == 0
-                && host[host.size() - a.size() - 1] == '.'))
+        if (on(a))
             return false;
     }
     return true;

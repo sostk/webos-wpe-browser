@@ -60,8 +60,8 @@ Logs are cleared when the TV restarts, so save them first.
 - Wren uses the TV's own provisioned Widevine CDM. This is outside the terms LG and Google ship it under, and the
   TV's Widevine certificate could in principle be revoked. **Use at your own risk.**
 - Opus and Vorbis audio is decoded in software; only one hardware video plays at a time.
-- The ad blocker cannot stop YouTube's video ads, which come from the same servers as the videos. Its lists are
-  updated with each Wren release.
+- The ad blocker cannot stop YouTube's video ads, which come from the same servers as the videos, so it is not
+  used on YouTube. Its lists are updated with each Wren release.
 - Cloudflare security checks ("Verifying you are human") take about a minute on a TV's processor. Wait for
   them; the site then remembers the pass for a while.
 

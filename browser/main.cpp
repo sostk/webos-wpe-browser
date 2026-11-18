@@ -336,6 +336,13 @@ class App : public wnk::app::Delegate {
         if (url.rfind("http://", 0) != 0 && url.rfind("https://", 0) != 0) return {};
         std::string h = browser::host_of(url);
         for (char &c : h) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        // The engine never blocks on YouTube (engine/src/main.cpp, adblock_wanted): nothing to offer there.
+        for (const char *yt : {"youtube.com", "youtube-nocookie.com", "youtu.be"}) {
+            const std::string y = yt;
+            if (h == y || (h.size() > y.size() && h.compare(h.size() - y.size(), y.size(), y) == 0 &&
+                           h[h.size() - y.size() - 1] == '.'))
+                return {};
+        }
         return h;
     }
     bool ads_allowed_on(const std::string &url) const {

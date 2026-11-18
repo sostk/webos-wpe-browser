@@ -172,7 +172,7 @@ class SettingsScreen : public PageScreen {
             s.block_ads = on;
             changed(ui);
         });
-        ads.set_description("Uses EasyList and EasyPrivacy. Applies from the next page you open. Video ads on YouTube may still play");
+        ads.set_description("Uses EasyList and EasyPrivacy. Applies from the next page you open. Not used on YouTube, whose video ads it cannot stop");
         if (!s.ads_allowed.empty())
             privacy.add<wnk::ui::ValueRow>("Sites allowed to show ads")
                 .set_value(std::to_string(s.ads_allowed.size()) + (s.ads_allowed.size() == 1 ? " site" : " sites"));
