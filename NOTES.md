@@ -790,6 +790,13 @@
   after ~8 FRAMEREADY; YouTube unloaded it after 4 s. Two bugs: the hole area is in page surface pixels (CSS size x
   device scale 1.5), set_page_geometry got the CSS size, so ACB got 0,0 2880x1620; and the kit loaded video-only
   streams with audioSync true (Wren's LgMediaPlayer already sends it only with audio). Both fixed for alpha 3.
+- Alpha 3: the B9 (webOS 4.5) played YouTube 1080p with HDR, audio (software Opus) out of sync, then ran out of
+  memory after a while (webOS restarts the app: events.log is now kept as events.prev.log, alpha 4). On the B7 the
+  ad blocker kept YouTube from sending any video (0 access units; with it off, 111-160); the ad blocker is now off
+  on YouTube (alpha 5). With it off the B7 still showed nothing and had no sound: placement and every ACB call
+  answered 1, first frames came, and YouTube paused and dropped each stream after ~3.8 s. Alpha 5 logs frame
+  progress every second and at Unload; the run to ask for uses wpebEnv WPE_BROWSER_DEBUG_CONSOLE=1 and
+  GST_DEBUG=2,wpebmedia:4 (page media events with currentTime, GStreamer errors such as the sound server's).
 
 ## 2026-11-16 Cloudflare checks and a Web Audio crash (user: Cloudflare "verifying" never finishes)
 - Cloudflare's managed challenge passes on the TV but takes 68-84 s (www.scrapingcourse.com/cloudflare-challenge,
