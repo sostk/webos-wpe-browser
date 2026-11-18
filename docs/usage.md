@@ -42,13 +42,13 @@ YouTube's TV app; the engine variable `WPE_BROWSER_DESKTOP_YOUTUBE=1` keeps the 
 On the TV, in `/tmp/org.sostk.wpebrowser/` (cleared when the TV restarts):
 
 - `engine.log`: the web engine, this run; `engine.prev.log`: the run before (the crash, if the app was reopened)
-- `events.log`: the interface
+- `events.log`: the interface, this run; `events.prev.log`: the run before
 
-**Settings → Help and feedback → Save logs to USB** writes all three to a USB drive as `wren-logs-<date>.txt`, with
+**Settings → Help and feedback → Save logs to USB** writes all four to a USB drive as `wren-logs-<date>.txt`, with
 query strings and fragments cut from web addresses. On a rooted TV they can also be fetched over SSH:
 
 ```sh
-ssh root@<tv-ip> 'cd /tmp/org.sostk.wpebrowser && tail -c 1500000 engine.log engine.prev.log events.log' > wren-logs.txt
+ssh root@<tv-ip> 'cd /tmp/org.sostk.wpebrowser && tail -c 1500000 engine.log engine.prev.log events.log events.prev.log' > wren-logs.txt
 ```
 
 The logs list the addresses of pages you visited; read them before posting them publicly.

@@ -2,8 +2,9 @@
 // "Save logs to USB" (Settings → Help and feedback): the browser's logs in one text file on a USB drive, for a
 // tester to attach to a bug report. The logs live in the app's runtime folder (/tmp/org.sostk.wpebrowser on
 // the TV, cleared at reboot): engine.log (this run), engine.prev.log (the run before, the one that crashed
-// when the app was reopened) and events.log (the UI). Web addresses keep their host and path only: query
-// strings and fragments (search terms, tokens, session ids) are cut before anything is written.
+// when the app was reopened), events.log and events.prev.log (the UI, this run and the one before). Web
+// addresses keep their host and path only: query strings and fragments (search terms, tokens, session ids) are
+// cut before anything is written.
 #pragma once
 
 #include <cstddef>

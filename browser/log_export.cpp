@@ -96,7 +96,8 @@ std::string export_logs(const LogExportRequest &req, const std::string &dest_dir
     static const char *const kLogs[][2] = {
         {"engine.log", "the web engine, this run"},
         {"engine.prev.log", "the web engine, the run before (the crash, if the app was reopened)"},
-        {"events.log", "the browser's interface"},
+        {"events.log", "the browser's interface, this run"},
+        {"events.prev.log", "the browser's interface, the run before"},
     };
     for (const auto &l : kLogs) {
         bool missing = false, cut = false;
