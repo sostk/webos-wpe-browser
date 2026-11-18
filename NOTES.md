@@ -786,6 +786,10 @@
   stream goes there, its AAC audio too (WPEB_MEDIA_ACB=1 lets the web process's audio sink pair with a video that
   has no window); Opus stays video only. The page's hole areas (page pixels) are moved to the page's place on the
   screen (MediaServer::set_page_geometry). Off by default; untested on a TV (the C1 has no libAcbAPI).
+- Alpha 2 on the B7 (2026-11-18): no freeze, every ACB call answered 1, but no picture and each stream stalled
+  after ~8 FRAMEREADY; YouTube unloaded it after 4 s. Two bugs: the hole area is in page surface pixels (CSS size x
+  device scale 1.5), set_page_geometry got the CSS size, so ACB got 0,0 2880x1620; and the kit loaded video-only
+  streams with audioSync true (Wren's LgMediaPlayer already sends it only with audio). Both fixed for alpha 3.
 
 ## 2026-11-16 Cloudflare checks and a Web Audio crash (user: Cloudflare "verifying" never finishes)
 - Cloudflare's managed challenge passes on the TV but takes 68-84 s (www.scrapingcourse.com/cloudflare-challenge,

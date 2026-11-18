@@ -120,6 +120,7 @@ class EngineClient {
     void set_zoom(uint32_t permille);
     // Device scale: the engine renders CSS size x permille/1000 pixels (1500 = native 1080p for a 720p page).
     void set_scale(uint32_t permille);
+    uint32_t scale() const { return scale_; }  // the last set_scale, permille
 
  private:
     bool send(uint32_t type, TabId tab, const void *payload, uint32_t size);
@@ -134,6 +135,7 @@ class EngineClient {
     uint8_t *frames_ = nullptr;
     size_t frames_size_ = 0;
     uint32_t slot_bytes_ = 0;
+    uint32_t scale_ = 1000;
     EngineFrame frame_;
     bool have_frame_ = false;
 };

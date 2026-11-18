@@ -643,7 +643,12 @@ class App : public wnk::app::Delegate {
                 screen_->page_->set_page_size(w, h);
                 engine_.resize(w, h);
             }
-            if (media_.acb()) media_.set_page_geometry(r, screen_->page_->page_width(), screen_->page_->page_height());
+            // The video area comes in the page surface's pixels: CSS size x device scale.
+            if (media_.acb()) {
+                const uint32_t s = engine_.scale();
+                media_.set_page_geometry(r, screen_->page_->page_width() * s / 1000,
+                                         screen_->page_->page_height() * s / 1000);
+            }
         }
         if (Tab *t = tab(active_)) {
             screen_->panel_->set_progress(t->loading, t->progress);

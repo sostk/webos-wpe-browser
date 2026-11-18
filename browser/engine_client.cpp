@@ -318,6 +318,7 @@ void EngineClient::clear_data(uint32_t what, uint32_t seconds) {
 }
 
 void EngineClient::set_scale(uint32_t permille) {
+    scale_ = permille;
     const WpeZoom z{permille};
     send(WPE_APP_SET_SCALE, 0, &z, sizeof(z));
 }
