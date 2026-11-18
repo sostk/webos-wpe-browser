@@ -797,6 +797,17 @@
   answered 1, first frames came, and YouTube paused and dropped each stream after ~3.8 s. Alpha 5 logs frame
   progress every second and at Unload; the run to ask for uses wpebEnv WPE_BROWSER_DEBUG_CONSOLE=1 and
   GST_DEBUG=2,wpebmedia:4 (page media events with currentTime, GStreamer errors such as the sound server's).
+- Alpha 5 on the B7 with that logging: pulsesink "Could not create probe stream", no caps, not-negotiated, and
+  WebKit's "Failed to push buffer" media error ended every playback (YouTube then tried other formats). The app
+  runs in groups 29,44,505,509,777; on the B7 pulse-access is 506 (root's id), so PulseAudio likely refuses the
+  app (the B9 has the same app groups and plays sound: unconfirmed). Alpha 6: pulse_usable() asks once, and
+  without PulseAudio the audio goes to a silent clock-paced fakesink so the video plays. Real sound on webOS 3
+  would be NDL DirectAudio (present on the B7; moonlight-tv's route) with software-decoded PCM.
+- Same run: Magic Remote resting at the top edge made focus flip address/page every frame for 1.5 s (the kit
+  re-hovered every frame and the toolbar's layout moved when the address took focus): likely gotwig's "flashing
+  reload button". Kit 0a086cc. The TV then froze at ~131 s with a black screen; the logs end with no cause.
+- engine.log now cuts query strings from every address (debug mode had put a tester's IP address, inside
+  googlevideo URLs, into a public bug report).
 
 ## 2026-11-16 Cloudflare checks and a Web Audio crash (user: Cloudflare "verifying" never finishes)
 - Cloudflare's managed challenge passes on the TV but takes 68-84 s (www.scrapingcourse.com/cloudflare-challenge,

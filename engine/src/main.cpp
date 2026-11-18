@@ -57,6 +57,17 @@ void log_msg(const char *fmt, ...)
     va_end(ap);
 }
 
+// A web address for the log: without its query string and fragment (search terms, session ids, tokens, the IP
+// addresses in video URLs). Testers attach engine.log to public bug reports as it is.
+std::string short_uri(const char *uri)
+{
+    std::string u = uri ? uri : "";
+    const size_t cut = u.find_first_of("?#");
+    if (cut != std::string::npos)
+        u.erase(cut);
+    return u.size() > 160 ? u.substr(0, 160) + "..." : u;
+}
+
 namespace {
 
 struct Tab {
@@ -483,10 +494,10 @@ void on_load_changed(WebKitWebView *view, WebKitLoadEvent event, gpointer)
     const char *uri = webkit_web_view_get_uri(view);
     if (event == WEBKIT_LOAD_STARTED) {
         started = now_ms();
-        log_msg("tab %u load started: %.200s", tab, uri ? uri : "");
+        log_msg("tab %u load started: %s", tab, short_uri(uri).c_str());
     } else {
         log_msg("tab %u load %s after %u ms: %.200s", tab, event == WEBKIT_LOAD_COMMITTED ? "committed" : "finished",
-            now_ms() - started, uri ? uri : "");
+            now_ms() - started, short_uri(uri).c_str());
     }
 }
 
@@ -496,7 +507,7 @@ gboolean on_load_failed(WebKitWebView *view, WebKitLoadEvent, gchar *uri, GError
     WpeLoad l { WPE_LOAD_FAILED };
     send_msg(WPE_ENGINE_LOAD, tab, &l, sizeof(l));
     if (!g_error_matches(error, WEBKIT_NETWORK_ERROR, WEBKIT_NETWORK_ERROR_CANCELLED)) {
-        log_msg("load failed for %s: %s", uri, error->message);
+        log_msg("load failed for %s: %s", short_uri(uri).c_str(), error->message);
         send_error(tab, WPE_ERROR_LOAD, static_cast<uint32_t>(error->code), error->message);
     }
     return FALSE; // let WebKit show its error page
@@ -504,7 +515,7 @@ gboolean on_load_failed(WebKitWebView *view, WebKitLoadEvent, gchar *uri, GError
 
 gboolean on_tls_error(WebKitWebView *view, gchar *uri, GTlsCertificate *, GTlsCertificateFlags flags, gpointer)
 {
-    log_msg("TLS error for %s (flags 0x%x)", uri, flags);
+    log_msg("TLS error for %s (flags 0x%x)", short_uri(uri).c_str(), flags);
     send_error(tab_of_web_view(view), WPE_ERROR_TLS, flags, uri);
     return FALSE;
 }
@@ -517,7 +528,7 @@ void on_web_process_terminated(WebKitWebView *view, WebKitWebProcessTerminationR
     const char *uri = webkit_web_view_get_uri(view);
     GDateTime *now = g_date_time_new_now_utc();
     gchar *when = g_date_time_format(now, "%F %T UTC");
-    log_msg("web process %s at %s on %s", why, when, uri ? uri : "(no page)");
+    log_msg("web process %s at %s on %s", why, when, uri ? short_uri(uri).c_str() : "(no page)");
     g_free(when);
     g_date_time_unref(now);
     send_error(tab_of_web_view(view), WPE_ERROR_WEB_PROCESS_CRASHED, static_cast<uint32_t>(reason), why);
@@ -756,7 +767,7 @@ gboolean on_decide_policy(WebKitWebView *view, WebKitPolicyDecision *decision, W
     const std::string tv = youtube_tv_url(uri);
     if (tv.empty())
         return FALSE;
-    log_msg("tab %u: %s -> %s (YouTube's TV app)", tab_of_web_view(view), uri, tv.c_str());
+    log_msg("tab %u: %s -> %s (YouTube's TV app)", tab_of_web_view(view), short_uri(uri).c_str(), short_uri(tv.c_str()).c_str());
     webkit_policy_decision_ignore(decision);
     g_idle_add(load_later, new std::pair<WebKitWebView *, std::string>(WEBKIT_WEB_VIEW(g_object_ref(view)), tv));
     return TRUE;
@@ -869,7 +880,7 @@ constexpr const char *kConsoleScript = R"JS((function () {
   }
   addEventListener('error', (e) => {
     if (e.target && e.target !== window && e.target.tagName) {
-      const t = e.target; send('resource-error', [t.tagName, t.src || t.href || '', t.error ? 'code=' + t.error.code + ' ' + t.error.message : '']);
+      const t = e.target; send('resource-error', [t.tagName, String(t.src || t.href || '').split(/[?#]/)[0], t.error ? 'code=' + t.error.code + ' ' + t.error.message : '']);
     } else send('uncaught', [e.message, (e.filename || '') + ':' + e.lineno]);
   }, true);
   addEventListener('unhandledrejection', (e) => send('unhandled-rejection', [e.reason]));
@@ -915,28 +926,31 @@ constexpr const char *kConsoleScript = R"JS((function () {
     for (const ev of ['loadedmetadata', 'playing', 'pause', 'waiting', 'stalled', 'encrypted', 'waitingforkey', 'error', 'abort', 'emptied']) {
       addEventListener(ev, (e) => {
         const v = e.target; if (!(v instanceof HTMLMediaElement)) return;
-        send('media', [ev, (v.currentSrc || v.src || '').slice(0, 120), 't=' + v.currentTime.toFixed(1), 'rs=' + v.readyState,
+        send('media', [ev, (v.currentSrc || v.src || '').split(/[?#]/)[0].slice(0, 120), 't=' + v.currentTime.toFixed(1), 'rs=' + v.readyState,
           v.error ? 'code=' + v.error.code + ' ' + v.error.message : '', e.initDataType || '']);
       }, true);
     }
   }
   const interesting = (u) => /\.(mpd|m3u8)|licen|widevine|drm|pallycon|token|stream|play/i.test(u);
+  // Logs get attached to public bug reports: addresses without their query strings (they carry IP addresses,
+  // session ids, tokens).
+  const bare = (u) => u.split(/[?#]/)[0].slice(0, 200);
   if (window.fetch) {
     const original = window.fetch;
     window.fetch = function (input, init) {
       const u = String(input && input.url || input);
       const p = original.apply(this, arguments);
       if (interesting(u)) p.then((r) => {
-        send('fetch', [(init && init.method) || 'GET', u.slice(0, 200), r.status]);
-        if (/json|mpegurl|dash/.test(r.headers.get('content-type') || '')) r.clone().text().then((b) => send('fetch-body', [u.slice(0, 80), b.slice(0, 1500)]), () => {});
-      }, (e) => send('fetch', [u.slice(0, 200), 'failed', e]));
+        send('fetch', [(init && init.method) || 'GET', bare(u), r.status]);
+        if (/json|mpegurl|dash/.test(r.headers.get('content-type') || '')) r.clone().text().then((b) => send('fetch-body', [bare(u).slice(0, 80), b.slice(0, 1500)]), () => {});
+      }, (e) => send('fetch', [bare(u), 'failed', e]));
       return p;
     };
   }
   const open = XMLHttpRequest.prototype.open;
   XMLHttpRequest.prototype.open = function (method, url) {
     const u = String(url);
-    if (interesting(u)) this.addEventListener('loadend', () => send('xhr', [method, u.slice(0, 200), this.status]));
+    if (interesting(u)) this.addEventListener('loadend', () => send('xhr', [method, bare(u), this.status]));
     return open.apply(this, arguments);
   };
 })();)JS";
@@ -1075,12 +1089,6 @@ void forget_cookies(const char *sites)
 
 // WPE_BROWSER_DEBUG_REQUESTS=1: every request of a page and its frames, with the response status or the error, goes
 // to the engine log (e.g. how far a Cloudflare challenge frame gets). Nothing in the page changes.
-std::string short_uri(const char *uri)
-{
-    std::string u = uri ? uri : "";
-    return u.size() > 160 ? u.substr(0, 160) + "..." : u;
-}
-
 void on_resource_finished(WebKitWebResource *resource, gpointer)
 {
     WebKitURIResponse *response = webkit_web_resource_get_response(resource);

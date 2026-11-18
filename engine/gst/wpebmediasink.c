@@ -909,8 +909,49 @@ static void decodebin_pad_added(GstElement *decodebin, GstPad *pad, gpointer nex
     gst_object_unref(sinkpad);
 }
 
+/* Whether PulseAudio takes a stream here. On webOS 3.9 (an LG B7) pulsesink could not create its probe stream, offered
+ * no caps, and the failed negotiation ended every playback with a media error ("Failed to push buffer"): YouTube gave
+ * up on each video after a second or two. Asked once per process. */
+static gboolean pulse_usable(void)
+{
+    static gsize once = 0;
+    static gboolean usable = TRUE;
+    if (g_once_init_enter(&once)) {
+        GstElement *p = gst_element_factory_make("pulsesink", NULL);
+        gboolean ok = FALSE;
+        if (p && gst_element_set_state(p, GST_STATE_READY) == GST_STATE_CHANGE_SUCCESS) {
+            GstPad *pad = gst_element_get_static_pad(p, "sink");
+            GstCaps *caps = gst_pad_query_caps(pad, NULL);
+            GstCaps *raw = gst_caps_new_empty_simple("audio/x-raw");
+            ok = caps && !gst_caps_is_empty(caps) && gst_caps_can_intersect(caps, raw);
+            gst_caps_unref(raw);
+            if (caps)
+                gst_caps_unref(caps);
+            gst_object_unref(pad);
+        }
+        if (p) {
+            gst_element_set_state(p, GST_STATE_NULL);
+            gst_object_unref(p);
+        }
+        usable = ok;
+        if (!ok)
+            GST_WARNING("PulseAudio takes no stream here: audio is dropped (silent), the video plays on");
+        g_once_init_leave(&once, 1);
+    }
+    return usable;
+}
+
 static GstElement *make_software_chain(WpebAudioSink *self, gboolean decode)
 {
+    if (!pulse_usable()) {
+        /* Silent, at the pipeline clock's pace like a sound card, so the playback (and its video) goes on. */
+        GstElement *sink = gst_element_factory_make("fakesink", NULL);
+        if (!sink)
+            return NULL;
+        g_object_set(sink, "sync", TRUE, "async", FALSE, NULL);
+        gst_bin_add(GST_BIN(self), sink);
+        return sink;
+    }
     GstElement *first = NULL, *prev = NULL;
     const char *names[] = {decode ? "decodebin" : NULL, "audioconvert", "audioresample", "pulsesink"};
     for (guint i = 0; i < G_N_ELEMENTS(names); ++i) {
@@ -969,7 +1010,7 @@ static gboolean wpeb_audio_sink_build(WpebAudioSink *self, GstCaps *caps)
         first = make_software_chain(self, encoded);
         if (!first)
             return FALSE;
-        GST_INFO_OBJECT(self, "%s: software audio (PulseAudio)", label);
+        GST_INFO_OBJECT(self, "%s: software audio (%s)", label, pulse_usable() ? "PulseAudio" : "none: PulseAudio unusable");
     }
     GstPad *target = gst_element_get_static_pad(first, "sink");
     gst_ghost_pad_set_target(GST_GHOST_PAD(self->ghost), target);
