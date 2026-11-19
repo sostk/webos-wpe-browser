@@ -31,8 +31,10 @@ target_link_libraries(compile-rules PRIVATE PkgConfig::WPE)
 pkg_check_modules(GSTBASE IMPORTED_TARGET gstreamer-1.0 gstreamer-base-1.0 gstreamer-audio-1.0 gstreamer-video-1.0
                   gstreamer-pbutils-1.0)
 if (GSTBASE_FOUND)
-    add_library(gstwpebmedia MODULE gst/wpebmediasink.c)
-    target_include_directories(gstwpebmedia PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../common)
+    add_library(gstwpebmedia MODULE gst/wpebmediasink.c gst/wpebpulse.c)
+    # libpulse: headers only; wpebpulse.c loads the TV's libpulse.so.0 at run time.
+    pkg_check_modules(PULSE_HEADERS REQUIRED libpulse)
+    target_include_directories(gstwpebmedia PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../common ${PULSE_HEADERS_INCLUDE_DIRS})
     target_link_libraries(gstwpebmedia PRIVATE PkgConfig::GSTBASE ${CMAKE_DL_LIBS})
     target_compile_options(gstwpebmedia PRIVATE -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
 endif ()

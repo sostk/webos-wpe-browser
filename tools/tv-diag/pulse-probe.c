@@ -5,14 +5,16 @@
  * then open playback streams the way Wren's GStreamer pulsesink does (a format probe stream, then a plain one) on
  * the sink Wren uses (pmedia), the default sink, and optionally every sink, playing a short quiet tone on each.
  *
- *   pulse-probe [--silent] [--all-sinks] [--sink NAME] [--as UID:GID:G1,G2,...]
+ *   pulse-probe [--plain] [--silent] [--all-sinks] [--sink NAME] [--as UID:GID:G1,G2,...]
  *
+ *   --plain       only plain streams (PulseAudio 2.1 on webOS 3.9 quits on the format stream)
  *   --silent      open the streams but write no sound
  *   --all-sinks   also try every sink the server lists
  *   --sink NAME   try this sink too
  *   --as ...      run as that user and groups (from root), e.g. Wren's: --as 5601:5000:29,44,505,509,777
  *
- * The server comes from PULSE_SERVER, else unix:/var/run/pulse/native (webOS runs PulseAudio in system mode). */
+ * The server comes from PULSE_SERVER, else unix:/var/run/pulse/native (webOS runs PulseAudio in system mode).
+ * If the server drops the connection (it quit), the probe waits for it to come back and goes on. */
 #define _GNU_SOURCE
 #include <grp.h>
 #include <math.h>
@@ -25,6 +27,7 @@
 static pa_mainloop *ml;
 static pa_context *ctx;
 static int silent;
+static const char *server;
 
 /* Runs the loop until *done is set or about `ms` pass. */
 static void run_until(int *done, int ms)
@@ -145,6 +148,33 @@ static int try_stream(const char *sink, int extended)
     return ok;
 }
 
+/* (Re)connects the context. After the server quit, retries for up to 15 s while it restarts. */
+static int connect_server(int first)
+{
+    for (int attempt = 0; attempt < (first ? 1 : 15); ++attempt) {
+        if (ctx) {
+            pa_context_set_state_callback(ctx, NULL, NULL);
+            pa_context_disconnect(ctx);
+            pa_context_unref(ctx);
+        }
+        ctx = pa_context_new(pa_mainloop_get_api(ml), "wren pulse-probe");
+        int done = 0;
+        pa_context_set_state_callback(ctx, context_state, &done);
+        if (pa_context_connect(ctx, server, PA_CONTEXT_NOAUTOSPAWN, NULL) >= 0) {
+            run_until(&done, 5000);
+            if (pa_context_get_state(ctx) == PA_CONTEXT_READY)
+                return 1;
+        }
+        if (first)
+            printf("connect to %s: %s\n", server, pa_strerror(pa_context_errno(ctx)));
+        else
+            sleep(1);
+    }
+    if (!first)
+        printf("  the server did not come back within 15 s\n");
+    return 0;
+}
+
 static int drop_to(const char *spec)
 {
     unsigned uid, gid;
@@ -162,11 +192,13 @@ static int drop_to(const char *spec)
 
 int main(int argc, char **argv)
 {
-    int all = 0;
+    int all = 0, plain = 0;
     const char *extra = NULL, *as = NULL;
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "--silent"))
             silent = 1;
+        else if (!strcmp(argv[i], "--plain"))
+            plain = 1;
         else if (!strcmp(argv[i], "--all-sinks"))
             all = 1;
         else if (!strcmp(argv[i], "--sink") && i + 1 < argc)
@@ -174,7 +206,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--as") && i + 1 < argc)
             as = argv[++i];
         else {
-            fprintf(stderr, "usage: pulse-probe [--silent] [--all-sinks] [--sink NAME] [--as UID:GID:G1,G2,...]\n");
+            fprintf(stderr, "usage: pulse-probe [--plain] [--silent] [--all-sinks] [--sink NAME] [--as UID:GID:G1,G2,...]\n");
             return 2;
         }
     }
@@ -182,30 +214,21 @@ int main(int argc, char **argv)
         perror("--as (run as root)");
         return 2;
     }
-    printf("pulse-probe 1: libpulse %s, uid %u gid %u groups", pa_get_library_version(), getuid(), getgid());
+    printf("pulse-probe 2: libpulse %s, uid %u gid %u groups", pa_get_library_version(), getuid(), getgid());
     gid_t g[64];
     int ng = getgroups(64, g);
     for (int i = 0; i < ng; ++i)
         printf(" %u", g[i]);
     printf("\n");
-    const char *server = getenv("PULSE_SERVER") ? getenv("PULSE_SERVER") : "unix:/var/run/pulse/native";
+    server = getenv("PULSE_SERVER") ? getenv("PULSE_SERVER") : "unix:/var/run/pulse/native";
     const char *path = strncmp(server, "unix:", 5) == 0 ? server + 5 : NULL;
     if (path)
         printf("socket %s: %s\n", path, access(path, W_OK) == 0 ? "writable" : "NOT writable by this user");
 
     ml = pa_mainloop_new();
-    ctx = pa_context_new(pa_mainloop_get_api(ml), "wren pulse-probe");
-    int done = 0;
-    pa_context_set_state_callback(ctx, context_state, &done);
-    if (pa_context_connect(ctx, server, PA_CONTEXT_NOAUTOSPAWN, NULL) < 0) {
-        printf("connect to %s failed: %s\n", server, pa_strerror(pa_context_errno(ctx)));
+    if (!connect_server(1))
         return 1;
-    }
-    run_until(&done, 5000);
-    if (pa_context_get_state(ctx) != PA_CONTEXT_READY) {
-        printf("connect to %s: %s\n", server, pa_strerror(pa_context_errno(ctx)));
-        return 1;
-    }
+    int done;
     printf("connected to %s (protocol %u, server protocol %u)\n", server, pa_context_get_protocol_version(ctx),
            pa_context_get_server_protocol_version(ctx));
 
@@ -233,9 +256,17 @@ int main(int argc, char **argv)
             if (strcmp(sinks[i], "pmedia") && (!extra || strcmp(sinks[i], extra)))
                 targets[nt++] = sinks[i];
     for (int i = 0; i < nt; ++i) {
-        try_stream(targets[i], 1);
-        try_stream(targets[i], 0);
+        for (int extended = plain ? 0 : 1; extended >= 0; --extended) {
+            if (pa_context_get_state(ctx) != PA_CONTEXT_READY) {
+                printf("  the server dropped the connection (it quit?): reconnecting\n");
+                if (!connect_server(0))
+                    goto out;
+                printf("  reconnected\n");
+            }
+            try_stream(targets[i], extended);
+        }
     }
+out:
     pa_context_disconnect(ctx);
     pa_context_unref(ctx);
     pa_mainloop_free(ml);

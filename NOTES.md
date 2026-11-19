@@ -808,6 +808,23 @@
   reload button". Kit 0a086cc. The TV then froze at ~131 s with a black screen; the logs end with no cause.
 - engine.log now cuts query strings from every address (debug mode had put a tester's IP address, inside
   googlevideo URLs, into a public bug report).
+- Alpha 6 on the B7: **the ACB picture shows** (two YouTube videos and an ad, 1080p60 VP9, smooth, no freeze, no
+  flashing). `sink: N displayed` stays 0 on ACB (frames bypass our sink): ignore it. Each stream's first summary
+  spans back to the previous video ("in 14.0 s"): first_frame_ns_ is not reset at Load (kit, small).
+- B7 PulseAudio (pulse-report.sh + pulse-probe, 2026-11-19): **server 2.1** (libpulse 2.1, protocol 26), system
+  mode, socket srwxrwxrwx with auth-anonymous=1, pmedia a null sink under module-palm-policy. So neither the group
+  nor a missing pmedia. **pulsesink's format stream (pa_stream_new_extended) makes the server quit**: "Connection
+  terminated", new pid after (2216 -> 11958); nothing in /var/log/messages. The alpha 6 run showed the same restart
+  (new server pid between Wren's threads at the audio check). Alpha 5 retried per video: likely the TV freeze.
+- Alpha 7: engine/gst/wpebpulse.c. pulse_mode() asks the server's version with no stream (libpulse.so.0 dlopened):
+  2.x -> wpebpulseplain (GstAudioSink, one pa_stream_new stream on PULSE_SINK, else the default sink; volume
+  element for volume/mute), never creating pulsesink; >= 3 -> pulsesink if its caps check passes, else plain; no
+  server -> silent fakesink. Web Audio uses the same choice. WPEB_PULSE=pulsesink|plain|none forces it.
+  QEMU against PipeWire's PulseAudio 15: all three modes play the 2 s file in 2.0 s and end cleanly. Not tested on
+  a 2.x server or a TV; seek/flush (reset) not exercised. pulse-probe 2: --plain, reconnects after the server quits.
+- What others do on webOS 3/4 (mariotaku/ss4s, moonlight-tv's backends): NDL DirectAudio (PCM/AAC/AC3) is the
+  first choice for webOS >= 3.5 and < 5; the PulseAudio fallback uses pa_simple (a plain stream); the Starfish/ACB
+  module is video-only below webOS 5 although its code can feed AcbAPI_setMediaAudioData. Kodi needs webOS 4+.
 
 ## 2026-11-16 Cloudflare checks and a Web Audio crash (user: Cloudflare "verifying" never finishes)
 - Cloudflare's managed challenge passes on the TV but takes 68-84 s (www.scrapingcourse.com/cloudflare-challenge,

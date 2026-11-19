@@ -19,6 +19,7 @@
  *     pipeline is one per app.
  */
 #include "wpe_media_ipc.h"
+#include "wpebpulse.h"
 
 #include <gst/audio/streamvolume.h>
 #include <gst/pbutils/codec-utils.h>
@@ -36,7 +37,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
-GST_DEBUG_CATEGORY_STATIC(wpeb_media_debug);
+GST_DEBUG_CATEGORY(wpeb_media_debug);
 #define GST_CAT_DEFAULT wpeb_media_debug
 
 /* ---- the page's video window (engine/webos-backend, loaded by libwpe in this process) ------------------------- */
@@ -909,41 +910,77 @@ static void decodebin_pad_added(GstElement *decodebin, GstPad *pad, gpointer nex
     gst_object_unref(sinkpad);
 }
 
-/* Whether PulseAudio takes a stream here. On webOS 3.9 (an LG B7) pulsesink could not create its probe stream, offered
- * no caps, and the failed negotiation ended every playback with a media error ("Failed to push buffer"): YouTube gave
- * up on each video after a second or two. Asked once per process. */
-static gboolean pulse_usable(void)
+/* How page audio reaches PulseAudio, decided once per process.
+ *   PULSE_SINK_FULL: GStreamer's pulsesink.
+ *   PULSE_PLAIN: wpebpulseplain, one ordinary stream (engine/gst/wpebpulse.c). On PulseAudio 2.x (webOS 3.9, an LG
+ *     B7) pulsesink is never made: its format check makes that server quit (pulse-probe, 2026-11-19), and the failed
+ *     negotiation also ended every playback with a media error (YouTube dropped each video after a second or two).
+ *   PULSE_NONE: no sound server; audio is dropped at the clock's pace and the video plays on.
+ * WPEB_PULSE=pulsesink|plain|none overrides it (tests). */
+typedef enum { PULSE_SINK_FULL, PULSE_PLAIN, PULSE_NONE } PulseMode;
+
+static gboolean pulsesink_takes_streams(void)
+{
+    GstElement *p = gst_element_factory_make("pulsesink", NULL);
+    gboolean ok = FALSE;
+    if (p && gst_element_set_state(p, GST_STATE_READY) == GST_STATE_CHANGE_SUCCESS) {
+        GstPad *pad = gst_element_get_static_pad(p, "sink");
+        GstCaps *caps = gst_pad_query_caps(pad, NULL);
+        GstCaps *raw = gst_caps_new_empty_simple("audio/x-raw");
+        ok = caps && !gst_caps_is_empty(caps) && gst_caps_can_intersect(caps, raw);
+        gst_caps_unref(raw);
+        if (caps)
+            gst_caps_unref(caps);
+        gst_object_unref(pad);
+    }
+    if (p) {
+        gst_element_set_state(p, GST_STATE_NULL);
+        gst_object_unref(p);
+    }
+    return ok;
+}
+
+static PulseMode pulse_mode(void)
 {
     static gsize once = 0;
-    static gboolean usable = TRUE;
+    static PulseMode mode = PULSE_NONE;
     if (g_once_init_enter(&once)) {
-        GstElement *p = gst_element_factory_make("pulsesink", NULL);
-        gboolean ok = FALSE;
-        if (p && gst_element_set_state(p, GST_STATE_READY) == GST_STATE_CHANGE_SUCCESS) {
-            GstPad *pad = gst_element_get_static_pad(p, "sink");
-            GstCaps *caps = gst_pad_query_caps(pad, NULL);
-            GstCaps *raw = gst_caps_new_empty_simple("audio/x-raw");
-            ok = caps && !gst_caps_is_empty(caps) && gst_caps_can_intersect(caps, raw);
-            gst_caps_unref(raw);
-            if (caps)
-                gst_caps_unref(caps);
-            gst_object_unref(pad);
+        const char *force = g_getenv("WPEB_PULSE");
+        if (force && !strcmp(force, "pulsesink")) {
+            mode = PULSE_SINK_FULL;
+        } else if (force && !strcmp(force, "plain")) {
+            mode = PULSE_PLAIN;
+        } else if (force && !strcmp(force, "none")) {
+            mode = PULSE_NONE;
+        } else {
+            const int major = wpeb_pulse_server_major();
+            if (major < 0)
+                mode = PULSE_NONE;
+            else if (major < 3)
+                mode = PULSE_PLAIN;
+            else if (pulsesink_takes_streams())
+                mode = PULSE_SINK_FULL;
+            else
+                mode = PULSE_PLAIN;
         }
-        if (p) {
-            gst_element_set_state(p, GST_STATE_NULL);
-            gst_object_unref(p);
-        }
-        usable = ok;
-        if (!ok)
-            GST_WARNING("PulseAudio takes no stream here: audio is dropped (silent), the video plays on");
+        GST_INFO("page audio: %s", mode == PULSE_SINK_FULL ? "PulseAudio (pulsesink)"
+                                   : mode == PULSE_PLAIN   ? "PulseAudio (plain stream)"
+                                                           : "none (no PulseAudio): dropped, the video plays on");
         g_once_init_leave(&once, 1);
     }
-    return usable;
+    return mode;
+}
+
+static const char *pulse_mode_label(void)
+{
+    const PulseMode m = pulse_mode();
+    return m == PULSE_SINK_FULL ? "PulseAudio" : m == PULSE_PLAIN ? "PulseAudio, plain stream" : "none: no PulseAudio";
 }
 
 static GstElement *make_software_chain(WpebAudioSink *self, gboolean decode)
 {
-    if (!pulse_usable()) {
+    const PulseMode mode = pulse_mode();
+    if (mode == PULSE_NONE) {
         /* Silent, at the pipeline clock's pace like a sound card, so the playback (and its video) goes on. */
         GstElement *sink = gst_element_factory_make("fakesink", NULL);
         if (!sink)
@@ -952,8 +989,9 @@ static GstElement *make_software_chain(WpebAudioSink *self, gboolean decode)
         gst_bin_add(GST_BIN(self), sink);
         return sink;
     }
-    GstElement *first = NULL, *prev = NULL;
-    const char *names[] = {decode ? "decodebin" : NULL, "audioconvert", "audioresample", "pulsesink"};
+    GstElement *first = NULL, *prev = NULL, *volume = NULL;
+    const char *names[] = {decode ? "decodebin" : NULL, "audioconvert", "audioresample",
+                           mode == PULSE_PLAIN ? "volume" : NULL, mode == PULSE_PLAIN ? "wpebpulseplain" : "pulsesink"};
     for (guint i = 0; i < G_N_ELEMENTS(names); ++i) {
         if (!names[i])
             continue;
@@ -963,6 +1001,8 @@ static GstElement *make_software_chain(WpebAudioSink *self, gboolean decode)
             return NULL;
         }
         gst_bin_add(GST_BIN(self), e);
+        if (!strcmp(names[i], "volume"))
+            volume = e;
         if (!first)
             first = e;
         if (prev && decode && prev == first) {
@@ -973,12 +1013,13 @@ static GstElement *make_software_chain(WpebAudioSink *self, gboolean decode)
         }
         prev = e;
     }
-    self->pulse = prev;
+    /* Volume and mute go to pulsesink, or to the volume element before the plain sink. */
+    self->pulse = volume ? volume : prev;
     /* The pipeline's clock must not be the sound server's: a PulseAudio stream that has not started (or is held)
      * does not advance it, and the video, fed to LG's pipeline against that clock, froze with it (TV, 2026-11-11). */
-    g_object_set(self->pulse, "provide-clock", FALSE, "volume", self->volume, "mute", self->mute, NULL);
     /* Added to a running pipeline: no preroll of its own (see wpeb_audio_hw_init). */
-    g_object_set(self->pulse, "async", FALSE, NULL);
+    g_object_set(prev, "provide-clock", FALSE, "async", FALSE, NULL);
+    g_object_set(self->pulse, "volume", self->volume, "mute", self->mute, NULL);
     return first;
 }
 
@@ -1010,7 +1051,7 @@ static gboolean wpeb_audio_sink_build(WpebAudioSink *self, GstCaps *caps)
         first = make_software_chain(self, encoded);
         if (!first)
             return FALSE;
-        GST_INFO_OBJECT(self, "%s: software audio (%s)", label, pulse_usable() ? "PulseAudio" : "none: PulseAudio unusable");
+        GST_INFO_OBJECT(self, "%s: software audio (%s)", label, pulse_mode_label());
     }
     GstPad *target = gst_element_get_static_pad(first, "sink");
     gst_ghost_pad_set_target(GST_GHOST_PAD(self->ghost), target);
@@ -1149,10 +1190,16 @@ static void wpeb_webaudio_sink_init(WpebWebAudioSink *self)
 {
     GstElement *convert = gst_element_factory_make("audioconvert", NULL);
     GstElement *resample = gst_element_factory_make("audioresample", NULL);
-    GstElement *pulse = gst_element_factory_make("pulsesink", NULL);
+    /* The same output as page audio (pulse_mode): pulsesink would make an old server quit. */
+    const PulseMode mode = pulse_mode();
+    GstElement *pulse = gst_element_factory_make(mode == PULSE_SINK_FULL ? "pulsesink"
+                                                 : mode == PULSE_PLAIN   ? "wpebpulseplain"
+                                                                         : "fakesink", NULL);
+    if (pulse && mode == PULSE_NONE)
+        g_object_set(pulse, "sync", TRUE, NULL);
     if (!convert || !resample || !pulse) {
         /* No sink pad: WebKit can't link it and Web Audio stays silent, but the page keeps running. */
-        GST_ERROR_OBJECT(self, "audioconvert, audioresample or pulsesink missing");
+        GST_ERROR_OBJECT(self, "audioconvert, audioresample or the audio output missing");
         g_clear_object(&convert);
         g_clear_object(&resample);
         g_clear_object(&pulse);
@@ -1185,7 +1232,8 @@ static gboolean plugin_init(GstPlugin *plugin)
      * is made by name only (rank none), so no autoaudiosink picks it. */
     return gst_element_register(plugin, "rialtomsevideosink", GST_RANK_SECONDARY, WPEB_TYPE_VIDEO_SINK)
         && gst_element_register(plugin, "rialtomseaudiosink", GST_RANK_SECONDARY, WPEB_TYPE_AUDIO_SINK)
-        && gst_element_register(plugin, "rialtowebaudiosink", GST_RANK_NONE, wpeb_webaudio_sink_get_type());
+        && gst_element_register(plugin, "rialtowebaudiosink", GST_RANK_NONE, wpeb_webaudio_sink_get_type())
+        && gst_element_register(plugin, "wpebpulseplain", GST_RANK_NONE, wpeb_pulse_plain_sink_get_type());
 }
 
 #define PACKAGE "wpebrowser"

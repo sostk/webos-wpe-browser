@@ -102,7 +102,7 @@ if [ -f "$TARGET/usr/lib/libgstreamer-1.0.so.0" ]; then
         cp -L "$plugin" "$OUT/lib/gstreamer-1.0/"
         MEDIA_SEEDS="$MEDIA_SEEDS $OUT/lib/gstreamer-1.0/$(basename "$plugin")"
     done
-    for required in coreelements typefindfunctions playback app isomp4 matroska libav videoparsersbad audioparsers vpx opus pulseaudio soup adaptivedemux2; do
+    for required in coreelements typefindfunctions playback app isomp4 matroska libav videoparsersbad audioparsers vpx opus pulseaudio volume soup adaptivedemux2; do
         [ -f "$OUT/lib/gstreamer-1.0/libgst$required.so" ] || {
             echo "missing required media plugin: $required (build multimedia dependencies first)" >&2
             exit 1
