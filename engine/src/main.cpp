@@ -804,11 +804,14 @@ constexpr const char *kMediaLimitScript = R"JS((function () {
     const t = type.toLowerCase();
     return codecOk(t) && !tooBig(num(t, 'width'), num(t, 'height'), num(t, 'framerate'));
   };
+  // Streams only (MSE): without Opus, YouTube sends AAC, which goes to LG's pipeline with the picture and stays in
+  // sync. canPlayType still says yes, so plain Opus files keep playing (through PulseAudio).
+  const mseOk = (type) => ok(type) && (cfg.opus || typeof type !== 'string' || !/opus/.test(type.toLowerCase()));
   for (const name of ['MediaSource', 'ManagedMediaSource', 'WebKitMediaSource']) {
     const MS = window[name];
     if (!MS || typeof MS.isTypeSupported !== 'function') continue;
     const original = MS.isTypeSupported.bind(MS);
-    Object.defineProperty(MS, 'isTypeSupported', { value: function isTypeSupported(t) { return ok(t) && original(t); }, configurable: true, writable: true });
+    Object.defineProperty(MS, 'isTypeSupported', { value: function isTypeSupported(t) { return mseOk(t) && original(t); }, configurable: true, writable: true });
   }
   if (window.HTMLMediaElement) {
     const original = HTMLMediaElement.prototype.canPlayType;
@@ -830,6 +833,12 @@ std::string media_limit_script()
 {
     unsigned long pixels = 1280 * 720, fps = 30;
     bool vp9 = false;
+    // ACB (webOS 3/4): LG's pipeline takes AAC with the video but Wren's Opus goes to PulseAudio on its own clock,
+    // out of sync on a B9 (alpha 3-7). Streams are offered without Opus unless WPEB_ACB_OPUS=1 or hardware Opus.
+    const char *acb = getenv("WPEB_MEDIA_ACB"), *acb_opus = getenv("WPEB_ACB_OPUS"), *hw_opus = getenv("WPEB_HW_OPUS");
+    const bool opus = !(acb && !strcmp(acb, "1")) || (acb_opus && !strcmp(acb_opus, "1")) || (hw_opus && !strcmp(hw_opus, "1"));
+    if (!opus)
+        log_msg("media: Opus streams not offered (ACB: AAC goes to LG's pipeline with the video)");
     // LG's decoder (hardware video, WPEB_MEDIA_SOCKET) plays 4K60 H.264/HEVC/VP9.
     if (getenv("WPEB_MEDIA_SOCKET")) {
         pixels = 3840 * 2160;
@@ -845,8 +854,9 @@ std::string media_limit_script()
         vp9 = strstr(v, "+vp9") != nullptr;
         log_msg("media limit: %lu pixels, %lu fps%s", pixels, fps, vp9 ? ", VP9 allowed" : "");
     }
-    char cfg[128];
-    snprintf(cfg, sizeof(cfg), "{pixels: %lu, fps: %lu, vp9: %s}", pixels, fps, vp9 ? "true" : "false");
+    char cfg[160];
+    snprintf(cfg, sizeof(cfg), "{pixels: %lu, fps: %lu, vp9: %s, opus: %s}", pixels, fps, vp9 ? "true" : "false",
+             opus ? "true" : "false");
     std::string script = kMediaLimitScript;
     const std::string marker = "__WPEB_MEDIA__";
     script.replace(script.find(marker), marker.size(), cfg);

@@ -825,6 +825,17 @@
 - What others do on webOS 3/4 (mariotaku/ss4s, moonlight-tv's backends): NDL DirectAudio (PCM/AAC/AC3) is the
   first choice for webOS >= 3.5 and < 5; the PulseAudio fallback uses pa_simple (a plain stream); the Starfish/ACB
   module is video-only below webOS 5 although its code can feed AcbAPI_setMediaAudioData. Kodi needs webOS 4+.
+- Alpha 7 on the B7 (2026-11-20): **picture and sound on YouTube**, PulseAudio pid unchanged, engine.log
+  "PulseAudio server pulseaudio 2.1", "page audio: PulseAudio (plain stream)", 48000 Hz stereo; pulse-test.sh
+  --plain READY on pmedia and the default sink as root and as the app user. GStreamer's audiobasesink logs
+  "correct clock skew" ~20 ms now and then (the plain stream's clock against the pipeline's). The first video after
+  start-up came out oversized/cropped; later ones were right. Both got the same "ACB place 1920x1080 -> 0,0
+  1920x1080 rv=1" at loadCompleted, but the first Load took 809 ms (55 ms for the next).
+- For alpha 8 (not yet released): the kit places the ACB video again at the first FRAMEREADY, and resets the summary
+  timer at Load. In ACB mode MediaSource.isTypeSupported says no to Opus (engine media-limit script; canPlayType
+  unchanged), so YouTube sends AAC, which already goes to LG's pipeline with the video (audioSync, setMediaAudioData):
+  the sync fix for the B9, and real LG audio on the B7 if webOS 3.9's ACB plays it. WPEB_ACB_OPUS=1 (wpebEnv)
+  brings Opus back for comparison. Script checked in node; not on a TV.
 
 ## 2026-11-16 Cloudflare checks and a Web Audio crash (user: Cloudflare "verifying" never finishes)
 - Cloudflare's managed challenge passes on the TV but takes 68-84 s (www.scrapingcourse.com/cloudflare-challenge,
